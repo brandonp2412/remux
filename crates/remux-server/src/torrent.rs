@@ -10,10 +10,10 @@ use librqbit::{
 };
 use tracing::{debug, warn};
 
-// Keep downloaded torrent pieces available for a quick retry, a player restart,
-// or the next episode. Thirty seconds causes the whole buffer to be thrown away
-// after every failed attempt, even when the same viewer immediately retries.
-const TORRENT_IDLE_GRACE: Duration = Duration::from_secs(10 * 60);
+// Let the chosen episode and its successor finish downloading while the TV
+// sits idle or after the player closes. Bound the retention so abandoned
+// torrent selections cannot occupy disk/peer connections indefinitely.
+const TORRENT_IDLE_GRACE: Duration = Duration::from_secs(2 * 60 * 60);
 
 #[derive(Clone, Debug)]
 struct TorrentFile {
@@ -28,6 +28,17 @@ struct SidecarSubtitleFile {
     language: Option<String>,
     is_forced: bool,
     is_hearing_impaired: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TorrentPrefetchStatus {
+    pub current_cached_bytes: u64,
+    pub current_total_bytes: u64,
+    pub next_cached_bytes: Option<u64>,
+    pub next_total_bytes: Option<u64>,
+    pub download_mibps: f64,
+    pub live_peers: u64,
 }
 
 pub struct TorrentManager {
@@ -225,6 +236,80 @@ impl TorrentManager {
             })
     }
 
+    // Safe server-side telemetry: no magnet URLs, tracker endpoints, names,
+    // filesystem paths, or credentials leave this authenticated API.
+    pub fn prefetch_status(
+        &self,
+        info_hash: &str,
+        file_idx: Option<usize>,
+        file_hint: Option<&str>,
+    ) -> Option<TorrentPrefetchStatus> {
+        let api = Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
+        let id = api
+            .api_torrent_list()
+            .torrents
+            .into_iter()
+            .find(|torrent| {
+                torrent
+                    .info_hash
+                    .eq_ignore_ascii_case(info_hash)
+            })?
+            .id?;
+        let details = api
+            .api_torrent_details(TorrentIdOrHash::Id(id))
+            .ok()?;
+        let files = details
+            .files?
+            .into_iter()
+            .map(|file| TorrentFile {
+                name: file.name,
+                length: file.length,
+            })
+            .collect::<Vec<_>>();
+        let index = select_file_index(&files, file_idx, file_hint).ok()?;
+        let next = episode_prefetch_selection(&files, index)
+            .into_iter()
+            .find(|i| *i != index);
+        let stats = api
+            .api_stats_v1(TorrentIdOrHash::Id(id))
+            .ok()?;
+        let live = stats
+            .live
+            .as_ref();
+        Some(TorrentPrefetchStatus {
+            current_cached_bytes: stats
+                .file_progress
+                .get(index)
+                .copied()
+                .unwrap_or(0)
+                .min(files[index].length),
+            current_total_bytes: files[index].length,
+            next_cached_bytes: next.map(|idx| {
+                stats
+                    .file_progress
+                    .get(idx)
+                    .copied()
+                    .unwrap_or(0)
+                    .min(files[idx].length)
+            }),
+            next_total_bytes: next.map(|idx| files[idx].length),
+            download_mibps: live.map_or(0.0, |v| {
+                v.download_speed
+                    .mbps
+            }),
+            live_peers: live.map_or(0, |v| {
+                v.snapshot
+                    .peer_stats
+                    .live as u64
+            }),
+        })
+    }
+
     /// Gracefully shut down the librqbit session, releasing all sockets
     /// (including the DHT UDP socket). Call this before dropping the manager
     /// to avoid "address already in use" errors on restart.
@@ -281,9 +366,13 @@ impl TorrentManager {
         let file_idx =
             select_file_index(&files, file_idx_override, wanted_file.as_deref())?;
 
-        // Existing persisted torrents may have been created with every file
-        // selected. Clear that natural queue as well; active FileStreams keep
-        // requesting their own pieces independently.
+        // Keep a bounded natural download queue while FileStream serves seeks
+        // with its own priority. For a series bundle, download the selected
+        // episode and its immediate successor completely, even when the TV is
+        // idle. Never select unrelated samples, movies or a whole season pack.
+        let existing = api_details_included(&self.session, torrent_id);
+        let selected_files =
+            merge_episode_prefetch_selection(&files, file_idx, &existing);
         let api = Api::new(
             self.session
                 .clone(),
@@ -292,10 +381,10 @@ impl TorrentManager {
         );
         api.api_torrent_action_update_only_files(
             TorrentIdOrHash::Id(torrent_id),
-            &std::collections::HashSet::new(),
+            &selected_files,
         )
         .await
-        .context("failed to clear torrent file selection")?;
+        .context("failed to select torrent episode prefetch files")?;
         if !matches!(
             handle
                 .stats()
@@ -470,6 +559,138 @@ impl crate::stream::StreamInfo {
             })
             .collect()
     }
+}
+
+fn api_details_included(
+    session: &Arc<Session>,
+    torrent_id: usize,
+) -> std::collections::HashSet<usize> {
+    let api = Api::new(session.clone(), None, None);
+    api.api_torrent_details(TorrentIdOrHash::Id(torrent_id))
+        .ok()
+        .and_then(|details| details.files)
+        .unwrap_or_default()
+        .into_iter()
+        .enumerate()
+        .filter_map(|(index, file)| {
+            file.included
+                .then_some(index)
+        })
+        .collect()
+}
+
+// Keep already-prefetched episode files when the next episode is resolved.
+// A new lookup must not stop the download of the episode that is playing.
+// This is bounded to four files per torrent, not a season-wide selection.
+fn merge_episode_prefetch_selection(
+    files: &[TorrentFile],
+    selected_idx: usize,
+    already: &std::collections::HashSet<usize>,
+) -> std::collections::HashSet<usize> {
+    const MAX_SELECTED: usize = 4;
+    let mut selected = episode_prefetch_selection(files, selected_idx);
+    let mut previous = already
+        .iter()
+        .copied()
+        .filter(|index| {
+            *index < files.len()
+                && files[*index].length > 0
+                && is_video_file(&files[*index].name)
+        })
+        .collect::<Vec<_>>();
+    previous.sort_by_key(|index| {
+        // Prefer adjacent episodes; preserve the older episode through a next
+        // lookup while limiting unrelated speculative cache growth.
+        let distance = match (
+            files
+                .get(*index)
+                .and_then(|file| episode_tag(&file.name)),
+            files
+                .get(selected_idx)
+                .and_then(|file| episode_tag(&file.name)),
+        ) {
+            (Some((a_season, a_episode)), Some((b_season, b_episode)))
+                if a_season == b_season =>
+            {
+                a_episode.abs_diff(b_episode)
+            }
+            _ => u32::MAX,
+        };
+        (distance, *index)
+    });
+    for index in previous {
+        if selected.len() >= MAX_SELECTED {
+            break;
+        }
+        selected.insert(index);
+    }
+    selected
+}
+
+fn episode_tag(name: &str) -> Option<(u32, u32)> {
+    let upper = name.to_ascii_uppercase();
+    let bytes = upper.as_bytes();
+    for (index, &ch) in bytes
+        .iter()
+        .enumerate()
+    {
+        if ch != b'S' || index + 5 >= bytes.len() {
+            continue;
+        }
+        let season = &bytes[index + 1..index + 3];
+        if !season
+            .iter()
+            .all(u8::is_ascii_digit)
+            || bytes[index + 3] != b'E'
+        {
+            continue;
+        }
+        let episode = &bytes[index + 4..index + 6];
+        if !episode
+            .iter()
+            .all(u8::is_ascii_digit)
+        {
+            continue;
+        }
+        return Some((
+            u32::from(season[0] - b'0') * 10 + u32::from(season[1] - b'0'),
+            u32::from(episode[0] - b'0') * 10 + u32::from(episode[1] - b'0'),
+        ));
+    }
+    None
+}
+
+fn episode_prefetch_selection(
+    files: &[TorrentFile],
+    selected_idx: usize,
+) -> std::collections::HashSet<usize> {
+    let mut selected = std::collections::HashSet::from([selected_idx]);
+    let Some(current) = files.get(selected_idx) else {
+        return selected;
+    };
+    if !is_video_file(&current.name) {
+        return selected;
+    }
+    let Some((season, episode)) = episode_tag(&current.name) else {
+        return selected;
+    };
+    // An explicit next-episode tag is required. Array order can differ from
+    // episode order and must not pull unrelated extras.
+    let parent = std::path::Path::new(&current.name).parent();
+    if let Some((next_idx, _)) = files
+        .iter()
+        .enumerate()
+        .find(|(idx, file)| {
+            *idx != selected_idx
+                && file.length > 0
+                && is_video_file(&file.name)
+                && std::path::Path::new(&file.name).parent() == parent
+                && episode_tag(&file.name) == Some((season, episode + 1))
+        })
+    {
+        selected.insert(next_idx);
+    }
+    selected
 }
 
 fn stream_only_options() -> AddTorrentOptions {
@@ -758,7 +979,7 @@ mod tests {
 
     #[test]
     fn recent_playback_is_retained_for_retries() {
-        assert_eq!(TORRENT_IDLE_GRACE, Duration::from_secs(600));
+        assert_eq!(TORRENT_IDLE_GRACE, Duration::from_secs(7200));
     }
 
     #[tokio::test]
@@ -1008,6 +1229,44 @@ mod tests {
         ];
 
         assert_eq!(select_file_index(&files, None, None).unwrap(), 1);
+    }
+
+    #[test]
+    fn prefetch_only_current_and_next_episode_not_entire_pack() {
+        let files = vec![
+            file("Show/S01E03.mkv", 500),
+            file("Show/extras.mkv", 100),
+            file("Show/S01E01.mkv", 500),
+            file("Show/S01E02.mkv", 500),
+            file("Show/S01E04.mkv", 500),
+            file("Other/S01E04.mkv", 500),
+        ];
+        assert_eq!(episode_prefetch_selection(&files, 2), [2, 3].into());
+        assert_eq!(episode_prefetch_selection(&files, 0), [0, 4].into());
+        assert_eq!(episode_prefetch_selection(&files, 4), [4].into());
+        assert_eq!(episode_prefetch_selection(&files, 1), [1].into());
+        assert_eq!(episode_prefetch_selection(&files, 5), [5].into());
+    }
+
+    #[test]
+    fn resolving_next_does_not_cancel_current_episode_download() {
+        let files = vec![
+            file("Show/S01E01.mkv", 1000),
+            file("Show/S01E02.mkv", 1000),
+            file("Show/S01E03.mkv", 1000),
+            file("Show/S01E04.mkv", 1000),
+            file("Show/S01E05.mkv", 1000),
+            file("Show/extras.mkv", 100),
+        ];
+        let first = merge_episode_prefetch_selection(&files, 1, &Default::default());
+        assert_eq!(first, [1, 2].into());
+        let second = merge_episode_prefetch_selection(&files, 2, &first);
+        assert_eq!(second, [1, 2, 3].into());
+        let third = merge_episode_prefetch_selection(&files, 3, &second);
+        assert_eq!(third, [1, 2, 3, 4].into());
+        let fourth = merge_episode_prefetch_selection(&files, 4, &third);
+        assert_eq!(fourth, [1, 2, 3, 4].into());
+        assert!(fourth.len() <= 4 && !fourth.contains(&5));
     }
 
     #[test]
