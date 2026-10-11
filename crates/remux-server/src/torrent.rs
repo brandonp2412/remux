@@ -10,6 +10,11 @@ use librqbit::{
 };
 use tracing::{debug, warn};
 
+// Keep downloaded torrent pieces available for a quick retry, a player restart,
+// or the next episode. Thirty seconds causes the whole buffer to be thrown away
+// after every failed attempt, even when the same viewer immediately retries.
+const TORRENT_IDLE_GRACE: Duration = Duration::from_secs(10 * 60);
+
 #[derive(Clone, Debug)]
 struct TorrentFile {
     name: String,
@@ -51,7 +56,7 @@ impl Drop for TorrentLease {
             runtime.spawn(async move {
                 // Allow a seek/reconnect or the next episode to acquire the
                 // same torrent before releasing its peers and downloaded data.
-                tokio::time::sleep(Duration::from_secs(30)).await;
+                tokio::time::sleep(TORRENT_IDLE_GRACE).await;
                 if let Err(error) = manager
                     .delete_if_unused(&hash)
                     .await
@@ -750,6 +755,11 @@ fn parse_file_idx_param(magnet: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn recent_playback_is_retained_for_retries() {
+        assert_eq!(TORRENT_IDLE_GRACE, Duration::from_secs(600));
+    }
 
     #[tokio::test]
     async fn cleanup_waits_for_sessions_and_readers_and_respects_reacquisition() {
