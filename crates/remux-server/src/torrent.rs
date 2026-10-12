@@ -276,9 +276,11 @@ impl TorrentManager {
         let file_idx =
             select_file_index(&files, file_idx_override, wanted_file.as_deref())?;
 
-        // Existing persisted torrents may have been created with every file
-        // selected. Clear that natural queue as well; active FileStreams keep
-        // requesting their own pieces independently.
+        // Keep rqbit's normal download queue aligned with the exact file we
+        // resolved. Leaving the selection empty makes HTTP FileStream the sole
+        // piece requester, which can stall startup and generate duplicate
+        // on-demand chunk requests. Selecting one file still avoids downloading
+        // unrelated files from movie bundles and episode packs.
         let api = Api::new(
             self.session
                 .clone(),
@@ -287,10 +289,10 @@ impl TorrentManager {
         );
         api.api_torrent_action_update_only_files(
             TorrentIdOrHash::Id(torrent_id),
-            &std::collections::HashSet::new(),
+            &selected_stream_files(file_idx),
         )
         .await
-        .context("failed to clear torrent file selection")?;
+        .context("failed to select torrent stream file")?;
         if !matches!(
             handle
                 .stats()
@@ -475,6 +477,10 @@ fn stream_only_options() -> AddTorrentOptions {
         only_files: Some(Vec::new()),
         ..Default::default()
     }
+}
+
+fn selected_stream_files(file_idx: usize) -> std::collections::HashSet<usize> {
+    std::collections::HashSet::from([file_idx])
 }
 
 fn is_video_file(name: &str) -> bool {
@@ -1003,6 +1009,81 @@ mod tests {
     #[test]
     fn metadata_lookup_selects_no_files_for_download() {
         assert_eq!(stream_only_options().only_files, Some(Vec::new()));
+    }
+
+    #[test]
+    fn resolved_stream_selects_only_the_chosen_file_for_download() {
+        assert_eq!(
+            selected_stream_files(7),
+            std::collections::HashSet::from([7])
+        );
+    }
+
+    #[tokio::test]
+    async fn rqbit_selected_stream_has_positive_selected_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            TorrentManager::new(
+                dir.path()
+                    .join("data"),
+                dir.path()
+                    .join("cache"),
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let response = manager
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(
+                    &b"d4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:....................ee"[..],
+                ),
+                Some(stream_only_options()),
+            )
+            .await
+            .unwrap();
+        let (torrent_id, handle) = match response {
+            AddTorrentResponse::Added(id, handle)
+            | AddTorrentResponse::AlreadyManaged(id, handle) => (id, handle),
+            AddTorrentResponse::ListOnly(_) => panic!("unexpected list-only response"),
+        };
+        handle
+            .wait_until_initialized()
+            .await
+            .unwrap();
+        assert_eq!(
+            handle
+                .stats()
+                .total_bytes,
+            0
+        );
+
+        Api::new(
+            manager
+                .session
+                .clone(),
+            None,
+            None,
+        )
+        .api_torrent_action_update_only_files(
+            TorrentIdOrHash::Id(torrent_id),
+            &selected_stream_files(0),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            handle
+                .stats()
+                .total_bytes,
+            1
+        );
+        manager
+            .shutdown()
+            .await;
     }
 
     #[test]
