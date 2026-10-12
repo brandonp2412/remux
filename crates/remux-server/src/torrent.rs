@@ -366,10 +366,9 @@ impl TorrentManager {
         let file_idx =
             select_file_index(&files, file_idx_override, wanted_file.as_deref())?;
 
-        // Keep a bounded natural download queue while FileStream serves seeks
-        // with its own priority. For a series bundle, download the selected
-        // episode and its immediate successor completely, even when the TV is
-        // idle. Never select unrelated samples, movies or a whole season pack.
+        // Start rqbit's natural piece download queue for the resolved file.
+        // Also retain the current/next episode prefetch selection rather than
+        // replacing it with a single file and interrupting active playback.
         let existing = api_details_included(&self.session, torrent_id);
         let selected_files =
             merge_episode_prefetch_selection(&files, file_idx, &existing);
@@ -384,7 +383,7 @@ impl TorrentManager {
             &selected_files,
         )
         .await
-        .context("failed to select torrent episode prefetch files")?;
+        .context("failed to select torrent playback and prefetch files")?;
         if !matches!(
             handle
                 .stats()
@@ -1272,6 +1271,82 @@ mod tests {
     #[test]
     fn metadata_lookup_selects_no_files_for_download() {
         assert_eq!(stream_only_options().only_files, Some(Vec::new()));
+    }
+
+    #[test]
+    fn resolved_movie_selects_only_the_chosen_file_for_download() {
+        let files = vec![file("Movie.mkv", 1024), file("Trailer.mkv", 64)];
+        assert_eq!(
+            merge_episode_prefetch_selection(&files, 0, &Default::default()),
+            std::collections::HashSet::from([0])
+        );
+    }
+
+    #[tokio::test]
+    async fn rqbit_selected_stream_has_positive_selected_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            TorrentManager::new(
+                dir.path()
+                    .join("data"),
+                dir.path()
+                    .join("cache"),
+                None,
+                true,
+                None,
+            )
+            .await
+            .unwrap(),
+        );
+        let response = manager
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(
+                    &b"d4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:....................ee"[..],
+                ),
+                Some(stream_only_options()),
+            )
+            .await
+            .unwrap();
+        let (torrent_id, handle) = match response {
+            AddTorrentResponse::Added(id, handle)
+            | AddTorrentResponse::AlreadyManaged(id, handle) => (id, handle),
+            AddTorrentResponse::ListOnly(_) => panic!("unexpected list-only response"),
+        };
+        handle
+            .wait_until_initialized()
+            .await
+            .unwrap();
+        assert_eq!(
+            handle
+                .stats()
+                .total_bytes,
+            0
+        );
+
+        Api::new(
+            manager
+                .session
+                .clone(),
+            None,
+            None,
+        )
+        .api_torrent_action_update_only_files(
+            TorrentIdOrHash::Id(torrent_id),
+            &merge_episode_prefetch_selection(&[file("x.mkv", 1)], 0, &Default::default()),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            handle
+                .stats()
+                .total_bytes,
+            1
+        );
+        manager
+            .shutdown()
+            .await;
     }
 
     #[test]
