@@ -389,12 +389,17 @@ impl TorrentManager {
         )
         .await
         .context("failed to select torrent playback and prefetch files")?;
-        if !matches!(
-            handle
-                .stats()
-                .state,
-            TorrentStatsState::Live
-        ) {
+
+        let selected_stats = handle.stats();
+        if selected_stats.total_bytes == 0 {
+            anyhow::bail!(
+                "torrent file selection produced zero selected bytes for file {} ({})",
+                file_idx,
+                files[file_idx].name
+            );
+        }
+
+        if !matches!(selected_stats.state, TorrentStatsState::Live) {
             if let Err(error) = api
                 .api_torrent_action_start(TorrentIdOrHash::Id(torrent_id))
                 .await
