@@ -108,7 +108,14 @@ fn prefer_available_torrents(sources: &mut [db::Media]) {
     }
     // Stable: keep the client's capability/quality ranking within each tier.
     sources.sort_by_cached_key(|source| {
-        std::cmp::Reverse(torrent_availability_tier(source))
+        // Avoid trying a 20-seed torrent before a 120-seed candidate solely
+        // because both fall in the same coarse availability bucket.
+        let seeders = source
+            .stream_info
+            .as_ref()
+            .and_then(|si| si.seeders)
+            .unwrap_or(-1);
+        std::cmp::Reverse((torrent_availability_tier(source), seeders))
     });
 }
 
@@ -127,6 +134,11 @@ fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
             std::cmp::Reverse((
                 torrent_availability_tier(stream),
                 stream.quality_weight(),
+                stream
+                    .stream_info
+                    .as_ref()
+                    .and_then(|si| si.seeders)
+                    .unwrap_or(-1),
             ))
         });
     } else {
