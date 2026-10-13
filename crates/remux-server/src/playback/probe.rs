@@ -1237,6 +1237,10 @@ fn is_reusable_probe_cache(cached: &api::MediaSourceInfo) -> bool {
     true
 }
 
+fn may_reuse_cached_probe(cached: &api::MediaSourceInfo, is_p2p: bool) -> bool {
+    !is_p2p && is_reusable_probe_cache(cached)
+}
+
 fn can_fallback_to_stale_probe_cache(cached: &api::MediaSourceInfo) -> bool {
     !is_reusable_probe_cache(cached)
         && !cached.is_filename_guess()
@@ -1277,12 +1281,20 @@ pub(crate) async fn probe_stream(
         }
         return Ok((info, stream.clone()));
     }
-    let can_fallback_to_stale = stream
-        .probe_data
+    // Torrent metadata is not source readiness. The descriptor's generic
+    // `is_alive()` check returns true for torrents without contacting peers;
+    // a cached ffprobe must never bypass the live bounded readiness probe.
+    let is_p2p = stream
+        .stream_info
         .as_ref()
-        .is_some_and(can_fallback_to_stale_probe_cache);
+        .is_some_and(|si| si.is_p2p());
+    let can_fallback_to_stale = !is_p2p
+        && stream
+            .probe_data
+            .as_ref()
+            .is_some_and(can_fallback_to_stale_probe_cache);
     if let Some(cached) = &stream.probe_data {
-        if is_reusable_probe_cache(cached) {
+        if may_reuse_cached_probe(cached, is_p2p) {
             let alive = match stream
                 .stream_info
                 .as_ref()
@@ -1636,6 +1648,11 @@ mod probe_tests {
             ..Default::default()
         };
         assert!(is_reusable_probe_cache(&real));
+        assert!(may_reuse_cached_probe(&real, false));
+        assert!(
+            !may_reuse_cached_probe(&real, true),
+            "a torrent with cached ffprobe metadata must still prove live swarm readiness"
+        );
     }
 
     #[test]

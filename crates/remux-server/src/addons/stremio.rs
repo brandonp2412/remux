@@ -1754,7 +1754,7 @@ struct StremioStreamMetadata {
 fn advertised_seeders(text: &str) -> Option<i64> {
     static SEEDERS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = SEEDERS.get_or_init(|| {
-        regex::Regex::new(r"(?i)(?:👤|👥|🌱|seeders?\s*[:=]|seeds?\s*[:=])\s*(\d{1,6}(?:[.,]\d{1,2})?\s*[km]?)")
+        regex::Regex::new(r"(?i)(?:👤|👥|🌱|seeders?\s*[:=]|seeds?\s*[:=])\s*(\d{1,6}(?:,\d{3})*(?:\.\d{1,2})?\s*[km]?)")
             .expect("valid seeder label pattern")
     });
     let value = re
@@ -2120,6 +2120,7 @@ mod tests {
             Some(127)
         );
         assert_eq!(advertised_seeders("👤 1.2K"), Some(1200));
+        assert_eq!(advertised_seeders("👤 1,234"), Some(1234));
         assert_eq!(advertised_seeders("Seeders: 42"), Some(42));
         assert_eq!(advertised_seeders("Seeds=0"), Some(0));
         assert_eq!(advertised_seeders("2160p 1080p 20 GB"), None);
