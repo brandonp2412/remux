@@ -44,6 +44,7 @@ pub struct TorrentPrefetchStatus {
 pub struct TorrentManager {
     session: Arc<Session>,
     http_port: u16,
+    upload_disabled: bool,
     leases: tokio::sync::Mutex<
         std::collections::HashMap<String, std::sync::Weak<TorrentLease>>,
     >,
@@ -86,12 +87,14 @@ impl TorrentManager {
         http_port: Option<u16>,
         disable_dht: bool,
         peer_port: Option<u16>,
+        upload_disabled: bool,
     ) -> Result<Self> {
         let session = Session::new_with_opts(
             data_dir,
             SessionOptions {
                 disable_dht,
                 disable_dht_persistence: disable_dht,
+                disable_upload: upload_disabled,
                 listen_port_range: peer_port.map(|p| p..p + 10),
                 persistence: Some(SessionPersistenceConfig::Json {
                     folder: Some(cache_dir.join("rqbit")),
@@ -122,6 +125,7 @@ impl TorrentManager {
         Ok(Self {
             session,
             http_port: bound_port,
+            upload_disabled,
             leases: Default::default(),
         })
     }
@@ -188,7 +192,7 @@ impl TorrentManager {
         Ok(())
     }
 
-    pub async fn from_config(config: &crate::Config) -> Result<Self> {
+    pub async fn from_config(config: &crate::Config, upload_kbps: i64) -> Result<Self> {
         let data_dir = config
             .torrent_data_dir
             .as_deref()
@@ -201,6 +205,7 @@ impl TorrentManager {
             config.torrent_http_port,
             config.disable_dht,
             config.torrent_peer_port,
+            upload_kbps <= 0,
         )
         .await
     }
@@ -484,18 +489,26 @@ impl TorrentManager {
             .ok()
     }
 
-    /// Apply upload/download speed limits.  0 = no limit (for download) or
-    /// effectively-disabled (for upload — 1 bps is used since the API requires
-    /// `NonZeroU32`).
-    pub fn update_limits(&self, upload_kbps: i64, download_kbps: i64) {
+    pub fn upload_disabled(&self) -> bool {
+        self.upload_disabled
+    }
+
+    /// Apply upload/download speed limits. Upload mode is fixed when the
+    /// librqbit session is created because disable-upload is a session-level
+    /// switch; callers must recreate the manager when crossing zero.
+    pub fn update_limits(&self, upload_kbps: i64, download_kbps: i64) -> Result<()> {
         use std::num::NonZeroU32;
-        // upload: 0 means "don't seed" — clamp to 1 bps (librqbit requires NonZero)
-        let upload = NonZeroU32::new(if upload_kbps <= 0 {
-            1
+
+        anyhow::ensure!(
+            self.upload_disabled == (upload_kbps <= 0),
+            "torrent upload mode changed without recreating the rqbit session"
+        );
+
+        let upload = if self.upload_disabled {
+            None
         } else {
-            (upload_kbps as u32).saturating_mul(1024)
-        });
-        // download: 0 means unlimited → None
+            NonZeroU32::new((upload_kbps as u32).saturating_mul(1024))
+        };
         let download = if download_kbps <= 0 {
             None
         } else {
@@ -507,6 +520,7 @@ impl TorrentManager {
         self.session
             .ratelimits
             .set_download_bps(download);
+        Ok(())
     }
 }
 
@@ -982,6 +996,38 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn disabled_upload_uses_session_mode_instead_of_impossible_rate_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = TorrentManager::new(
+            dir.path()
+                .join("data"),
+            dir.path()
+                .join("cache"),
+            None,
+            true,
+            None,
+            true,
+        )
+        .await
+        .unwrap();
+
+        assert!(manager.upload_disabled());
+        assert!(
+            manager
+                .update_limits(0, 0)
+                .is_ok()
+        );
+        assert!(
+            manager
+                .update_limits(1, 0)
+                .is_err()
+        );
+        manager
+            .shutdown()
+            .await;
+    }
+
+    #[tokio::test]
     async fn cleanup_waits_for_sessions_and_readers_and_respects_reacquisition() {
         let dir = tempfile::tempdir().unwrap();
         let manager = Arc::new(
@@ -993,6 +1039,7 @@ mod tests {
                 None,
                 true,
                 None,
+                true,
             )
             .await
             .unwrap(),
@@ -1294,6 +1341,7 @@ mod tests {
                 None,
                 true,
                 None,
+                true,
             )
             .await
             .unwrap(),
@@ -1333,7 +1381,11 @@ mod tests {
         )
         .api_torrent_action_update_only_files(
             TorrentIdOrHash::Id(torrent_id),
-            &merge_episode_prefetch_selection(&[file("x.mkv", 1)], 0, &Default::default()),
+            &merge_episode_prefetch_selection(
+                &[file("x.mkv", 1)],
+                0,
+                &Default::default(),
+            ),
         )
         .await
         .unwrap();
