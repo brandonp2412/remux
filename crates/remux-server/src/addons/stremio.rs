@@ -1748,6 +1748,53 @@ struct StremioStreamMetadata {
     seeders: Option<i64>,
 }
 
+/// Torrentio reports seeders in its display title (e.g. "👤 127"), not
+/// necessarily in the structured `seeders` field. Never treat arbitrary
+/// numbers in filenames or resolutions as peers.
+fn advertised_seeders(text: &str) -> Option<i64> {
+    static SEEDERS: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = SEEDERS.get_or_init(|| {
+        regex::Regex::new(r"(?i)(?:👤|👥|🌱|seeders?\s*[:=]|seeds?\s*[:=])\s*(\d{1,6}(?:[.,]\d{1,2})?\s*[km]?)")
+            .expect("valid seeder label pattern")
+    });
+    let value = re
+        .captures(text)?
+        .get(1)?
+        .as_str()
+        .trim();
+    let suffix = value
+        .chars()
+        .last()
+        .filter(|c| matches!(c, 'k' | 'K' | 'm' | 'M'));
+    let number = if suffix.is_some() {
+        &value[..value.len() - 1]
+    } else {
+        value
+    };
+    let number = number
+        .trim()
+        .replace(',', "");
+    let parsed = if suffix.is_some() {
+        let multiplier = if suffix.is_some_and(|s| s == 'm' || s == 'M') {
+            1_000_000.0
+        } else {
+            1_000.0
+        };
+        (number
+            .parse::<f64>()
+            .ok()?
+            * multiplier)
+            .round() as i64
+    } else {
+        number
+            .parse::<i64>()
+            .ok()?
+    };
+    (0..=10_000_000)
+        .contains(&parsed)
+        .then_some(parsed)
+}
+
 fn stremio_stream_metadata(stream: &sdks::stremio::Stream) -> StremioStreamMetadata {
     let stream_data = stream
         .stream_data
@@ -1787,7 +1834,19 @@ fn stremio_stream_metadata(stream: &sdks::stremio::Stream) -> StremioStreamMetad
             }),
         seeders: stream
             .seeders
-            .or_else(|| torrent.and_then(|torrent| torrent.seeders)),
+            .or_else(|| torrent.and_then(|torrent| torrent.seeders))
+            .or_else(|| {
+                stream
+                    .title
+                    .as_deref()
+                    .and_then(advertised_seeders)
+            })
+            .or_else(|| {
+                stream
+                    .description
+                    .as_deref()
+                    .and_then(advertised_seeders)
+            }),
     }
 }
 
@@ -2052,6 +2111,30 @@ mod tests {
             .find(|r| r.name == ResourceType::Stream)
             .unwrap();
         assert_eq!(stream.id_prefixes, None);
+    }
+
+    #[test]
+    fn advertised_seeders_uses_explicit_labels_only() {
+        assert_eq!(
+            advertised_seeders("Torrentio 4K\n👤 127 💾 7.1 GB"),
+            Some(127)
+        );
+        assert_eq!(advertised_seeders("👤 1.2K"), Some(1200));
+        assert_eq!(advertised_seeders("Seeders: 42"), Some(42));
+        assert_eq!(advertised_seeders("Seeds=0"), Some(0));
+        assert_eq!(advertised_seeders("2160p 1080p 20 GB"), None);
+        assert_eq!(advertised_seeders("👤 unknown"), None);
+    }
+
+    #[test]
+    fn torrentio_title_seeder_count_is_preserved() {
+        let stream: sdks::stremio::Stream = serde_json::from_value(serde_json::json!({
+            "infoHash": "0123456789abcdef0123456789abcdef01234567",
+            "name": "Torrentio\n1080p",
+            "title": "Movie 2026\n👤 84 | 💾 2.4 GB"
+        }))
+        .unwrap();
+        assert_eq!(stremio_stream_metadata(&stream).seeders, Some(84));
     }
 
     #[test]

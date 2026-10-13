@@ -884,6 +884,8 @@ pub struct StreamsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Stream {
+    /// Torrentio and other addons often put seeder counts in this display title.
+    pub title: Option<String>,
     pub info_hash: Option<String>,
     pub url: Option<String>,
     pub nzb_url: Option<String>,

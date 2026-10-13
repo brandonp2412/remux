@@ -71,9 +71,67 @@ pub(crate) struct StreamService {
     pub streams: Vec<db::Media>,
 }
 
+/// Coarse swarm-health buckets. Seed counts are estimates; probes remain the
+/// authority on actual source readiness and playable bytes.
+fn torrent_availability_tier(source: &db::Media) -> u8 {
+    let Some(info) = source
+        .stream_info
+        .as_ref()
+    else {
+        return 1;
+    };
+    if !info.is_p2p() {
+        return 1;
+    }
+    match info.seeders {
+        Some(20..) => 4,
+        Some(5..) => 3,
+        Some(1..) => 2,
+        Some(0) => 0,
+        _ => 1,
+    }
+}
+
+fn prefer_available_torrents(sources: &mut [db::Media]) {
+    // Preserve priority of non-P2P or cached service sources: advertised
+    // seeder counts are only comparable between torrent candidates.
+    if !sources
+        .iter()
+        .all(|source| {
+            source
+                .stream_info
+                .as_ref()
+                .is_some_and(|si| si.is_p2p())
+        })
+    {
+        return;
+    }
+    // Stable: keep the client's capability/quality ranking within each tier.
+    sources.sort_by_cached_key(|source| {
+        std::cmp::Reverse(torrent_availability_tier(source))
+    });
+}
+
 fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
     let mut pool = streams.to_vec();
-    pool.sort_by_cached_key(|stream| std::cmp::Reverse(stream.quality_weight()));
+    if pool
+        .iter()
+        .all(|source| {
+            source
+                .stream_info
+                .as_ref()
+                .is_some_and(|si| si.is_p2p())
+        })
+    {
+        pool.sort_by_cached_key(|stream| {
+            std::cmp::Reverse((
+                torrent_availability_tier(stream),
+                stream.quality_weight(),
+            ))
+        });
+    } else {
+        pool.sort_by_cached_key(|stream| std::cmp::Reverse(stream.quality_weight()));
+    }
     pool
 }
 
@@ -173,6 +231,7 @@ impl StreamService {
             );
             (info, allow_subtitle_extraction)
         });
+        prefer_available_torrents(sources);
         extraction
     }
 
@@ -564,7 +623,9 @@ impl StreamService {
         StreamSelection {
             candidates,
             probe_pool,
-            restrict_resolution: true,
+            // Auto-play may fall back from an unseeded 4K source to a viable
+            // 1080p release. Explicitly selected resolutions stay respected.
+            restrict_resolution: specific_requested,
             specific_requested,
         }
     }
@@ -1282,6 +1343,45 @@ mod tests {
     /// Candidates come out in the order PlaybackInfo lists them, and the
     /// first is the one probed and auto-played: addon order with sorting
     /// disabled or for group representatives, capability ranking otherwise.
+    #[test]
+    fn swarm_health_prioritizes_playable_torrents_over_unseeded_4k() {
+        let torrent = |name: &str, seeders: Option<i64>| db::Media {
+            title: name.to_string(),
+            stream_info: Some(StreamInfo {
+                descriptor: StreamDescriptor::Torrent {
+                    info_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                    file_hint: None,
+                    file_idx: None,
+                    trackers: vec![],
+                },
+                filename: Some(format!("{name}.mkv")),
+                seeders,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut sources = vec![
+            torrent("4k_unseeded", Some(0)),
+            torrent("1080p_fast", Some(58)),
+            torrent("4k_unknown", None),
+            torrent("1080p_slow", Some(2)),
+        ];
+        prefer_available_torrents(&mut sources);
+        assert_eq!(
+            sources
+                .iter()
+                .map(|m| m
+                    .title
+                    .as_str())
+                .collect::<Vec<_>>(),
+            vec!["1080p_fast", "1080p_slow", "4k_unknown", "4k_unseeded"]
+        );
+        assert_eq!(quality_ordered_probe_pool(&sources)[0].title, "1080p_fast");
+        let mut mixed = vec![torrent("p2p", Some(100)), db::Media::default()];
+        prefer_available_torrents(&mut mixed);
+        assert_eq!(mixed[0].title, "p2p");
+    }
+
     #[tokio::test]
     async fn rank_candidates_orders_like_playback_info() {
         use crate::integration_test::{authenticated_server, insert_test_source};
