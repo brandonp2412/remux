@@ -331,15 +331,16 @@ pub async fn init_app(
         .p2p_enabled
         .unwrap_or(true);
     let torrent_mgr = if p2p_enabled {
-        let mgr = torrent::TorrentManager::from_config(&config).await?;
+        let upload_kbps = saved_config
+            .p2p_upload_speed_kbps
+            .unwrap_or(0);
+        let mgr = torrent::TorrentManager::from_config(&config, upload_kbps).await?;
         mgr.update_limits(
-            saved_config
-                .p2p_upload_speed_kbps
-                .unwrap_or(0),
+            upload_kbps,
             saved_config
                 .p2p_download_speed_kbps
                 .unwrap_or(0),
-        );
+        )?;
         Some(mgr)
     } else {
         None
@@ -508,33 +509,42 @@ impl AppContext {
         }
     }
 
-    pub async fn set_p2p_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+    pub async fn set_p2p_enabled(
+        &self,
+        enabled: bool,
+        upload_kbps: i64,
+    ) -> anyhow::Result<()> {
+        let desired_upload_disabled = upload_kbps <= 0;
         let current = self
             .torrent
             .read()
             .await
             .clone();
-        match (enabled, current.is_some()) {
-            (true, false) => {
-                let mgr =
-                    Arc::new(torrent::TorrentManager::from_config(&self.config).await?);
-                *self
-                    .torrent
-                    .write()
-                    .await = Some(mgr);
+        let recreate = enabled
+            && current
+                .as_ref()
+                .is_some_and(|mgr| mgr.upload_disabled() != desired_upload_disabled);
+
+        if !enabled || recreate {
+            let old = self
+                .torrent
+                .write()
+                .await
+                .take();
+            if let Some(mgr) = old {
+                mgr.shutdown()
+                    .await;
             }
-            (false, true) => {
-                let old = self
-                    .torrent
-                    .write()
-                    .await
-                    .take();
-                if let Some(mgr) = old {
-                    mgr.shutdown()
-                        .await;
-                }
-            }
-            _ => {}
+        }
+
+        if enabled && (current.is_none() || recreate) {
+            let mgr = Arc::new(
+                torrent::TorrentManager::from_config(&self.config, upload_kbps).await?,
+            );
+            *self
+                .torrent
+                .write()
+                .await = Some(mgr);
         }
         Ok(())
     }

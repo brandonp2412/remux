@@ -272,9 +272,12 @@ pub async fn update_system_configuration(
     let p2p_enabled = config
         .p2p_enabled
         .unwrap_or(true);
+    let upload_kbps = config
+        .p2p_upload_speed_kbps
+        .unwrap_or(0);
     state
         .ctx
-        .set_p2p_enabled(p2p_enabled)
+        .set_p2p_enabled(p2p_enabled, upload_kbps)
         .await?;
     if p2p_enabled {
         if let Some(mgr) = state
@@ -285,13 +288,11 @@ pub async fn update_system_configuration(
             .clone()
         {
             mgr.update_limits(
-                config
-                    .p2p_upload_speed_kbps
-                    .unwrap_or(0),
+                upload_kbps,
                 config
                     .p2p_download_speed_kbps
                     .unwrap_or(0),
-            );
+            )?;
         }
     }
     crate::db::Settings::set_config(
