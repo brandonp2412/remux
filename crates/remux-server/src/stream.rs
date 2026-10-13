@@ -307,6 +307,13 @@ impl StreamDescriptor {
     /// Instantiate the runtime service for self-contained variants.
     /// Do **not** call this for `Opendal` — those must go through the addon.
     pub fn into_source(self) -> Box<dyn StreamSource> {
+        self.into_source_with_expected_bitrate(None)
+    }
+
+    pub fn into_source_with_expected_bitrate(
+        self,
+        expected_bitrate_bps: Option<i64>,
+    ) -> Box<dyn StreamSource> {
         match self {
             Self::Http {
                 url,
@@ -328,6 +335,7 @@ impl StreamDescriptor {
                 file_hint,
                 file_idx,
                 trackers,
+                expected_bitrate_bps,
             }),
             Self::Rtsp { .. } => {
                 panic!("Rtsp descriptors must be served through the transcode path")
@@ -524,6 +532,7 @@ pub struct TorrentSource {
     pub file_hint: Option<String>,
     pub file_idx: Option<usize>,
     pub trackers: Vec<TrackerUrl>,
+    pub expected_bitrate_bps: Option<i64>,
 }
 
 impl TorrentSource {
@@ -547,6 +556,72 @@ impl TorrentSource {
             m.push_str(&format!("&file={}", urlencoding::encode(hint)));
         }
         m
+    }
+
+    async fn wait_until_ready(
+        &self,
+        torrent: &crate::torrent::TorrentManager,
+    ) -> anyhow::Result<()> {
+        const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+        const POLL: std::time::Duration = std::time::Duration::from_millis(250);
+        const MIN_READY_BYTES: u64 = 4 * 1024 * 1024;
+
+        let deadline = tokio::time::Instant::now() + READY_WAIT;
+        let mut last_status = None;
+        loop {
+            if let Some(status) = torrent.prefetch_status(
+                &self.info_hash,
+                self.file_idx,
+                self.file_hint
+                    .as_deref(),
+            ) {
+                let required = status
+                    .current_total_bytes
+                    .min(MIN_READY_BYTES);
+                let fully_cached = status.current_total_bytes > 0
+                    && status.current_cached_bytes >= status.current_total_bytes;
+                let required_download_mibps = self
+                    .expected_bitrate_bps
+                    .filter(|bitrate| *bitrate > 0)
+                    .map(|bitrate| bitrate as f64 / 8.0 / 1024.0 / 1024.0 * 1.15)
+                    .unwrap_or(1.0)
+                    .max(1.0);
+                let downloading_fast_enough = status.current_cached_bytes >= required
+                    && status.download_mibps >= required_download_mibps;
+                if required > 0 && (fully_cached || downloading_fast_enough) {
+                    tracing::info!(
+                        cached_bytes = status.current_cached_bytes,
+                        total_bytes = status.current_total_bytes,
+                        download_mibps = status.download_mibps,
+                        required_bytes = required,
+                        required_download_mibps,
+                        expected_bitrate_bps = self.expected_bitrate_bps,
+                        fully_cached,
+                        "torrent source reached probe-ready cache"
+                    );
+                    return Ok(());
+                }
+                last_status = Some(status);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                if let Some(status) = last_status {
+                    anyhow::bail!(
+                        "torrent cached {} of {} bytes at {:.2} MiB/s within 6 seconds; need full cache or at least {} cached bytes at {:.2} MiB/s before probing",
+                        status.current_cached_bytes,
+                        status.current_total_bytes,
+                        status.download_mibps,
+                        status.current_total_bytes.min(MIN_READY_BYTES),
+                        self.expected_bitrate_bps
+                            .filter(|bitrate| *bitrate > 0)
+                            .map(|bitrate| bitrate as f64 / 8.0 / 1024.0 / 1024.0 * 1.15)
+                            .unwrap_or(1.0)
+                            .max(1.0),
+                    );
+                }
+                anyhow::bail!("torrent readiness status unavailable within 6 seconds");
+            }
+            tokio::time::sleep(POLL).await;
+        }
     }
 }
 
@@ -774,6 +849,9 @@ impl StreamSource for TorrentSource {
             .resolve_url(&self.to_magnet())
             .await
             .context_bad_request("failed to resolve torrent")?;
+        self.wait_until_ready(&torrent)
+            .await
+            .context_bad_request("torrent source is not ready")?;
 
         let response = HttpSource {
             url: resolved,

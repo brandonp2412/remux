@@ -30,6 +30,10 @@ pub async fn stream_proxy(
     .await?
     .context_not_found("not found")?;
 
+    let expected_bitrate_bps = media
+        .probe_data
+        .as_ref()
+        .and_then(|probe| probe.bitrate);
     let descriptor = media
         .stream_info
         .map(|si| si.descriptor)
@@ -68,7 +72,7 @@ pub async fn stream_proxy(
     }
 
     descriptor
-        .into_source()
+        .into_source_with_expected_bitrate(expected_bitrate_bps)
         .serve(&state, &headers)
         .await
 }
