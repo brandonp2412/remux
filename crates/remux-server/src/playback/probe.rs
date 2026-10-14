@@ -1421,26 +1421,63 @@ fn select_candidates(
         })
         .collect();
 
-    // The preferred source is still tried first. Once it fails, spend the
-    // bounded startup budget on materially different resolution/codec tiers
-    // before retrying near-duplicates. Preserve the ranked order within each
-    // class so healthy-source ranking remains authoritative.
+    // The preferred source is still tried first. Once it fails, allow one
+    // same-resolution codec alternative, then give each known different
+    // resolution tier a prompt chance before spending more of the bounded
+    // startup budget on same-tier variants or near-duplicates. This prevents
+    // a stalled 4K swarm from consuming every probe slot while a ranked
+    // 1080p/720p fallback is available, without slowing a healthy primary.
     let ordered: Vec<_> = if restrict_resolution {
         eligible
     } else {
-        let mut seen = HashSet::new();
-        seen.insert(fallback_probe_tier(primary));
-        let mut diverse = Vec::with_capacity(eligible.len());
+        let primary_tier = fallback_probe_tier(primary);
+        let primary_resolution = primary_tier
+            .0
+            .clone();
+        let mut seen_tiers = HashSet::new();
+        seen_tiers.insert(primary_tier);
+
+        let mut first_same_resolution_alt = None;
+        let mut seen_other_resolutions = HashSet::new();
+        let mut first_other_resolutions = Vec::new();
+        let mut diverse_remaining = Vec::new();
         let mut repeats = Vec::new();
+
         for candidate in eligible {
-            if seen.insert(fallback_probe_tier(candidate)) {
-                diverse.push(candidate);
-            } else {
+            let tier = fallback_probe_tier(candidate);
+            if !seen_tiers.insert(tier.clone()) {
                 repeats.push(candidate);
+                continue;
+            }
+
+            let resolution = tier
+                .0
+                .clone();
+            if resolution == primary_resolution && first_same_resolution_alt.is_none() {
+                first_same_resolution_alt = Some(candidate);
+            } else if resolution.is_some()
+                && resolution != primary_resolution
+                && seen_other_resolutions.insert(resolution)
+            {
+                first_other_resolutions.push(candidate);
+            } else {
+                diverse_remaining.push(candidate);
             }
         }
-        diverse.extend(repeats);
-        diverse
+
+        let mut ordered = Vec::with_capacity(
+            usize::from(first_same_resolution_alt.is_some())
+                + first_other_resolutions.len()
+                + diverse_remaining.len()
+                + repeats.len(),
+        );
+        if let Some(candidate) = first_same_resolution_alt {
+            ordered.push(candidate);
+        }
+        ordered.extend(first_other_resolutions);
+        ordered.extend(diverse_remaining);
+        ordered.extend(repeats);
+        ordered
     };
 
     ordered
