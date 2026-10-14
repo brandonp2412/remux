@@ -307,12 +307,13 @@ impl StreamDescriptor {
     /// Instantiate the runtime service for self-contained variants.
     /// Do **not** call this for `Opendal` — those must go through the addon.
     pub fn into_source(self) -> Box<dyn StreamSource> {
-        self.into_source_with_expected_bitrate(None)
+        self.into_source_with_expected_bitrate(None, None)
     }
 
     pub fn into_source_with_expected_bitrate(
         self,
         expected_bitrate_bps: Option<i64>,
+        expected_duration_secs: Option<i64>,
     ) -> Box<dyn StreamSource> {
         match self {
             Self::Http {
@@ -336,6 +337,7 @@ impl StreamDescriptor {
                 file_idx,
                 trackers,
                 expected_bitrate_bps,
+                expected_duration_secs,
             }),
             Self::Rtsp { .. } => {
                 panic!("Rtsp descriptors must be served through the transcode path")
@@ -533,9 +535,26 @@ pub struct TorrentSource {
     pub file_idx: Option<usize>,
     pub trackers: Vec<TrackerUrl>,
     pub expected_bitrate_bps: Option<i64>,
+    pub expected_duration_secs: Option<i64>,
 }
 
 impl TorrentSource {
+    /// A per-release probe bitrate wins. Otherwise compute average required
+    /// bandwidth from the *selected torrent file's* actual byte length and
+    /// the title's duration. Without this, an unprobed 30 GB 4K source could
+    /// incorrectly pass the generic 1 MiB/s readiness floor.
+    fn expected_playback_bitrate_bps(&self, selected_bytes: u64) -> Option<i64> {
+        self.expected_bitrate_bps.filter(|bitrate| *bitrate > 0).or_else(|| {
+            let seconds = u64::try_from(self.expected_duration_secs?).ok()?;
+            if seconds < 60 || selected_bytes == 0 {
+                return None;
+            }
+            i64::try_from(u128::from(selected_bytes) * 8 / u128::from(seconds))
+                .ok()
+                .filter(|bitrate| *bitrate > 0)
+        })
+    }
+
     fn to_magnet(&self) -> String {
         let mut m = format!("magnet:?xt=urn:btih:{}", self.info_hash);
         let trackers = &self.trackers;
@@ -558,13 +577,102 @@ impl TorrentSource {
         m
     }
 
+    async fn probe_readable_range(
+        resolved_url: &str,
+        start: u64,
+        bytes_needed: usize,
+        required_download_mibps: f64,
+        wait: std::time::Duration,
+    ) -> anyhow::Result<(usize, f64)> {
+        let probe_range = format!("bytes={start}-");
+        let started_at = tokio::time::Instant::now();
+        let received = tokio::time::timeout(wait, async {
+            let response = STREAM_PROXY_CLIENT
+                .get(resolved_url)
+                .header(http::header::RANGE, &probe_range)
+                .send()
+                .await?;
+            anyhow::ensure!(
+                response.status() == http::StatusCode::PARTIAL_CONTENT
+                    || start == 0 && response.status().is_success(),
+                "range at byte {start} returned HTTP {}",
+                response.status()
+            );
+            let mut stream = response.bytes_stream();
+            let mut received = 0usize;
+            while received < bytes_needed {
+                let Some(chunk) = stream.next().await else {
+                    break;
+                };
+                received = received.saturating_add(chunk?.len());
+            }
+            anyhow::ensure!(
+                received >= bytes_needed,
+                "range at byte {start} produced only {received} of {bytes_needed} required bytes"
+            );
+            anyhow::Ok(received)
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "range at byte {start} timed out after {:.2}s",
+                wait.as_secs_f64()
+            )
+        })??;
+        let elapsed_secs = started_at
+            .elapsed()
+            .as_secs_f64()
+            .max(0.001);
+        let readable_mibps = received as f64 / 1024.0 / 1024.0 / elapsed_secs;
+        anyhow::ensure!(
+            readable_mibps >= required_download_mibps,
+            "range at byte {start} read {received} bytes at {readable_mibps:.2} MiB/s, below required {required_download_mibps:.2} MiB/s"
+        );
+        Ok((received, readable_mibps))
+    }
+
+    /// Require real buffered startup bytes when a swarm is only slightly slower
+    /// than playback. A fast swarm needs just the usual short range proof;
+    /// one at 80-110% of the playback rate must first supply eight contiguous
+    /// MiB, giving the player time to ride out short download fluctuations.
+    /// Materially slower swarms are rejected rather than buffering indefinitely.
+    fn readiness_plan(
+        expected_bitrate_bps: Option<i64>,
+        download_mibps: f64,
+    ) -> Option<(usize, f64, bool)> {
+        const MIB: usize = 1024 * 1024;
+        if !download_mibps.is_finite() || download_mibps <= 0.0 {
+            return None;
+        }
+        if let Some(playback_mibps) = expected_bitrate_bps
+            .filter(|bps| *bps > 0)
+            .map(|bps| bps as f64 / 8.0 / MIB as f64)
+        {
+            let minimum_sustainable = (playback_mibps * 0.8).max(0.25);
+            if download_mibps < minimum_sustainable {
+                return None;
+            }
+            let needs_buffer = download_mibps < playback_mibps * 1.1;
+            let startup_bytes = if needs_buffer { 8 * MIB } else { MIB };
+            return Some((startup_bytes, minimum_sustainable, needs_buffer));
+        }
+        (download_mibps >= 1.0).then_some((MIB, 1.0, false))
+    }
+
     async fn wait_until_ready(
         &self,
         torrent: &crate::torrent::TorrentManager,
+        resolved_url: &str,
+        requested_range: Option<&str>,
     ) -> anyhow::Result<()> {
-        const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(6);
+        const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(14);
         const POLL: std::time::Duration = std::time::Duration::from_millis(250);
-        const MIN_READY_BYTES: u64 = 4 * 1024 * 1024;
+        // The HTTP Range proof is the authoritative readiness check. Trigger it once
+        // there is enough aggregate activity for one probe chunk instead of waiting
+        // for 4 MiB of unrelated pieces; the old 4 MiB gate could consume nearly
+        // the entire readiness budget before checking the bytes the client needs.
+                const RANGE_PROBE_BYTES: usize = 1024 * 1024;
+        const RANGE_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
         let deadline = tokio::time::Instant::now() + READY_WAIT;
         let mut last_status = None;
@@ -575,53 +683,183 @@ impl TorrentSource {
                 self.file_hint
                     .as_deref(),
             ) {
-                let required = status
-                    .current_total_bytes
-                    .min(MIN_READY_BYTES);
                 let fully_cached = status.current_total_bytes > 0
                     && status.current_cached_bytes >= status.current_total_bytes;
-                let required_download_mibps = self
-                    .expected_bitrate_bps
-                    .filter(|bitrate| *bitrate > 0)
-                    .map(|bitrate| bitrate as f64 / 8.0 / 1024.0 / 1024.0 * 1.15)
-                    .unwrap_or(1.0)
-                    .max(1.0);
-                let downloading_fast_enough = status.current_cached_bytes >= required
-                    && status.download_mibps >= required_download_mibps;
-                if required > 0 && (fully_cached || downloading_fast_enough) {
+                let expected_bitrate_bps =
+                    self.expected_playback_bitrate_bps(status.current_total_bytes);
+                let plan = Self::readiness_plan(expected_bitrate_bps, status.download_mibps);
+                if fully_cached {
                     tracing::info!(
                         cached_bytes = status.current_cached_bytes,
                         total_bytes = status.current_total_bytes,
-                        download_mibps = status.download_mibps,
-                        required_bytes = required,
-                        required_download_mibps,
-                        expected_bitrate_bps = self.expected_bitrate_bps,
-                        fully_cached,
-                        "torrent source reached probe-ready cache"
+                        expected_bitrate_bps,
+                        "fully cached torrent source fast-pathed via persisted piece state"
                     );
                     return Ok(());
+                }
+                if let Some((startup_target_bytes, required_download_mibps, buffering)) = plan {
+                    let required = status.current_total_bytes.min(startup_target_bytes as u64);
+                    if required == 0 || status.current_cached_bytes < required {
+                        last_status = Some(status);
+                        if tokio::time::Instant::now() >= deadline {
+                            break;
+                        }
+                        tokio::time::sleep(POLL).await;
+                        continue;
+                    }
+                    // Aggregate torrent bytes are not a playable buffer. Verify actual
+                    // consecutive startup bytes and seek/tail access before accepting.
+                    // When bandwidth is slightly below the estimated media bitrate,
+                    // demand a larger continuous read, not an arbitrarily high speed.
+                    let (probe_start, probe_end) = requested_range
+                        .and_then(|range| {
+                            parse_range(range, status.current_total_bytes).ok()
+                        })
+                        .unwrap_or((
+                            0,
+                            status
+                                .current_total_bytes
+                                .saturating_sub(1),
+                        ));
+                    let probe_bytes_needed = usize::try_from(
+                        probe_end
+                            .saturating_sub(probe_start)
+                            .saturating_add(1)
+                            .min(startup_target_bytes as u64),
+                    )
+                    .unwrap_or(startup_target_bytes);
+                    let tail_probe_start = status
+                        .current_total_bytes
+                        .saturating_sub(RANGE_PROBE_BYTES as u64);
+                    let tail_probe_bytes_needed = usize::try_from(
+                        status
+                            .current_total_bytes
+                            .saturating_sub(tail_probe_start)
+                            .min(RANGE_PROBE_BYTES as u64),
+                    )
+                    .unwrap_or(RANGE_PROBE_BYTES);
+
+                    let range_readable: anyhow::Result<(usize, f64, usize, f64)> =
+                        async {
+                            let remaining = deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            anyhow::ensure!(
+                                !remaining.is_zero(),
+                                "readiness budget exhausted before startup range check"
+                            );
+                            let (startup_bytes, startup_read_mibps) =
+                                Self::probe_readable_range(
+                                    resolved_url,
+                                    probe_start,
+                                    probe_bytes_needed,
+                                    required_download_mibps,
+                                    RANGE_PROBE_WAIT.min(remaining),
+                                )
+                                .await?;
+
+                            // For a slightly slower source with a verified eight-MiB
+                            // startup buffer, do not reject playback solely because
+                            // the far end of a multi-GB file is not downloaded yet.
+                            // ffprobe decides whether this container truly needs that
+                            // optional tail metadata; the startup bytes are real.
+                            if buffering {
+                                // Record the skipped tail explicitly rather than claiming
+                                // the startup read also proved the end of the file.
+                                return Ok((startup_bytes, startup_read_mibps, 0, 0.0));
+                            }
+                            if tail_probe_start == probe_start
+                                || tail_probe_bytes_needed == 0
+                            {
+                                return Ok((
+                                    startup_bytes,
+                                    startup_read_mibps,
+                                    startup_bytes,
+                                    startup_read_mibps,
+                                ));
+                            }
+
+                            let remaining = deadline
+                                .saturating_duration_since(tokio::time::Instant::now());
+                            anyhow::ensure!(
+                                !remaining.is_zero(),
+                                "readiness budget exhausted before tail range check"
+                            );
+                            let (tail_bytes, tail_read_mibps) =
+                                Self::probe_readable_range(
+                                    resolved_url,
+                                    tail_probe_start,
+                                    tail_probe_bytes_needed,
+                                    required_download_mibps,
+                                    RANGE_PROBE_WAIT.min(remaining),
+                                )
+                                .await?;
+                            Ok((
+                                startup_bytes,
+                                startup_read_mibps,
+                                tail_bytes,
+                                tail_read_mibps,
+                            ))
+                        }
+                        .await;
+
+                    match range_readable {
+                        Ok((
+                            startup_bytes,
+                            startup_read_mibps,
+                            tail_bytes,
+                            tail_read_mibps,
+                        )) => {
+                            tracing::info!(
+                                cached_bytes = status.current_cached_bytes,
+                                total_bytes = status.current_total_bytes,
+                                download_mibps = status.download_mibps,
+                                live_peers = status.live_peers,
+                                required_bytes = required,
+                                required_download_mibps,
+                                expected_bitrate_bps,
+                                fully_cached,
+                                buffering,
+                                startup_bytes,
+                                startup_read_mibps,
+                                probe_start,
+                                tail_bytes,
+                                tail_read_mibps,
+                                tail_probe_start,
+                                "torrent source reached probe-ready cache"
+                            );
+                            return Ok(());
+                        }
+                        Err(error) => {
+                            tracing::debug!(
+                                %error,
+                                cached_bytes = status.current_cached_bytes,
+                                download_mibps = status.download_mibps,
+                                live_peers = status.live_peers,
+                                required_download_mibps,
+                                probe_start,
+                                tail_probe_start,
+                                "torrent client ranges not sustainably readable yet"
+                            );
+                        }
+                    }
                 }
                 last_status = Some(status);
             }
             if tokio::time::Instant::now() >= deadline {
-                if let Some(status) = last_status {
-                    anyhow::bail!(
-                        "torrent cached {} of {} bytes at {:.2} MiB/s within 6 seconds; need full cache or at least {} cached bytes at {:.2} MiB/s before probing",
-                        status.current_cached_bytes,
-                        status.current_total_bytes,
-                        status.download_mibps,
-                        status.current_total_bytes.min(MIN_READY_BYTES),
-                        self.expected_bitrate_bps
-                            .filter(|bitrate| *bitrate > 0)
-                            .map(|bitrate| bitrate as f64 / 8.0 / 1024.0 / 1024.0 * 1.15)
-                            .unwrap_or(1.0)
-                            .max(1.0),
-                    );
-                }
-                anyhow::bail!("torrent readiness status unavailable within 6 seconds");
+                break;
             }
             tokio::time::sleep(POLL).await;
         }
+        if let Some(status) = last_status {
+            anyhow::bail!(
+                "torrent cached {} of {} bytes at {:.2} MiB/s in 14 seconds, but could not prove buffered startup and tail ranges (media bitrate {:?} bit/s)",
+                status.current_cached_bytes,
+                status.current_total_bytes,
+                status.download_mibps,
+                self.expected_playback_bitrate_bps(status.current_total_bytes),
+            );
+        }
+        anyhow::bail!("torrent readiness status unavailable within 14 seconds");
     }
 }
 
@@ -842,16 +1080,73 @@ impl StreamSource for TorrentSource {
             .clone()
             .ok_or_else(|| anyhow::anyhow!("P2P is disabled"))
             .context_bad_request("P2P is disabled")?;
+        const TORRENT_RESOLVE_WAIT: std::time::Duration =
+            std::time::Duration::from_secs(6);
+
         let lease = torrent
             .acquire(&self.info_hash)
             .await;
-        let resolved = torrent
-            .resolve_url(&self.to_magnet())
+        let resolved = match tokio::time::timeout(
+            TORRENT_RESOLVE_WAIT,
+            torrent.resolve_url(&self.to_magnet()),
+        )
+        .await
+        {
+            Ok(Ok(resolved)) => resolved,
+            Ok(Err(error)) => {
+                if let Err(cleanup_error) = lease
+                    .discard_failed()
+                    .await
+                {
+                    tracing::warn!(
+                        error = %cleanup_error,
+                        info_hash = %self.info_hash,
+                        "failed to discard unresolved torrent candidate"
+                    );
+                }
+                return Err(error).context_bad_request("failed to resolve torrent");
+            }
+            Err(_) => {
+                if let Err(cleanup_error) = lease
+                    .discard_failed()
+                    .await
+                {
+                    tracing::warn!(
+                        error = %cleanup_error,
+                        info_hash = %self.info_hash,
+                        "failed to discard timed-out torrent candidate"
+                    );
+                }
+                return Err(anyhow::anyhow!(
+                    "torrent metadata did not resolve within {:.1}s",
+                    TORRENT_RESOLVE_WAIT.as_secs_f64()
+                ))
+                .context_bad_request("failed to resolve torrent");
+            }
+        };
+        let requested_range = headers
+            .get(http::header::RANGE)
+            .and_then(|value| {
+                value
+                    .to_str()
+                    .ok()
+            });
+        if let Err(error) = self
+            .wait_until_ready(&torrent, &resolved, requested_range)
             .await
-            .context_bad_request("failed to resolve torrent")?;
-        self.wait_until_ready(&torrent)
-            .await
-            .context_bad_request("torrent source is not ready")?;
+        {
+            if let Err(cleanup_error) = lease
+                .discard_failed()
+                .await
+            {
+                tracing::warn!(
+                    error = %cleanup_error,
+                    info_hash = %self.info_hash,
+                    "failed to discard unready torrent candidate"
+                );
+            }
+            return Err(error).context_bad_request("torrent source is not ready");
+        }
 
         let response = HttpSource {
             url: resolved,

@@ -119,6 +119,26 @@ fn prefer_available_torrents(sources: &mut [db::Media]) {
     });
 }
 
+fn p2p_resolution_height(source: &db::Media) -> Option<u32> {
+    source
+        .stream_info
+        .as_ref()
+        .and_then(|info| info.resolution_tag())
+        .and_then(|tag| {
+            tag.trim_end_matches(['p', 'i'])
+                .parse::<u32>()
+                .ok()
+        })
+}
+
+fn meets_minimum_p2p_resolution(source: &db::Media) -> bool {
+    let is_p2p = source
+        .stream_info
+        .as_ref()
+        .is_some_and(|info| info.is_p2p());
+    !is_p2p || p2p_resolution_height(source).is_some_and(|height| height >= 720)
+}
+
 fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
     let mut pool = streams.to_vec();
     if pool
@@ -366,6 +386,23 @@ impl StreamService {
             );
             streams
         };
+
+        let streams: Vec<_> = streams
+            .into_iter()
+            .filter(|source| {
+                let keep = meets_minimum_p2p_resolution(source);
+                if !keep {
+                    debug!(
+                        id = %source.id,
+                        title = %source.title,
+                        filename = ?source.stream_info.as_ref().and_then(|info| info.filename.as_deref()),
+                        resolution = ?source.stream_info.as_ref().and_then(|info| info.resolution_tag()),
+                        "dropping P2P source below or without verified 720p resolution"
+                    );
+                }
+                keep
+            })
+            .collect();
 
         if streams.is_empty() {
             return Ok(());
@@ -665,6 +702,73 @@ impl StreamService {
             }
             None => Default::default(),
         };
+        // A completed torrent is strong readiness evidence, but cache state must
+        // never silently downgrade a healthy quality-first primary. Only promote
+        // cached P2P sources that are at least the ranked primary's resolution;
+        // lower-resolution cached sources remain available for the bounded
+        // diversified fallback path after the higher-quality source proves bad.
+        // This preserves the fast path for cached same/higher-quality releases
+        // without imposing a universal cached-720p-first policy.
+        let primary_p2p_height = candidates
+            .first()
+            .filter(|source| {
+                source
+                    .stream_info
+                    .as_ref()
+                    .is_some_and(|info| info.is_p2p())
+            })
+            .and_then(p2p_resolution_height);
+        if let Some(primary_height) = primary_p2p_height
+            && let Some(torrent) = self
+                .ctx
+                .torrent
+                .read()
+                .await
+                .clone()
+        {
+            let cached_choice = candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(index, source)| {
+                    let height = p2p_resolution_height(source)?;
+                    if height < 720 || height < primary_height {
+                        return None;
+                    }
+                    let info = source
+                        .stream_info
+                        .as_ref()?;
+                    let crate::stream::StreamDescriptor::Torrent {
+                        info_hash,
+                        file_hint,
+                        file_idx,
+                        ..
+                    } = &info.descriptor
+                    else {
+                        return None;
+                    };
+                    let status = torrent.prefetch_status(
+                        info_hash,
+                        *file_idx,
+                        file_hint.as_deref(),
+                    )?;
+                    (status.current_total_bytes > 0
+                        && status.current_cached_bytes >= status.current_total_bytes)
+                        .then_some((index, height))
+                })
+                .max_by_key(|(index, height)| (*height, std::cmp::Reverse(*index)));
+            if let Some((index, height)) = cached_choice.filter(|(index, _)| *index > 0)
+            {
+                let cached = candidates.remove(index);
+                tracing::info!(
+                    stream_id = %cached.id,
+                    resolution_height = height,
+                    primary_resolution_height = primary_height,
+                    "prioritizing same-or-higher-resolution fully cached torrent"
+                );
+                candidates.insert(0, cached);
+            }
+        }
+
         (candidates, extraction)
     }
 

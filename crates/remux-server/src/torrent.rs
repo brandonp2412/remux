@@ -10,10 +10,13 @@ use librqbit::{
 };
 use tracing::{debug, warn};
 
-// Let the chosen episode and its successor finish downloading while the TV
-// sits idle or after the player closes. Bound the retention so abandoned
-// torrent selections cannot occupy disk/peer connections indefinitely.
+// Keep cached pieces briefly reusable after playback, but stop peer traffic
+// almost immediately once the last playback/response lease disappears. The
+// longer retention window is disk-cache retention only; paused torrents are
+// restarted on demand by resolve_url().
+const TORRENT_IDLE_PAUSE_GRACE: Duration = Duration::from_secs(5);
 const TORRENT_IDLE_GRACE: Duration = Duration::from_secs(2 * 60 * 60);
+const TORRENT_CONTROL_WAIT: Duration = Duration::from_secs(2);
 
 #[derive(Clone, Debug)]
 struct TorrentFile {
@@ -66,9 +69,20 @@ impl Drop for TorrentLease {
             .clone();
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move {
-                // Allow a seek/reconnect or the next episode to acquire the
-                // same torrent before releasing its peers and downloaded data.
-                tokio::time::sleep(TORRENT_IDLE_GRACE).await;
+                // Allow a short seek/reconnect window, then stop consuming
+                // bandwidth while retaining cached pieces for a later request.
+                tokio::time::sleep(TORRENT_IDLE_PAUSE_GRACE).await;
+                if let Err(error) = manager
+                    .pause_if_unused(&hash)
+                    .await
+                {
+                    warn!(%hash, "failed to pause idle torrent: {error:#}");
+                }
+
+                tokio::time::sleep(
+                    TORRENT_IDLE_GRACE.saturating_sub(TORRENT_IDLE_PAUSE_GRACE),
+                )
+                .await;
                 if let Err(error) = manager
                     .delete_if_unused(&hash)
                     .await
@@ -77,6 +91,24 @@ impl Drop for TorrentLease {
                 }
             });
         }
+    }
+}
+
+impl TorrentLease {
+    /// Drop this request's lease and immediately remove a failed candidate when
+    /// nobody else is using the same torrent. Unlike the normal two-hour idle
+    /// grace, probe/readiness failures should not leave loser swarms running.
+    pub async fn discard_failed(self: Arc<Self>) -> Result<()> {
+        let manager = self
+            .manager
+            .clone();
+        let hash = self
+            .hash
+            .clone();
+        drop(self);
+        manager
+            .delete_if_unused(&hash)
+            .await
     }
 }
 
@@ -96,6 +128,7 @@ impl TorrentManager {
                 disable_dht_persistence: disable_dht,
                 disable_upload: upload_disabled,
                 listen_port_range: peer_port.map(|p| p..p + 10),
+                fastresume: true,
                 persistence: Some(SessionPersistenceConfig::Json {
                     folder: Some(cache_dir.join("rqbit")),
                 }),
@@ -107,6 +140,28 @@ impl TorrentManager {
             },
         )
         .await?;
+
+        // Fastresume restores cached torrents across process restarts. Never
+        // let those restored sessions immediately resume downloading before a
+        // client asks for them: preserve the cache, but start them paused.
+        let restored_api = Api::new(session.clone(), None, None);
+        for restored in restored_api
+            .api_torrent_list()
+            .torrents
+        {
+            let Some(id) = restored.id else {
+                continue;
+            };
+            if restored_api
+                .api_stats_v1(TorrentIdOrHash::Id(id))
+                .is_ok_and(|stats| matches!(stats.state, TorrentStatsState::Live))
+                && let Err(error) = restored_api
+                    .api_torrent_action_pause(TorrentIdOrHash::Id(id))
+                    .await
+            {
+                warn!(torrent_id = id, error = %error, "failed to pause restored torrent");
+            }
+        }
 
         // None → let the OS pick a free ephemeral port.
         let bind_port = http_port.unwrap_or(0);
@@ -155,40 +210,87 @@ impl TorrentManager {
         lease
     }
 
-    async fn delete_if_unused(&self, hash: &str) -> Result<()> {
-        // Acquisition and deletion share the lock, so a new reader cannot
-        // acquire a torrent between the last-user check and deletion.
-        let mut leases = self
-            .leases
-            .lock()
-            .await;
-        if leases
-            .get(hash)
-            .is_none_or(|lease| lease.strong_count() != 0)
+    async fn pause_if_unused(&self, hash: &str) -> Result<()> {
+        // Do not hold the global lease-map mutex across rqbit control I/O.
+        // A slow pause must not block unrelated torrent acquisitions.
         {
-            return Ok(());
+            let leases = self.leases.lock().await;
+            if leases.get(hash).is_none_or(|lease| lease.strong_count() != 0) {
+                return Ok(());
+            }
         }
-        let api = Api::new(
-            self.session
-                .clone(),
-            None,
-            None,
-        );
+
+        let api = Api::new(self.session.clone(), None, None);
         if let Some(id) = api
             .api_torrent_list()
             .torrents
             .into_iter()
-            .find(|torrent| {
-                torrent
-                    .info_hash
-                    .eq_ignore_ascii_case(hash)
-            })
+            .find(|torrent| torrent.info_hash.eq_ignore_ascii_case(hash))
+            .and_then(|torrent| torrent.id)
+            && api
+                .api_stats_v1(TorrentIdOrHash::Id(id))
+                .is_ok_and(|stats| matches!(stats.state, TorrentStatsState::Live))
+        {
+            tokio::time::timeout(
+                TORRENT_CONTROL_WAIT,
+                api.api_torrent_action_pause(TorrentIdOrHash::Id(id)),
+            )
+            .await
+            .context("timed out pausing idle torrent")??;
+            debug!(%hash, torrent_id = id, "paused idle torrent while retaining cache");
+
+            let acquired_during_pause = self
+                .leases
+                .lock()
+                .await
+                .get(hash)
+                .is_some_and(|lease| lease.strong_count() != 0);
+            if acquired_during_pause
+                && !api
+                    .api_stats_v1(TorrentIdOrHash::Id(id))
+                    .is_ok_and(|stats| matches!(stats.state, TorrentStatsState::Live))
+            {
+                tokio::time::timeout(
+                    TORRENT_CONTROL_WAIT,
+                    api.api_torrent_action_start(TorrentIdOrHash::Id(id)),
+                )
+                .await
+                .context("timed out restarting torrent acquired during idle pause")??;
+                debug!(%hash, torrent_id = id, "restarted torrent acquired during idle pause");
+            }
+        }
+        Ok(())
+    }
+
+    async fn delete_if_unused(&self, hash: &str) -> Result<()> {
+        // Likewise, don't serialize every torrent acquire behind a delete.
+        {
+            let leases = self.leases.lock().await;
+            if leases.get(hash).is_none_or(|lease| lease.strong_count() != 0) {
+                return Ok(());
+            }
+        }
+
+        let api = Api::new(self.session.clone(), None, None);
+        if let Some(id) = api
+            .api_torrent_list()
+            .torrents
+            .into_iter()
+            .find(|torrent| torrent.info_hash.eq_ignore_ascii_case(hash))
             .and_then(|torrent| torrent.id)
         {
-            api.api_torrent_action_delete(TorrentIdOrHash::Id(id))
-                .await?;
+            tokio::time::timeout(
+                TORRENT_CONTROL_WAIT,
+                api.api_torrent_action_delete(TorrentIdOrHash::Id(id)),
+            )
+            .await
+            .context("timed out deleting unused torrent")??;
         }
-        leases.remove(hash);
+
+        let mut leases = self.leases.lock().await;
+        if leases.get(hash).is_some_and(|lease| lease.strong_count() == 0) {
+            leases.remove(hash);
+        }
         Ok(())
     }
 

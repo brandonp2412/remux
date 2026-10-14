@@ -72,7 +72,7 @@ pub async fn stream_proxy(
     }
 
     descriptor
-        .into_source_with_expected_bitrate(expected_bitrate_bps)
+        .into_source_with_expected_bitrate(expected_bitrate_bps, media.runtime)
         .serve(&state, &headers)
         .await
 }

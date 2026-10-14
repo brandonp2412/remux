@@ -26,6 +26,7 @@ fn ffprobe_args(
     url: &str,
     allow_nonstandard_hls_extensions: bool,
     headers: Option<&str>,
+    local_stream_rw_timeout: std::time::Duration,
 ) -> Vec<String> {
     let mut args = vec![
         "-v".into(),
@@ -36,6 +37,23 @@ fn ffprobe_args(
         "-show_streams".into(),
         "-show_format".into(),
     ];
+    // The local Remux stream proxy can deliberately reject an unavailable
+    // seek/range while continuing to make the sequential startup bytes useful.
+    // Bound each ffprobe HTTP read below the server's readiness deadline so
+    // Matroska's optional near-EOF seek can time out and ffprobe can continue
+    // parsing sequentially instead of consuming the entire outer probe budget.
+    if url::Url::parse(url).is_ok_and(|parsed| {
+        matches!(parsed.host_str(), Some("127.0.0.1" | "::1" | "localhost"))
+            && parsed
+                .path()
+                .starts_with("/stream/")
+    }) {
+        let timeout_micros = local_stream_rw_timeout
+            .as_micros()
+            .min(u64::MAX as u128)
+            .to_string();
+        args.extend(["-rw_timeout".into(), timeout_micros]);
+    }
     if allow_nonstandard_hls_extensions {
         args.extend([
             "-allowed_extensions".into(),
@@ -72,8 +90,12 @@ mod extension_retry_tests {
 
     #[test]
     fn retry_uses_hls_extension_compatibility_options() {
-        let args =
-            super::ffprobe_args("https://relay.example/hls?url=playlist", true, None);
+        let args = super::ffprobe_args(
+            "https://relay.example/hls?url=playlist",
+            true,
+            None,
+            std::time::Duration::from_secs(5),
+        );
 
         assert!(
             args.windows(2)
@@ -711,11 +733,28 @@ pub fn probe_media_with(
     headers: Option<&str>,
     timeout: Option<std::time::Duration>,
 ) -> Result<(api::MediaSourceInfo, MediaSegments)> {
+    probe_media_with_local_stream_rw_timeout(
+        url,
+        headers,
+        timeout,
+        std::time::Duration::from_secs(5),
+    )
+}
+
+fn probe_media_with_local_stream_rw_timeout(
+    url: &str,
+    headers: Option<&str>,
+    timeout: Option<std::time::Duration>,
+    local_stream_rw_timeout: std::time::Duration,
+) -> Result<(api::MediaSourceInfo, MediaSegments)> {
     let shown = redact_url(url);
     debug!(url = %shown, "probing media");
     let deadline = timeout.map(|t| std::time::Instant::now() + t);
 
-    let mut output = run_ffprobe(&ffprobe_args(url, false, headers), deadline)?;
+    let mut output = run_ffprobe(
+        &ffprobe_args(url, false, headers, local_stream_rw_timeout),
+        deadline,
+    )?;
 
     if !output
         .status
@@ -724,7 +763,10 @@ pub fn probe_media_with(
             &output.stderr,
         ))
     {
-        output = run_ffprobe(&ffprobe_args(url, true, headers), deadline)?;
+        output = run_ffprobe(
+            &ffprobe_args(url, true, headers, local_stream_rw_timeout),
+            deadline,
+        )?;
     }
 
     if !output
@@ -1327,11 +1369,20 @@ pub(crate) async fn probe_stream(
         restrict_resolution,
         port,
         db,
-        move |url| {
-            probe_media_with(
+        move |url, attempt_timeout_secs| {
+            let local_stream_rw_timeout = if attempt_timeout_secs > 15 {
+                // A cold but promising swarm may need up to fourteen seconds
+                // to assemble a verified startup buffer. Do not abort the
+                // individual ffprobe socket before readiness can finish.
+                std::time::Duration::from_secs(15)
+            } else {
+                std::time::Duration::from_secs(7)
+            };
+            probe_media_with_local_stream_rw_timeout(
                 &url,
                 None,
-                Some(std::time::Duration::from_secs(timeout_secs)),
+                Some(std::time::Duration::from_secs(attempt_timeout_secs)),
+                local_stream_rw_timeout,
             )
         },
     )
@@ -1353,6 +1404,57 @@ pub(crate) async fn probe_stream(
     }
 }
 
+fn resolution_height(stream: &db::Media) -> Option<u32> {
+    stream
+        .stream_info
+        .as_ref()
+        .and_then(|info| info.resolution_tag())
+        .and_then(|tag| {
+            tag.trim_end_matches(['p', 'i'])
+                .parse::<u32>()
+                .ok()
+        })
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TorrentCodecFamily {
+    Avc,
+    Hevc,
+    Av1,
+    Vp9,
+}
+
+fn torrent_codec_family(stream: &db::Media) -> Option<TorrentCodecFamily> {
+    let info = stream.stream_info.as_ref();
+    let mut hint = info
+        .and_then(|value| value.filename.as_deref())
+        .unwrap_or(&stream.title)
+        .to_ascii_lowercase();
+    if hint.is_empty() {
+        hint = stream.title.to_ascii_lowercase();
+    }
+
+    if hint.contains("av1") {
+        Some(TorrentCodecFamily::Av1)
+    } else if hint.contains("hevc")
+        || hint.contains("h265")
+        || hint.contains("h.265")
+        || hint.contains("x265")
+    {
+        Some(TorrentCodecFamily::Hevc)
+    } else if hint.contains("avc")
+        || hint.contains("h264")
+        || hint.contains("h.264")
+        || hint.contains("x264")
+    {
+        Some(TorrentCodecFamily::Avc)
+    } else if hint.contains("vp9") {
+        Some(TorrentCodecFamily::Vp9)
+    } else {
+        None
+    }
+}
+
 fn select_candidates(
     primary: &db::Media,
     probe_pool: &[db::Media],
@@ -1361,69 +1463,204 @@ fn select_candidates(
     restrict_resolution: bool,
     port: u16,
 ) -> Vec<(db::Media, String)> {
-    if !auto_next_stream {
+    if !auto_next_stream || max_retries == 0 {
         return vec![];
     }
     let pri_p2p = primary
         .stream_info
         .as_ref()
-        .map_or(false, |si| si.is_p2p());
+        .is_some_and(|si| si.is_p2p());
     let pri_res = primary
         .stream_info
         .as_ref()
         .and_then(|si| si.resolution_tag());
-    probe_pool
+
+    let eligible: Vec<&db::Media> = probe_pool
         .iter()
-        .filter(|c| {
-            if c.id == primary.id {
+        .filter(|candidate| {
+            if candidate.id == primary.id {
                 return false;
             }
-            let c_p2p = c
+            let candidate_p2p = candidate
                 .stream_info
                 .as_ref()
-                .map_or(false, |si| si.is_p2p());
-            if c_p2p != pri_p2p {
+                .is_some_and(|si| si.is_p2p());
+            if candidate_p2p != pri_p2p {
                 return false;
             }
             if restrict_resolution {
-                let c_res = c
+                let candidate_res = candidate
                     .stream_info
                     .as_ref()
                     .and_then(|si| si.resolution_tag());
-                if c_res != pri_res {
+                if candidate_res != pri_res {
                     return false;
+                }
+            } else if pri_p2p {
+                // The primary has already passed the normal capability/quality ranking.
+                // After it fails, do not spend the bounded fallback budget climbing to
+                // a higher resolution than the chosen primary. Keep comparable-quality
+                // alternatives first; the reserved final slot below can then diversify
+                // downward when repeated same-tier candidates fail.
+                if let (Some(primary_height), Some(candidate_height)) =
+                    (resolution_height(primary), resolution_height(candidate))
+                {
+                    if candidate_height > primary_height {
+                        return false;
+                    }
                 }
             }
             true
         })
-        // The configured fallback cap is a latency/safety bound, not a
-        // resolution-filtering option. Cascade mode may broaden which
-        // candidates qualify, but it must not silently disable the cap.
-        .take(max_retries)
-        .filter_map(|c| {
-            let url = c
+        .collect();
+
+    let lower_recovery = if pri_p2p && !restrict_resolution && max_retries >= 2 {
+        resolution_height(primary).and_then(|primary_height| {
+            eligible
+                .iter()
+                .copied()
+                .find(|candidate| {
+                    resolution_height(candidate)
+                        .is_some_and(|height| height < primary_height && height >= 720)
+                })
+        })
+    } else {
+        None
+    };
+
+    // Keep the highest-ranked same-tier retry first. If another same-tier retry
+    // is available, prefer a genuinely different codec family before spending
+    // that slot on another near-identical encode. This diversity is reached
+    // only after the primary and first fallback have already failed, so a
+    // healthy 1080p/4K primary still starts with zero extra work. Filename
+    // codec hints are deliberately a soft ordering signal, never health proof.
+    let same_tier_budget = max_retries.saturating_sub(usize::from(lower_recovery.is_some()));
+    let primary_height = resolution_height(primary);
+    let mut selected: Vec<&db::Media> = Vec::with_capacity(max_retries);
+    let mut seen_codec_families = Vec::new();
+    if let Some(family) = torrent_codec_family(primary) {
+        seen_codec_families.push(family);
+    }
+
+    let same_tier: Vec<&db::Media> = eligible
+        .iter()
+        .copied()
+        .filter(|candidate| {
+            primary_height.is_none()
+                || resolution_height(candidate) == primary_height
+                || restrict_resolution
+        })
+        .collect();
+
+    if same_tier_budget > 0
+        && let Some(first) = same_tier.first().copied()
+    {
+        selected.push(first);
+        if let Some(family) = torrent_codec_family(first)
+            && !seen_codec_families.contains(&family)
+        {
+            seen_codec_families.push(family);
+        }
+    }
+
+    while selected.len() < same_tier_budget {
+        // AVC/H.264 is the conservative compatibility rescue after repeated
+        // same-tier failures. Prefer it before an exotic "different" codec:
+        // choosing AV1 merely because it differs from HEVC can prove torrent
+        // readability while still forcing an avoidable transcode on clients
+        // that never advertised AV1 decode support.
+        let avc_rescue = same_tier
+            .iter()
+            .copied()
+            .find(|candidate| {
+                !selected.iter().any(|chosen| chosen.id == candidate.id)
+                    && torrent_codec_family(candidate) == Some(TorrentCodecFamily::Avc)
+            });
+        let distinct = same_tier
+            .iter()
+            .copied()
+            .find(|candidate| {
+                !selected.iter().any(|chosen| chosen.id == candidate.id)
+                    && torrent_codec_family(candidate)
+                        .is_some_and(|family| !seen_codec_families.contains(&family))
+            });
+        let next = avc_rescue.or(distinct).or_else(|| {
+            same_tier
+                .iter()
+                .copied()
+                .find(|candidate| !selected.iter().any(|chosen| chosen.id == candidate.id))
+        });
+        let Some(next) = next else {
+            break;
+        };
+        selected.push(next);
+        if let Some(family) = torrent_codec_family(next)
+            && !seen_codec_families.contains(&family)
+        {
+            seen_codec_families.push(family);
+        }
+    }
+
+    // After repeated same-resolution failures, reserve the final retry for the
+    // best lower-resolution candidate (still >=720p). This does not impose a
+    // 720p-first policy and cannot slow an already-healthy high-quality source.
+    if let Some(lower) = lower_recovery
+        && !selected.iter().any(|candidate| candidate.id == lower.id)
+    {
+        selected.push(lower);
+    }
+
+    // Non-P2P and resolution-restricted paths retain the original bounded
+    // best-ranked fallback behavior when the diversity path did not fill them.
+    for candidate in eligible.iter().copied() {
+        if selected.len() >= max_retries {
+            break;
+        }
+        if !selected.iter().any(|chosen| chosen.id == candidate.id) {
+            selected.push(candidate);
+        }
+    }
+
+    selected
+        .into_iter()
+        .filter_map(|candidate| {
+            let url = candidate
                 .stream_info
                 .as_ref()?
                 .descriptor
-                .server_input(c.id, port);
-            Some((c.clone(), url))
+                .server_input(candidate.id, port);
+            Some((candidate.clone(), url))
         })
         .collect()
 }
 
-fn probe_attempt_timeout(primary: &db::Media, configured_secs: u64) -> u64 {
-    if primary
+fn probe_attempt_timeout(
+    stream: &db::Media,
+    configured_secs: u64,
+    diversified_recovery: bool,
+    primary_attempt: bool,
+) -> u64 {
+    if stream
         .stream_info
         .as_ref()
         .is_some_and(|info| info.is_p2p())
     {
         // PlaybackInfo clients currently allow about 90 seconds for the entire
-        // request, while the server can try the primary plus three fallback
-        // streams. A 30-second P2P attempt can therefore consume the whole
-        // client budget before the later candidates are reached. Real-device
-        // rotations also show viable fallback torrents becoming probeable well
-        // inside this window once the dead candidate is skipped.
-        configured_secs.min(15)
+        // request. Keep the primary and same-tier retries tightly bounded so
+        // dead swarms cannot consume that budget. If those attempts already
+        // failed and the final reserved candidate deliberately diversifies to a
+        // lower (still >=720p) resolution, allow a little longer for the actual
+        // container probe: real-device E2E showed a healthy 720p fallback
+        // completing ffprobe at ~20s after a cold sparse-piece start.
+        if diversified_recovery {
+            // This is a bounded recovery allowance, not the generic P2P
+            // timeout. The normal configured value is 15s on the deployed
+            // server; E2E showed the viable diversified source completing at
+            // ~20s, so it must be allowed to outlive that normal cap.
+            25
+        } else {
+            configured_secs.min(if primary_attempt { 22 } else { 18 })
+        }
     } else {
         configured_secs
     }
@@ -1447,6 +1684,7 @@ async fn probe_with_fallback<F>(
 where
     F: Fn(
             String,
+            u64,
         )
             -> anyhow::Result<(api::MediaSourceInfo, remux_sdks::remux::MediaSegments)>
         + Clone
@@ -1470,13 +1708,27 @@ where
         )
         .collect();
     let total_available = probe_pool.len();
+    let total_attempts = all_to_try.len();
     let mut attempts = 0usize;
     // Torrent startup depends on piece availability and can otherwise hold
     // PlaybackInfo for the full configured 60s per candidate. Keep real P2P
-    // probing, but restore the bounded per-attempt wait used before #422.
-    for (stream, url_opt) in all_to_try {
-        let effective_timeout = probe_attempt_timeout(&stream, timeout_secs);
+    // probing tightly bounded, with a slightly larger budget only for the final
+    // deliberately diversified lower-resolution recovery candidate.
+    for (attempt_index, (stream, url_opt)) in all_to_try
+        .into_iter()
+        .enumerate()
+    {
         let is_retry = stream.id != primary.id;
+        let diversified_recovery = is_retry
+            && attempt_index + 1 == total_attempts
+            && match (resolution_height(&primary), resolution_height(&stream)) {
+                (Some(primary_height), Some(stream_height)) => {
+                    stream_height < primary_height
+                }
+                _ => false,
+            };
+        let effective_timeout =
+            probe_attempt_timeout(&stream, timeout_secs, diversified_recovery, attempt_index == 0);
         let url = match url_opt {
             Some(u) => u,
             None => {
@@ -1490,6 +1742,11 @@ where
                 failed_id = %primary.id,
                 next_id = %stream.id,
                 next_url = %url,
+                next_resolution = ?stream.stream_info.as_ref().and_then(|info| info.resolution_tag()),
+                next_seeders = ?stream.stream_info.as_ref().and_then(|info| info.seeders),
+                next_filename = ?stream.stream_info.as_ref().and_then(|info| info.filename.as_deref()),
+                effective_timeout,
+                diversified_recovery,
                 "probe failed, trying next matching stream"
             );
         }
@@ -1499,7 +1756,7 @@ where
         let f = probe_fn.clone();
         let probe_result = tokio::time::timeout(
             std::time::Duration::from_secs(effective_timeout),
-            tokio::task::spawn_blocking(move || f(url2)),
+            tokio::task::spawn_blocking(move || f(url2, effective_timeout)),
         )
         .await;
 
@@ -1885,12 +2142,12 @@ mod probe_tests {
 
     fn queued_probe(
         results: Vec<anyhow::Result<(api::MediaSourceInfo, MediaSegments)>>,
-    ) -> impl Fn(String) -> anyhow::Result<(api::MediaSourceInfo, MediaSegments)>
+    ) -> impl Fn(String, u64) -> anyhow::Result<(api::MediaSourceInfo, MediaSegments)>
     + Clone
     + Send
     + 'static {
         let q = Arc::new(Mutex::new(VecDeque::from(results)));
-        move |_url: String| {
+        move |_url: String, _timeout_secs: u64| {
             q.lock()
                 .unwrap()
                 .pop_front()
@@ -1995,10 +2252,12 @@ mod probe_tests {
 
     #[test]
     fn p2p_probe_timeout_is_capped_without_changing_http_timeout() {
-        assert_eq!(probe_attempt_timeout(&p2p_media(), 60), 15);
-        assert_eq!(probe_attempt_timeout(&p2p_media(), 10), 10);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 60, false, true), 22);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 10, false, true), 10);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 15, true, false), 25);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 60, true, false), 25);
         assert_eq!(
-            probe_attempt_timeout(&http_media("http://example.com"), 60),
+            probe_attempt_timeout(&http_media("http://example.com"), 60, false, true),
             60
         );
     }
