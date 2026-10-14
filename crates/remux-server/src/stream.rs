@@ -624,10 +624,16 @@ impl TorrentSource {
             .as_secs_f64()
             .max(0.001);
         let readable_mibps = received as f64 / 1024.0 / 1024.0 / elapsed_secs;
-        anyhow::ensure!(
-            readable_mibps >= required_download_mibps,
-            "range at byte {start} read {received} bytes at {readable_mibps:.2} MiB/s, below required {required_download_mibps:.2} MiB/s"
-        );
+        // A tiny client seek (especially the last few bytes of an MP4) can
+        // never measure a meaningful MiB/s rate: HTTP request overhead alone
+        // dominates. Require correct readable bytes, not an impossible
+        // throughput threshold, for ranges smaller than 64 KiB.
+        if bytes_needed >= 64 * 1024 {
+            anyhow::ensure!(
+                readable_mibps >= required_download_mibps,
+                "range at byte {start} read {received} bytes at {readable_mibps:.2} MiB/s, below required {required_download_mibps:.2} MiB/s"
+            );
+        }
         Ok((received, readable_mibps))
     }
 
@@ -653,10 +659,13 @@ impl TorrentSource {
                 return None;
             }
             let needs_buffer = download_mibps < playback_mibps * 1.1;
-            let startup_bytes = if needs_buffer { 8 * MIB } else { MIB };
+            // One MiB can contain MP4 metadata without any decodable frames.
+            // Require a consecutive four-MiB startup window even for a fast
+            // source; retain eight MiB for swarms below full playback rate.
+            let startup_bytes = if needs_buffer { 8 * MIB } else { 4 * MIB };
             return Some((startup_bytes, minimum_sustainable, needs_buffer));
         }
-        (download_mibps >= 1.0).then_some((MIB, 1.0, false))
+        (download_mibps >= 1.0).then_some((4 * MIB, 1.0, false))
     }
 
     async fn wait_until_ready(

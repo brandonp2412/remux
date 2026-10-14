@@ -438,17 +438,28 @@ impl TorrentManager {
             "resolving torrent"
         );
 
-        let response = self
-            .session
-            .add_torrent(AddTorrent::from_url(magnet), Some(stream_only_options()))
-            .await
-            .context("failed to add torrent")?;
-
-        let (torrent_id, handle) = match response {
-            AddTorrentResponse::Added(id, h) => (id, h),
-            AddTorrentResponse::AlreadyManaged(id, h) => (id, h),
-            AddTorrentResponse::ListOnly(_) => {
-                anyhow::bail!("unexpected ListOnly response")
+        // Range requests for the same playing file must reuse its managed
+        // torrent. Re-adding an already-managed magnet can block behind rqbit's
+        // metadata/session bookkeeping and fail the short HTTP seek deadline,
+        // even when the download itself is healthy.
+        let managed = librqbit::Magnet::parse(magnet)
+            .ok()
+            .and_then(|parsed| parsed.as_id20())
+            .and_then(|hash| self.session.get(TorrentIdOrHash::Hash(hash)));
+        let (torrent_id, handle) = if let Some(handle) = managed {
+            (handle.id(), handle)
+        } else {
+            let response = self
+                .session
+                .add_torrent(AddTorrent::from_url(magnet), Some(stream_only_options()))
+                .await
+                .context("failed to add torrent")?;
+            match response {
+                AddTorrentResponse::Added(id, h)
+                | AddTorrentResponse::AlreadyManaged(id, h) => (id, h),
+                AddTorrentResponse::ListOnly(_) => {
+                    anyhow::bail!("unexpected ListOnly response")
+                }
             }
         };
 
@@ -485,12 +496,14 @@ impl TorrentManager {
             None,
             None,
         );
-        api.api_torrent_action_update_only_files(
-            TorrentIdOrHash::Id(torrent_id),
-            &selected_files,
-        )
-        .await
-        .context("failed to select torrent playback and prefetch files")?;
+        if selected_files != existing {
+            api.api_torrent_action_update_only_files(
+                TorrentIdOrHash::Id(torrent_id),
+                &selected_files,
+            )
+            .await
+            .context("failed to select torrent playback and prefetch files")?;
+        }
 
         let selected_stats = handle.stats();
         if selected_stats.total_bytes == 0 {
