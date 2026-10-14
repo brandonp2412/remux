@@ -637,11 +637,11 @@ impl TorrentSource {
         Ok((received, readable_mibps))
     }
 
-    /// Require real buffered startup bytes when a swarm is only slightly slower
-    /// than playback. A fast swarm needs just the usual short range proof;
-    /// one at 80-110% of the playback rate must first supply eight contiguous
-    /// MiB, giving the player time to ride out short download fluctuations.
-    /// Materially slower swarms are rejected rather than buffering indefinitely.
+    /// Size the verified contiguous startup buffer by *seconds of media*,
+    /// not a universal number of megabytes. Low-bitrate 720p should not be
+    /// rejected for needing 20+ seconds to read an unnecessary 4-8 MiB.
+    /// A source slightly slower than real-time playback gets a longer buffer;
+    /// sources substantially slower still fall back within the bounded probe.
     fn readiness_plan(
         expected_bitrate_bps: Option<i64>,
         download_mibps: f64,
@@ -654,17 +654,23 @@ impl TorrentSource {
             .filter(|bps| *bps > 0)
             .map(|bps| bps as f64 / 8.0 / MIB as f64)
         {
-            let minimum_sustainable = (playback_mibps * 0.8).max(0.25);
+            // Permit an 80%-of-real-time swarm to use a modest head start.
+            // The tiny floor only rejects effectively dead peers; it must
+            // not exceed the required speed of low-bitrate video.
+            let minimum_sustainable = (playback_mibps * 0.8).max(0.06);
             if download_mibps < minimum_sustainable {
                 return None;
             }
             let needs_buffer = download_mibps < playback_mibps * 1.1;
-            // One MiB can contain MP4 metadata without any decodable frames.
-            // Require a consecutive four-MiB startup window even for a fast
-            // source; retain eight MiB for swarms below full playback rate.
-            let startup_bytes = if needs_buffer { 8 * MIB } else { 4 * MIB };
+            let seconds_to_buffer = if needs_buffer { 6.0 } else { 4.0 };
+            let max_bytes = if needs_buffer { 8 * MIB } else { 4 * MIB };
+            let startup_bytes = (playback_mibps * seconds_to_buffer * MIB as f64)
+                .ceil()
+                .clamp(MIB as f64, max_bytes as f64) as usize;
             return Some((startup_bytes, minimum_sustainable, needs_buffer));
         }
+        // No trustworthy duration/bitrate: retain the conservative 4-MiB
+        // proof and 1 MiB/s throughput baseline until ffprobe can help.
         (download_mibps >= 1.0).then_some((4 * MIB, 1.0, false))
     }
 
