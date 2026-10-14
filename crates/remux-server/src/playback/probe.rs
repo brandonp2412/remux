@@ -9,7 +9,10 @@ use anyhow::{Result, anyhow};
 use isolang::Language;
 use remux_sdks::remux::{MediaSegmentType, MediaSegments, Segment};
 use serde::Deserialize;
-use std::{collections::HashMap, str::FromStr};
+use std::{
+    collections::{HashMap, HashSet},
+    str::FromStr,
+};
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
@@ -1341,6 +1344,37 @@ pub(crate) async fn probe_stream(
     }
 }
 
+fn fallback_probe_tier(media: &db::Media) -> (Option<String>, Option<String>) {
+    let Some(stream_info) = media
+        .stream_info
+        .as_ref()
+    else {
+        return (None, None);
+    };
+    let resolution = stream_info.resolution_tag();
+    let codec = media
+        .probe_data
+        .as_ref()
+        .and_then(|probe| probe.video_stream())
+        .and_then(|video| {
+            video
+                .codec
+                .clone()
+        })
+        .or_else(|| {
+            let release = stream_info
+                .filename
+                .as_deref()
+                .or(stream_info
+                    .name
+                    .as_deref())?;
+            hunch::hunch(release)
+                .video_codec()
+                .map(|codec| format!("{codec:?}").to_ascii_lowercase())
+        });
+    (resolution, codec)
+}
+
 fn select_candidates(
     primary: &db::Media,
     probe_pool: &[db::Media],
@@ -1360,7 +1394,8 @@ fn select_candidates(
         .stream_info
         .as_ref()
         .and_then(|si| si.resolution_tag());
-    probe_pool
+
+    let eligible: Vec<_> = probe_pool
         .iter()
         .filter(|c| {
             if c.id == primary.id {
@@ -1384,6 +1419,32 @@ fn select_candidates(
             }
             true
         })
+        .collect();
+
+    // The preferred source is still tried first. Once it fails, spend the
+    // bounded startup budget on materially different resolution/codec tiers
+    // before retrying near-duplicates. Preserve the ranked order within each
+    // class so healthy-source ranking remains authoritative.
+    let ordered: Vec<_> = if restrict_resolution {
+        eligible
+    } else {
+        let mut seen = HashSet::new();
+        seen.insert(fallback_probe_tier(primary));
+        let mut diverse = Vec::with_capacity(eligible.len());
+        let mut repeats = Vec::new();
+        for candidate in eligible {
+            if seen.insert(fallback_probe_tier(candidate)) {
+                diverse.push(candidate);
+            } else {
+                repeats.push(candidate);
+            }
+        }
+        diverse.extend(repeats);
+        diverse
+    };
+
+    ordered
+        .into_iter()
         // In group-cascade mode (restrict_resolution=false) try all candidates;
         // otherwise honour the configured retry cap.
         .take(if restrict_resolution {
@@ -1444,6 +1505,7 @@ where
         .collect();
     let total_available = probe_pool.len();
     let mut attempts = 0usize;
+    let mut last_attempted_id = None;
 
     for (stream, url_opt) in all_to_try {
         let is_retry = stream.id != primary.id;
@@ -1457,12 +1519,15 @@ where
         attempts += 1;
         if is_retry {
             info!(
-                failed_id = %primary.id,
+                failed_id = %last_attempted_id.unwrap_or(primary.id),
                 next_id = %stream.id,
                 next_url = %url,
+                next_resolution = ?stream.stream_info.as_ref().and_then(|si| si.resolution_tag()),
+                next_codec = ?fallback_probe_tier(&stream).1,
                 "probe failed, trying next matching stream"
             );
         }
+        last_attempted_id = Some(stream.id);
         let url2 = url.clone();
         let stream2 = stream.clone();
         let db2 = db.clone();
