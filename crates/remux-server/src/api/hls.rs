@@ -838,10 +838,19 @@ fn resolve_hls_audio_codec(
 
 fn should_serve_ffmpeg_variant_playlist(
     is_live: bool,
-    _use_fmp4: bool,
-    _start_time_secs: u32,
+    use_fmp4: bool,
+    start_time_secs: u32,
 ) -> bool {
-    is_live
+    // FFmpeg is authoritative whenever our synthetic zero-based VOD playlist
+    // cannot faithfully describe the files it writes:
+    // - live sessions need the growing EVENT playlist;
+    // - fMP4 segment durations/keyframe boundaries are FFmpeg-defined;
+    // - resumed TS sessions use a non-zero -start_number derived from the seek.
+    //
+    // Serving the synthetic playlist for a resumed TS session makes the client
+    // request segment_00000.ts even though FFmpeg starts at e.g. segment_00070.ts,
+    // which can only time out and 404.
+    is_live || use_fmp4 || start_time_secs > 0
 }
 
 async fn variant_hls_video_inner(

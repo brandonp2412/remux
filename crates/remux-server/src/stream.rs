@@ -770,10 +770,26 @@ impl StreamSource for TorrentSource {
         let lease = torrent
             .acquire(&self.info_hash)
             .await;
-        let resolved = torrent
+        let (resolved, selected_file_idx) = torrent
             .resolve_url(&self.to_magnet())
             .await
             .context_bad_request("failed to resolve torrent")?;
+        let requested_range = headers
+            .get(http::header::RANGE)
+            .and_then(|value| {
+                value
+                    .to_str()
+                    .ok()
+            })
+            .unwrap_or("<none>");
+        tracing::info!(
+            info_hash = %self.info_hash,
+            file_idx = selected_file_idx,
+            file_hint = ?self.file_hint,
+            range = requested_range,
+            "torrent stream range requested"
+        );
+        torrent.note_range_requested(&self.info_hash, selected_file_idx);
 
         let response = HttpSource {
             url: resolved,
@@ -782,11 +798,39 @@ impl StreamSource for TorrentSource {
         }
         .serve_inner(headers, true)
         .await?;
+        torrent.note_range_ready(&self.info_hash, selected_file_idx);
+        tracing::info!(
+            info_hash = %self.info_hash,
+            file_idx = selected_file_idx,
+            file_hint = ?self.file_hint,
+            range = requested_range,
+            status = %response.status(),
+            content_range = ?response
+                .headers()
+                .get(http::header::CONTENT_RANGE)
+                .and_then(|value| value.to_str().ok()),
+            content_length = ?response
+                .headers()
+                .get(http::header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok()),
+            "torrent stream range ready"
+        );
         let (parts, body) = response.into_parts();
+        let progress_torrent = torrent.clone();
+        let progress_hash = self
+            .info_hash
+            .clone();
         let stream = async_stream::stream! {
             let _lease = lease;
             let mut stream = body.into_data_stream();
             while let Some(chunk) = stream.next().await {
+                if let Ok(bytes) = &chunk {
+                    progress_torrent.note_range_bytes(
+                        &progress_hash,
+                        selected_file_idx,
+                        bytes.len(),
+                    );
+                }
                 yield chunk;
             }
         };

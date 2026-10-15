@@ -595,6 +595,101 @@ impl StreamService {
         (candidates, extraction)
     }
 
+    fn episode_source_matches_requested_content(
+        stream: &db::Media,
+        item: &db::Media,
+    ) -> bool {
+        if item.kind != db::MediaKind::Episode {
+            return true;
+        }
+        let Some(series) = item
+            .grandparent
+            .as_ref()
+        else {
+            return true;
+        };
+        let Some(info) = stream
+            .stream_info
+            .as_ref()
+        else {
+            return true;
+        };
+        if !info.is_p2p() {
+            return true;
+        }
+
+        let filename = info
+            .filename
+            .as_deref()
+            .or_else(|| match &info.descriptor {
+                crate::stream::StreamDescriptor::Torrent {
+                    file_hint: Some(file_hint),
+                    ..
+                } => Some(file_hint.as_str()),
+                _ => None,
+            });
+        let Some(filename) = filename else {
+            return true;
+        };
+
+        let parsed = hunch::hunch(filename);
+        let parsed_season = parsed
+            .season()
+            .map(i64::from);
+        let parsed_episode = parsed
+            .episode()
+            .map(i64::from);
+
+        // Only reject when the release name gives us concrete episode identity.
+        // Ambiguous filenames still get a chance to probe; an explicit mismatch
+        // must never become a fallback or slow-buffer candidate.
+        if let (Some(expected), Some(actual)) = (item.parent_idx, parsed_season)
+            && expected != actual
+        {
+            return false;
+        }
+        if let (Some(expected), Some(actual)) = (item.idx, parsed_episode)
+            && expected != actual
+        {
+            return false;
+        }
+
+        let Some(parsed_title) = parsed.title() else {
+            return true;
+        };
+        if parsed_season.is_none() && parsed_episode.is_none() {
+            return true;
+        }
+
+        fn anchor_token(value: &str) -> Option<String> {
+            let tokens: Vec<String> = value
+                .split(|c: char| !c.is_alphanumeric())
+                .filter(|token| !token.is_empty())
+                .map(str::to_lowercase)
+                .filter(|token| !matches!(token.as_str(), "the" | "and" | "for"))
+                .collect();
+            tokens
+                .iter()
+                .find(|token| token.len() >= 4)
+                .cloned()
+                .or_else(|| {
+                    tokens
+                        .into_iter()
+                        .find(|token| token.len() >= 3)
+                })
+        }
+
+        let Some(expected_anchor) = anchor_token(&series.title) else {
+            return true;
+        };
+        let parsed_tokens: std::collections::HashSet<String> = parsed_title
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|token| !token.is_empty())
+            .map(str::to_lowercase)
+            .collect();
+        parsed_tokens.contains(&expected_anchor)
+    }
+
     /// Probe all stream candidates and return stamped results.
     ///
     /// Internally calls `select_streams()`, loads probe config, then invokes `probe_stream`
@@ -609,6 +704,61 @@ impl StreamService {
         prefs: DefaultStreamPrefs<'_>,
     ) -> anyhow::Result<ProbedStreams> {
         let mut sel = self.select_streams();
+        let mut item = db::Media::get_by_id(
+            &self
+                .ctx
+                .db,
+            &self.item_id,
+        )
+        .await
+        .ok()
+        .flatten();
+        if let Some(ref mut it) = item {
+            it.grandparent(
+                &self
+                    .ctx
+                    .db,
+            )
+            .await
+            .ok();
+        }
+        if let Some(ref item) = item {
+            let candidate_count = sel
+                .candidates
+                .len();
+            let pool_count = sel
+                .probe_pool
+                .len();
+            sel.candidates
+                .retain(|stream| {
+                    Self::episode_source_matches_requested_content(stream, item)
+                });
+            sel.probe_pool
+                .retain(|stream| {
+                    Self::episode_source_matches_requested_content(stream, item)
+                });
+            if candidate_count
+                != sel
+                    .candidates
+                    .len()
+                || pool_count
+                    != sel
+                        .probe_pool
+                        .len()
+            {
+                warn!(
+                    item_id = %item.id,
+                    title = %item.title,
+                    series = ?item.grandparent.as_ref().map(|series| series.title.as_str()),
+                    candidates_before = candidate_count,
+                    candidates_after = sel.candidates.len(),
+                    probe_pool_before = pool_count,
+                    probe_pool_after = sel.probe_pool.len(),
+                    "discarded episode sources whose release identity does not match requested content"
+                );
+            }
+        }
+
         let (candidates, extraction) = self
             .rank_candidates(std::mem::take(&mut sel.candidates), ranking, prefs)
             .await;
@@ -642,25 +792,6 @@ impl StreamService {
             .ctx
             .config
             .port;
-        let mut item = db::Media::get_by_id(
-            &self
-                .ctx
-                .db,
-            &self.item_id,
-        )
-        .await
-        .ok()
-        .flatten();
-        if let Some(ref mut it) = item {
-            it.grandparent(
-                &self
-                    .ctx
-                    .db,
-            )
-            .await
-            .ok();
-        }
-
         let mut results = Vec::with_capacity(
             sel.candidates
                 .len(),
@@ -701,6 +832,12 @@ impl StreamService {
             } else {
                 timeout
             };
+            let torrent = self
+                .ctx
+                .torrent
+                .read()
+                .await
+                .clone();
             let (mut source, effective_stream) = probe_stream(
                 &stream,
                 url_opt,
@@ -711,6 +848,7 @@ impl StreamService {
                 &sel.probe_pool,
                 sel.restrict_resolution,
                 port,
+                torrent,
                 &self
                     .ctx
                     .db,

@@ -1262,6 +1262,7 @@ pub(crate) async fn probe_stream(
     probe_pool: &[db::Media],
     restrict_resolution: bool,
     port: u16,
+    torrent: Option<std::sync::Arc<crate::torrent::TorrentManager>>,
     db: &sqlx::SqlitePool,
 ) -> axum_anyhow::ApiResult<(api::MediaSourceInfo, db::Media)> {
     if skip_probe {
@@ -1317,12 +1318,13 @@ pub(crate) async fn probe_stream(
         probe_pool,
         restrict_resolution,
         port,
+        torrent,
         db,
-        move |url| {
+        move |url, attempt_timeout_secs| {
             probe_media_with(
                 &url,
                 None,
-                Some(std::time::Duration::from_secs(timeout_secs)),
+                Some(std::time::Duration::from_secs(attempt_timeout_secs)),
             )
         },
     )
@@ -1500,6 +1502,99 @@ fn select_candidates(
         .collect()
 }
 
+const SLOW_BUFFER_MAX_GRACE_SECS: u64 = 5 * 60;
+
+struct SlowProbeCandidate {
+    stream: db::Media,
+    url: String,
+    progress: crate::torrent::TorrentProbeProgress,
+    lease: std::sync::Arc<crate::torrent::TorrentLease>,
+}
+
+fn advertised_resolution_height(stream: &db::Media) -> Option<u32> {
+    let tag = stream
+        .stream_info
+        .as_ref()?
+        .resolution_tag()?
+        .to_ascii_lowercase();
+    if let Some(value) = tag.strip_suffix('p') {
+        return value
+            .parse()
+            .ok();
+    }
+    match tag.as_str() {
+        "4k" | "uhd" => Some(2160),
+        _ => None,
+    }
+}
+
+async fn retain_slow_torrent_candidate(
+    stream: &db::Media,
+    url: &str,
+    torrent: Option<&std::sync::Arc<crate::torrent::TorrentManager>>,
+    require_sustained_growth: bool,
+) -> Option<SlowProbeCandidate> {
+    if advertised_resolution_height(stream)? < 720 {
+        return None;
+    }
+    let info = stream
+        .stream_info
+        .as_ref()?;
+    let crate::stream::StreamDescriptor::Torrent {
+        info_hash,
+        file_idx,
+        file_hint,
+        ..
+    } = &info.descriptor
+    else {
+        return None;
+    };
+    let torrent = torrent?;
+    let progress =
+        torrent.probe_progress(info_hash, *file_idx, file_hint.as_deref())?;
+    // Do not require the *last* sampling window to be positive. A torrent can
+    // make sustained progress across the early samples and then spend one
+    // window assembling/verifying a piece. The slow-path retry below proves
+    // fresh growth again before extending grace.
+    let progressing = progress.live_peers > 0
+        && (!require_sustained_growth || progress.positive_growth_samples >= 2)
+        && progress.selected_file_bytes > 0
+        && progress.range_requests > 0
+        && progress.range_ready > 0
+        && progress.range_bytes_served > 0;
+    if !progressing {
+        return None;
+    }
+
+    info!(
+        stream_id = %stream.id,
+        info_hash = %progress.info_hash,
+        file_idx = progress.file_idx,
+        file = %progress.file_name,
+        selected_file_bytes = progress.selected_file_bytes,
+        selected_file_total_bytes = progress.selected_file_total_bytes,
+        selected_file_growth_mib_s = progress.selected_file_growth_mib_s,
+        torrent_download_mib_s = progress.torrent_download_mib_s,
+        live_peers = progress.live_peers,
+        connecting_peers = progress.connecting_peers,
+        seen_peers = progress.seen_peers,
+        positive_growth_samples = progress.positive_growth_samples,
+        range_requests = progress.range_requests,
+        range_ready = progress.range_ready,
+        range_bytes_served = progress.range_bytes_served,
+        "retaining progressing torrent as last-resort slow-buffer candidate"
+    );
+    let lease = torrent
+        .acquire(info_hash)
+        .await;
+    Some(SlowProbeCandidate {
+        stream: stream.clone(),
+        url: url.to_string(),
+        progress,
+        lease,
+    })
+}
+
 /// Probe a stream URL, retrying with the next matching candidate on failure.
 ///
 /// Returns a 500 error if all candidates fail to probe.
@@ -1512,12 +1607,14 @@ async fn probe_with_fallback<F>(
     probe_pool: &[db::Media],
     restrict_resolution: bool,
     port: u16,
+    torrent: Option<std::sync::Arc<crate::torrent::TorrentManager>>,
     db: &sqlx::SqlitePool,
     probe_fn: F,
 ) -> axum_anyhow::ApiResult<(api::MediaSourceInfo, db::Media)>
 where
     F: Fn(
             String,
+            u64,
         )
             -> anyhow::Result<(api::MediaSourceInfo, remux_sdks::remux::MediaSegments)>
         + Clone
@@ -1533,18 +1630,29 @@ where
         port,
     );
 
-    let all_to_try: Vec<_> = std::iter::once((primary.clone(), primary_url))
+    let mut all_to_try: std::collections::VecDeque<(
+        db::Media,
+        Option<String>,
+        bool,
+        Option<std::sync::Arc<crate::torrent::TorrentLease>>,
+        Option<crate::torrent::TorrentProbeProgress>,
+    )> = std::iter::once((primary.clone(), primary_url, false, None, None))
         .chain(
             candidates
                 .into_iter()
-                .map(|(m, u)| (m, Some(u))),
+                .map(|(m, u)| (m, Some(u), false, None, None)),
         )
         .collect();
     let total_available = probe_pool.len();
     let mut attempts = 0usize;
     let mut last_attempted_id = None;
+    let mut slow_candidate: Option<SlowProbeCandidate> = None;
+    let mut queued_slow_retry = false;
+    let mut slow_buffer_started: Option<std::time::Instant> = None;
 
-    for (stream, url_opt) in all_to_try {
+    while let Some((stream, url_opt, is_slow_retry, _slow_lease, slow_baseline)) =
+        all_to_try.pop_front()
+    {
         let is_retry = stream.id != primary.id;
         let url = match url_opt {
             Some(u) => u,
@@ -1561,6 +1669,7 @@ where
                 next_url = %url,
                 next_resolution = ?stream.stream_info.as_ref().and_then(|si| si.resolution_tag()),
                 next_codec = ?fallback_probe_tier(&stream).1,
+                slow_buffer_retry = is_slow_retry,
                 "probe failed, trying next matching stream"
             );
         }
@@ -1569,14 +1678,58 @@ where
         let stream2 = stream.clone();
         let db2 = db.clone();
         let f = probe_fn.clone();
+        // A retained slow candidate may stay alive for several minutes while it
+        // is demonstrably growing, but each probe attempt must stay short so we
+        // can re-check selected-file growth/range progress and terminate a real
+        // stall promptly. One opaque 45-60s ffprobe also risks outliving the
+        // client's PlaybackInfo response budget.
+        let attempt_timeout_secs = if is_slow_retry {
+            timeout_secs.clamp(10, 20)
+        } else {
+            timeout_secs
+        };
+        if is_slow_retry {
+            info!(
+                id = %stream.id,
+                timeout = attempt_timeout_secs,
+                "retrying retained torrent in slow-buffer probe grace"
+            );
+        }
         let probe_result = tokio::time::timeout(
-            std::time::Duration::from_secs(timeout_secs),
-            tokio::task::spawn_blocking(move || f(url2)),
+            std::time::Duration::from_secs(attempt_timeout_secs.saturating_add(2)),
+            tokio::task::spawn_blocking(move || f(url2, attempt_timeout_secs)),
         )
         .await;
 
         match probe_result {
             Ok(Ok(Ok((mut probed, segments)))) => {
+                // P2P fallback/slow-buffer playback is video-only here and must
+                // be backed by real ffprobe dimensions. Provider/filename
+                // quality labels are eligibility hints, not proof: a source
+                // advertised as 720p that decodes below 720 lines (or has no
+                // decoded height) must not be accepted as the verified >=720p
+                // source required by the playback policy.
+                let requires_verified_hd = stream
+                    .stream_info
+                    .as_ref()
+                    .is_some_and(|info| info.is_p2p());
+                if requires_verified_hd {
+                    let decoded_height = probed
+                        .video_stream()
+                        .and_then(|video| video.height)
+                        .filter(|height| *height > 0);
+                    if !decoded_height.is_some_and(|height| height >= 720) {
+                        warn!(
+                            id = %stream.id,
+                            url = %url,
+                            decoded_height = ?decoded_height,
+                            advertised_height = ?advertised_resolution_height(&stream),
+                            "rejecting P2P source without verified >=720p decoded height"
+                        );
+                        continue;
+                    }
+                }
+
                 // Reject streams whose probed duration is suspiciously short
                 // relative to the known metadata runtime (or absolutely < 3 min
                 // when unknown) — these are typically error/copyright-strike
@@ -1628,7 +1781,8 @@ where
                         warn!(id = %stream2.id, error = %e, "failed to save probe data");
                     }
                 } else {
-                    warn!(id = %stream2.id, "probe returned no audio or video stream, not caching");
+                    warn!(id = %stream2.id, "probe returned no audio or video stream; rejecting source");
+                    continue;
                 }
                 if is_retry {
                     info!(
@@ -1646,8 +1800,149 @@ where
                 warn!(url = %url, error = %e, "probe task panicked");
             }
             Err(_) => {
-                warn!(url = %url, timeout = timeout_secs, "probe timed out");
+                warn!(url = %url, timeout = attempt_timeout_secs, "probe timed out");
             }
+        }
+
+        // Initial retention requires repeated growth samples. Once the same
+        // candidate is already in slow-buffer grace, the baseline comparison
+        // below is the stronger freshness test: requiring two new positive
+        // sampling windows here can discard a candidate that resumed growing
+        // late in a short re-probe window.
+        let observed_slow_candidate = retain_slow_torrent_candidate(
+            &stream,
+            &url,
+            torrent.as_ref(),
+            !is_slow_retry,
+        )
+        .await;
+
+        if is_slow_retry {
+            if let (Some(candidate), Some(baseline)) =
+                (observed_slow_candidate, slow_baseline)
+            {
+                let selected_file_grew = candidate
+                    .progress
+                    .selected_file_bytes
+                    > baseline.selected_file_bytes;
+                let range_progressed = candidate
+                    .progress
+                    .range_bytes_served
+                    > baseline.range_bytes_served
+                    || candidate
+                        .progress
+                        .range_ready
+                        > baseline.range_ready;
+                let elapsed_secs = slow_buffer_started
+                    .map(|started| {
+                        started
+                            .elapsed()
+                            .as_secs()
+                    })
+                    .unwrap_or_default();
+                let within_resource_limit = elapsed_secs < SLOW_BUFFER_MAX_GRACE_SECS;
+
+                if selected_file_grew && range_progressed && within_resource_limit {
+                    info!(
+                        id = %candidate.stream.id,
+                        info_hash = %candidate.progress.info_hash,
+                        file_idx = candidate.progress.file_idx,
+                        selected_file_bytes = candidate.progress.selected_file_bytes,
+                        selected_file_total_bytes = candidate.progress.selected_file_total_bytes,
+                        selected_file_growth_mib_s = candidate.progress.selected_file_growth_mib_s,
+                        live_peers = candidate.progress.live_peers,
+                        range_progressed,
+                        range_bytes_served = candidate.progress.range_bytes_served,
+                        elapsed_secs,
+                        "slow-buffer candidate is still growing; extending grace instead of returning source unavailable"
+                    );
+                    let baseline = candidate
+                        .progress
+                        .clone();
+                    all_to_try.push_back((
+                        candidate.stream,
+                        Some(candidate.url),
+                        true,
+                        Some(candidate.lease),
+                        Some(baseline),
+                    ));
+                    continue;
+                }
+
+                if !selected_file_grew {
+                    warn!(
+                        id = %candidate.stream.id,
+                        info_hash = %candidate.progress.info_hash,
+                        file_idx = candidate.progress.file_idx,
+                        selected_file_bytes = candidate.progress.selected_file_bytes,
+                        live_peers = candidate.progress.live_peers,
+                        range_bytes_served = candidate.progress.range_bytes_served,
+                        elapsed_secs,
+                        "slow-buffer candidate stopped making selected-file progress; ending grace"
+                    );
+                } else if !within_resource_limit {
+                    warn!(
+                        id = %candidate.stream.id,
+                        info_hash = %candidate.progress.info_hash,
+                        file_idx = candidate.progress.file_idx,
+                        selected_file_bytes = candidate.progress.selected_file_bytes,
+                        selected_file_total_bytes = candidate.progress.selected_file_total_bytes,
+                        elapsed_secs,
+                        max_grace_secs = SLOW_BUFFER_MAX_GRACE_SECS,
+                        "slow-buffer resource limit reached while candidate was still growing"
+                    );
+                }
+            }
+        } else if let Some(candidate) = observed_slow_candidate {
+            let replace = slow_candidate
+                .as_ref()
+                .is_none_or(|current| {
+                    candidate
+                        .progress
+                        .selected_file_growth_mib_s
+                        > current
+                            .progress
+                            .selected_file_growth_mib_s
+                });
+            if replace {
+                slow_candidate = Some(candidate);
+            }
+        }
+
+        if all_to_try.is_empty()
+            && !queued_slow_retry
+            && let Some(candidate) = slow_candidate.take()
+        {
+            // The bounded normal candidates are exhausted, but this exact
+            // selected file has peers, repeated selected-file growth and real
+            // HTTP range traffic. Keep its lease alive and give ffprobe a
+            // longer bounded chance now that more of the container exists.
+            // Crucially, do not fabricate MediaSourceInfo from an advertised
+            // label here: only a successful ffprobe above can return it.
+            queued_slow_retry = true;
+            slow_buffer_started = Some(std::time::Instant::now());
+            let baseline = candidate
+                .progress
+                .clone();
+            info!(
+                id = %candidate.stream.id,
+                info_hash = %candidate.progress.info_hash,
+                file_idx = candidate.progress.file_idx,
+                file = %candidate.progress.file_name,
+                selected_file_bytes = candidate.progress.selected_file_bytes,
+                selected_file_total_bytes = candidate.progress.selected_file_total_bytes,
+                selected_file_growth_mib_s = candidate.progress.selected_file_growth_mib_s,
+                live_peers = candidate.progress.live_peers,
+                range_bytes_served = candidate.progress.range_bytes_served,
+                "bounded prompt probes exhausted; retaining progressing torrent for verified slow-buffer re-probe"
+            );
+            all_to_try.push_back((
+                candidate.stream,
+                Some(candidate.url),
+                true,
+                Some(candidate.lease),
+                Some(baseline),
+            ));
         }
     }
 
@@ -1952,12 +2247,12 @@ mod probe_tests {
 
     fn queued_probe(
         results: Vec<anyhow::Result<(api::MediaSourceInfo, MediaSegments)>>,
-    ) -> impl Fn(String) -> anyhow::Result<(api::MediaSourceInfo, MediaSegments)>
+    ) -> impl Fn(String, u64) -> anyhow::Result<(api::MediaSourceInfo, MediaSegments)>
     + Clone
     + Send
     + 'static {
         let q = Arc::new(Mutex::new(VecDeque::from(results)));
-        move |_url: String| {
+        move |_url: String, _timeout_seconds: u64| {
             q.lock()
                 .unwrap()
                 .pop_front()
@@ -2075,6 +2370,7 @@ mod probe_tests {
             &all,
             false,
             3000,
+            None,
             &db,
             queued_probe(vec![video_probe()]),
         )
@@ -2102,6 +2398,7 @@ mod probe_tests {
             &all,
             false,
             3000,
+            None,
             &db,
             queued_probe(vec![video_probe()]),
         )
@@ -2132,6 +2429,7 @@ mod probe_tests {
             &all,
             false,
             3000,
+            None,
             &db,
             queued_probe(vec![Err(anyhow!("primary failed")), video_probe()]),
         )
@@ -2158,6 +2456,7 @@ mod probe_tests {
             &all,
             false,
             3000,
+            None,
             &db,
             queued_probe(vec![Err(anyhow!("fail")), Err(anyhow!("fail"))]),
         )
@@ -2198,6 +2497,7 @@ mod probe_tests {
             &all,
             false,
             3000,
+            None,
             &db,
             queued_probe(vec![short_probe, video_probe()]),
         )
@@ -2223,6 +2523,7 @@ mod probe_tests {
             &all,
             false,
             3000,
+            None,
             &db,
             queued_probe(vec![]),
         )
@@ -2250,6 +2551,7 @@ mod probe_tests {
             &sources,
             false,
             3000,
+            None,
             &db,
             queued_probe(vec![
                 Err(anyhow!("fail")),
@@ -2288,6 +2590,7 @@ mod probe_tests {
             &probe_pool,
             false,
             3000,
+            None,
             &db,
             queued_probe(vec![
                 Err(anyhow!("fail")),
