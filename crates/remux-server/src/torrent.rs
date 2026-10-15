@@ -8,7 +8,8 @@ use librqbit::{
     dht::PersistentDhtConfig,
     http_api::HttpApi,
 };
-use tracing::{debug, warn};
+use serde::{Deserialize, Serialize};
+use tracing::{debug, info, warn};
 
 // Keep cached pieces briefly reusable after playback, but stop peer traffic
 // almost immediately once the last playback/response lease disappears. The
@@ -22,6 +23,107 @@ const TORRENT_CONTROL_WAIT: Duration = Duration::from_secs(2);
 struct TorrentFile {
     name: String,
     length: u64,
+}
+
+#[derive(Clone, Debug)]
+struct TorrentStreamSnapshot {
+    selected_file_bytes: u64,
+    downloaded_and_checked_bytes: u64,
+    live_peers: usize,
+    connecting_peers: usize,
+    seen_peers: usize,
+    torrent_download_mib_s: f64,
+}
+
+#[derive(Clone, Debug, Default)]
+struct TorrentObservedProgress {
+    file_name: String,
+    selected_file_total_bytes: u64,
+    selected_file_growth_mib_s: f64,
+    positive_growth_samples: u32,
+    range_requests: u64,
+    range_ready: u64,
+    range_bytes_served: u64,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct TorrentProbeProgress {
+    pub info_hash: String,
+    pub file_idx: usize,
+    pub file_name: String,
+    pub selected_file_bytes: u64,
+    pub selected_file_total_bytes: u64,
+    pub live_peers: usize,
+    pub connecting_peers: usize,
+    pub seen_peers: usize,
+    pub torrent_download_mib_s: f64,
+    pub selected_file_growth_mib_s: f64,
+    pub positive_growth_samples: u32,
+    pub range_requests: u64,
+    pub range_ready: u64,
+    pub range_bytes_served: u64,
+}
+
+fn normalized_info_hash(hash: &str) -> String {
+    librqbit::Magnet::parse(&format!("magnet:?xt=urn:btih:{hash}"))
+        .ok()
+        .and_then(|magnet| magnet.as_id20())
+        .map(|id| id.as_string())
+        .unwrap_or_else(|| hash.to_ascii_lowercase())
+}
+
+fn torrent_stream_snapshot(
+    session: &Arc<Session>,
+    torrent_id: usize,
+    file_idx: usize,
+) -> Option<TorrentStreamSnapshot> {
+    let api = Api::new(session.clone(), None, None);
+    let stats = api
+        .api_stats_v1(TorrentIdOrHash::Id(torrent_id))
+        .ok()?;
+    let live = stats
+        .live
+        .as_ref();
+    Some(TorrentStreamSnapshot {
+        selected_file_bytes: stats
+            .file_progress
+            .get(file_idx)
+            .copied()
+            .unwrap_or_default(),
+        downloaded_and_checked_bytes: live
+            .map(|live| {
+                live.snapshot
+                    .downloaded_and_checked_bytes
+            })
+            .unwrap_or_default(),
+        live_peers: live
+            .map(|live| {
+                live.snapshot
+                    .peer_stats
+                    .live
+            })
+            .unwrap_or_default(),
+        connecting_peers: live
+            .map(|live| {
+                live.snapshot
+                    .peer_stats
+                    .connecting
+            })
+            .unwrap_or_default(),
+        seen_peers: live
+            .map(|live| {
+                live.snapshot
+                    .peer_stats
+                    .seen
+            })
+            .unwrap_or_default(),
+        torrent_download_mib_s: live
+            .map(|live| {
+                live.download_speed
+                    .mbps
+            })
+            .unwrap_or_default(),
+    })
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -46,11 +148,23 @@ pub struct TorrentPrefetchStatus {
 
 pub struct TorrentManager {
     session: Arc<Session>,
+    torrent_data_path: PathBuf,
     http_port: u16,
     upload_disabled: bool,
     leases: tokio::sync::Mutex<
         std::collections::HashMap<String, std::sync::Weak<TorrentLease>>,
     >,
+    progress_observers:
+        Arc<tokio::sync::Mutex<std::collections::HashSet<(usize, usize)>>>,
+    probe_progress: Arc<
+        std::sync::Mutex<
+            std::collections::HashMap<(String, usize), TorrentObservedProgress>,
+        >,
+    >,
+    background_downloads:
+        tokio::sync::Mutex<std::collections::HashMap<String, BackgroundDownload>>,
+    background_downloads_path: PathBuf,
+    background_limits: BackgroundLimits,
 }
 
 /// Shared by playback sessions and response bodies using this exact torrent.
@@ -122,7 +236,7 @@ impl TorrentManager {
         upload_disabled: bool,
     ) -> Result<Self> {
         let session = Session::new_with_opts(
-            data_dir,
+            data_dir.clone(),
             SessionOptions {
                 disable_dht,
                 disable_dht_persistence: disable_dht,
@@ -177,11 +291,160 @@ impl TorrentManager {
         tokio::spawn(http_api.make_http_api_and_run(listener, None));
 
         debug!(port = bound_port, "torrent HTTP server listening");
+        let background_downloads_path = cache_dir.join("background-downloads.json");
+        let background_downloads =
+            match tokio::fs::read(&background_downloads_path).await {
+                Ok(data) => serde_json::from_slice::<Vec<BackgroundDownload>>(&data)
+                    .context("invalid background download state; not overwriting it")?
+                    .into_iter()
+                    .map(|job| {
+                        (
+                            job.info_hash
+                                .clone(),
+                            job,
+                        )
+                    })
+                    .collect(),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Default::default()
+                }
+                Err(error) => {
+                    return Err(error).context("reading background download state");
+                }
+            };
         Ok(Self {
             session,
+            torrent_data_path: data_dir,
             http_port: bound_port,
             upload_disabled,
             leases: Default::default(),
+            progress_observers: Default::default(),
+            probe_progress: Default::default(),
+            background_downloads: tokio::sync::Mutex::new(background_downloads),
+            background_downloads_path,
+            background_limits: BackgroundLimits::default(),
+        })
+    }
+
+    pub(crate) fn note_range_requested(&self, info_hash: &str, file_idx: usize) {
+        let key = (normalized_info_hash(info_hash), file_idx);
+        if let Ok(mut progress) = self
+            .probe_progress
+            .lock()
+        {
+            progress
+                .entry(key)
+                .or_default()
+                .range_requests += 1;
+        }
+    }
+
+    pub(crate) fn note_range_ready(&self, info_hash: &str, file_idx: usize) {
+        let key = (normalized_info_hash(info_hash), file_idx);
+        if let Ok(mut progress) = self
+            .probe_progress
+            .lock()
+        {
+            progress
+                .entry(key)
+                .or_default()
+                .range_ready += 1;
+        }
+    }
+
+    pub(crate) fn note_range_bytes(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        bytes: usize,
+    ) {
+        let key = (normalized_info_hash(info_hash), file_idx);
+        if let Ok(mut progress) = self
+            .probe_progress
+            .lock()
+        {
+            let entry = progress
+                .entry(key)
+                .or_default();
+            entry.range_bytes_served = entry
+                .range_bytes_served
+                .saturating_add(bytes as u64);
+        }
+    }
+
+    pub(crate) fn probe_progress(
+        &self,
+        info_hash: &str,
+        file_idx: Option<usize>,
+        file_hint: Option<&str>,
+    ) -> Option<TorrentProbeProgress> {
+        let normalized = normalized_info_hash(info_hash);
+        let hash_id =
+            librqbit::Magnet::parse(&format!("magnet:?xt=urn:btih:{normalized}"))
+                .ok()?
+                .as_id20()?;
+        let handle = self
+            .session
+            .get(TorrentIdOrHash::Hash(hash_id))?;
+        let files = handle
+            .with_metadata(|metadata| {
+                metadata
+                    .file_infos
+                    .iter()
+                    .map(|file| TorrentFile {
+                        name: file
+                            .relative_filename
+                            .to_string_lossy()
+                            .into_owned(),
+                        length: file.len,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .ok()?;
+        let selected_idx = select_file_index(&files, file_idx, file_hint).ok()?;
+        let selected_file = files
+            .get(selected_idx)?
+            .clone();
+        let snapshot =
+            torrent_stream_snapshot(&self.session, handle.id(), selected_idx)?;
+
+        let observed = self
+            .probe_progress
+            .lock()
+            .ok()
+            .and_then(|progress| {
+                progress
+                    .get(&(normalized.clone(), selected_idx))
+                    .cloned()
+            })
+            .unwrap_or_default();
+
+        Some(TorrentProbeProgress {
+            info_hash: normalized,
+            file_idx: selected_idx,
+            file_name: if observed
+                .file_name
+                .is_empty()
+            {
+                selected_file.name
+            } else {
+                observed.file_name
+            },
+            selected_file_bytes: snapshot.selected_file_bytes,
+            selected_file_total_bytes: if observed.selected_file_total_bytes == 0 {
+                selected_file.length
+            } else {
+                observed.selected_file_total_bytes
+            },
+            live_peers: snapshot.live_peers,
+            connecting_peers: snapshot.connecting_peers,
+            seen_peers: snapshot.seen_peers,
+            torrent_download_mib_s: snapshot.torrent_download_mib_s,
+            selected_file_growth_mib_s: observed.selected_file_growth_mib_s,
+            positive_growth_samples: observed.positive_growth_samples,
+            range_requests: observed.range_requests,
+            range_ready: observed.range_ready,
+            range_bytes_served: observed.range_bytes_served,
         })
     }
 
@@ -211,21 +474,45 @@ impl TorrentManager {
     }
 
     async fn pause_if_unused(&self, hash: &str) -> Result<()> {
+        if self
+            .background_downloads
+            .lock()
+            .await
+            .get(hash)
+            .is_some_and(|job| !job.paused)
+        {
+            return Ok(());
+        }
         // Do not hold the global lease-map mutex across rqbit control I/O.
         // A slow pause must not block unrelated torrent acquisitions.
         {
-            let leases = self.leases.lock().await;
-            if leases.get(hash).is_none_or(|lease| lease.strong_count() != 0) {
+            let leases = self
+                .leases
+                .lock()
+                .await;
+            if leases
+                .get(hash)
+                .is_none_or(|lease| lease.strong_count() != 0)
+            {
                 return Ok(());
             }
         }
 
-        let api = Api::new(self.session.clone(), None, None);
+        let api = Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
         if let Some(id) = api
             .api_torrent_list()
             .torrents
             .into_iter()
-            .find(|torrent| torrent.info_hash.eq_ignore_ascii_case(hash))
+            .find(|torrent| {
+                torrent
+                    .info_hash
+                    .eq_ignore_ascii_case(hash)
+            })
             .and_then(|torrent| torrent.id)
             && api
                 .api_stats_v1(TorrentIdOrHash::Id(id))
@@ -263,20 +550,43 @@ impl TorrentManager {
     }
 
     async fn delete_if_unused(&self, hash: &str) -> Result<()> {
+        if self
+            .background_downloads
+            .lock()
+            .await
+            .contains_key(hash)
+        {
+            return Ok(());
+        }
         // Likewise, don't serialize every torrent acquire behind a delete.
         {
-            let leases = self.leases.lock().await;
-            if leases.get(hash).is_none_or(|lease| lease.strong_count() != 0) {
+            let leases = self
+                .leases
+                .lock()
+                .await;
+            if leases
+                .get(hash)
+                .is_none_or(|lease| lease.strong_count() != 0)
+            {
                 return Ok(());
             }
         }
 
-        let api = Api::new(self.session.clone(), None, None);
+        let api = Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
         if let Some(id) = api
             .api_torrent_list()
             .torrents
             .into_iter()
-            .find(|torrent| torrent.info_hash.eq_ignore_ascii_case(hash))
+            .find(|torrent| {
+                torrent
+                    .info_hash
+                    .eq_ignore_ascii_case(hash)
+            })
             .and_then(|torrent| torrent.id)
         {
             tokio::time::timeout(
@@ -287,8 +597,14 @@ impl TorrentManager {
             .context("timed out deleting unused torrent")??;
         }
 
-        let mut leases = self.leases.lock().await;
-        if leases.get(hash).is_some_and(|lease| lease.strong_count() == 0) {
+        let mut leases = self
+            .leases
+            .lock()
+            .await;
+        if leases
+            .get(hash)
+            .is_some_and(|lease| lease.strong_count() == 0)
+        {
             leases.remove(hash);
         }
         Ok(())
@@ -299,7 +615,7 @@ impl TorrentManager {
             .torrent_data_dir
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("Config::resolve() must be called before TorrentManager::from_config"))?;
-        Self::new(
+        let mut manager = Self::new(
             std::path::PathBuf::from(data_dir),
             config
                 .data_dir
@@ -309,7 +625,18 @@ impl TorrentManager {
             config.torrent_peer_port,
             upload_kbps <= 0,
         )
-        .await
+        .await?;
+        manager.background_limits = BackgroundLimits {
+            max_active: config.background_download_max_active,
+            max_bytes: config
+                .background_download_max_gib
+                .saturating_mul(1024 * 1024 * 1024),
+            max_age_hours: config.background_download_max_age_hours,
+        };
+        manager
+            .restore_background_downloads()
+            .await?;
+        Ok(manager)
     }
 
     fn managed_torrent_files(&self, info_hash: &str) -> Option<Vec<TorrentFile>> {
@@ -428,7 +755,7 @@ impl TorrentManager {
 
     /// Resolve a magnet URI (possibly with `&tr=`, `&file_idx=`, `&file=` params
     /// we encode) to a local `http://127.0.0.1:<port>/torrents/<id>/stream/<file_idx>` URL
-    pub async fn resolve_url(&self, magnet: &str) -> Result<String> {
+    pub async fn resolve_url(&self, magnet: &str) -> Result<(String, usize)> {
         let file_idx_override = parse_file_idx_param(magnet);
         let wanted_file = parse_file_param(magnet);
         debug!(
@@ -445,7 +772,10 @@ impl TorrentManager {
         let managed = librqbit::Magnet::parse(magnet)
             .ok()
             .and_then(|parsed| parsed.as_id20())
-            .and_then(|hash| self.session.get(TorrentIdOrHash::Hash(hash)));
+            .and_then(|hash| {
+                self.session
+                    .get(TorrentIdOrHash::Hash(hash))
+            });
         let (torrent_id, handle) = if let Some(handle) = managed {
             (handle.id(), handle)
         } else {
@@ -488,8 +818,23 @@ impl TorrentManager {
         // Also retain the current/next episode prefetch selection rather than
         // replacing it with a single file and interrupting active playback.
         let existing = api_details_included(&self.session, torrent_id);
-        let selected_files =
+        let mut selected_files =
             merge_episode_prefetch_selection(&files, file_idx, &existing);
+        if let Some(background_index) = self
+            .background_downloads
+            .lock()
+            .await
+            .get(
+                &handle
+                    .info_hash()
+                    .as_string()
+                    .to_ascii_lowercase(),
+            )
+            .filter(|job| !job.paused)
+            .map(|job| job.file_idx)
+        {
+            selected_files.insert(background_index);
+        }
         let api = Api::new(
             self.session
                 .clone(),
@@ -542,9 +887,144 @@ impl TorrentManager {
             "selected torrent stream file"
         );
 
-        Ok(format!(
-            "http://127.0.0.1:{}/torrents/{}/stream/{}",
-            self.http_port, torrent_id, file_idx
+        let info_hash = librqbit::Magnet::parse(magnet)
+            .ok()
+            .and_then(|magnet| magnet.as_id20())
+            .map(|hash| hash.as_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        let selected_file = files[file_idx].clone();
+        let progress_key = (info_hash.clone(), file_idx);
+        if let Ok(mut progress) = self
+            .probe_progress
+            .lock()
+        {
+            let entry = progress
+                .entry(progress_key.clone())
+                .or_default();
+            entry.file_name = selected_file
+                .name
+                .clone();
+            entry.selected_file_total_bytes = selected_file.length;
+        }
+        let initial = torrent_stream_snapshot(&self.session, torrent_id, file_idx);
+        if let Some(snapshot) = &initial {
+            info!(
+                torrent_id,
+                info_hash = %info_hash,
+                file_idx,
+                file = %selected_file.name,
+                selected_file_bytes = snapshot.selected_file_bytes,
+                selected_file_total_bytes = selected_file.length,
+                downloaded_and_checked_bytes = snapshot.downloaded_and_checked_bytes,
+                live_peers = snapshot.live_peers,
+                connecting_peers = snapshot.connecting_peers,
+                seen_peers = snapshot.seen_peers,
+                torrent_download_mib_s = snapshot.torrent_download_mib_s,
+                "torrent selected-file progress"
+            );
+        }
+
+        let initial_bytes = initial
+            .as_ref()
+            .map(|snapshot| snapshot.selected_file_bytes)
+            .unwrap_or_default();
+        let observe_progress = if initial_bytes < selected_file.length {
+            self.progress_observers
+                .lock()
+                .await
+                .insert((torrent_id, file_idx))
+        } else {
+            false
+        };
+        if observe_progress {
+            let session = self
+                .session
+                .clone();
+            let progress_observers = self
+                .progress_observers
+                .clone();
+            let probe_progress = self
+                .probe_progress
+                .clone();
+            tokio::spawn(async move {
+                let started = std::time::Instant::now();
+                let mut previous_elapsed = Duration::ZERO;
+                let mut previous_bytes = initial_bytes;
+                // Keep the final progress observation comfortably ahead of the
+                // 15-second P2P ffprobe budget. Sampling exactly at 15 seconds
+                // races the probe timeout, so genuinely growing torrents can
+                // be discarded before their second positive-growth sample is
+                // published to the probe fallback policy.
+                for target_secs in [2_u64, 5, 9, 13] {
+                    let target = Duration::from_secs(target_secs);
+                    tokio::time::sleep(target.saturating_sub(started.elapsed())).await;
+                    let elapsed = started.elapsed();
+                    let Some(snapshot) =
+                        torrent_stream_snapshot(&session, torrent_id, file_idx)
+                    else {
+                        break;
+                    };
+                    let delta_bytes = snapshot
+                        .selected_file_bytes
+                        .saturating_sub(previous_bytes);
+                    let delta_seconds = elapsed
+                        .saturating_sub(previous_elapsed)
+                        .as_secs_f64();
+                    let selected_file_growth_mib_s = if delta_seconds > 0.0 {
+                        delta_bytes as f64 / 1024.0 / 1024.0 / delta_seconds
+                    } else {
+                        0.0
+                    };
+                    if let Ok(mut progress) = probe_progress.lock() {
+                        let entry = progress
+                            .entry(progress_key.clone())
+                            .or_default();
+                        entry.file_name = selected_file
+                            .name
+                            .clone();
+                        entry.selected_file_total_bytes = selected_file.length;
+                        entry.selected_file_growth_mib_s = selected_file_growth_mib_s;
+                        if delta_bytes > 0 {
+                            entry.positive_growth_samples = entry
+                                .positive_growth_samples
+                                .saturating_add(1);
+                        }
+                    }
+                    info!(
+                        torrent_id,
+                        info_hash = %info_hash,
+                        file_idx,
+                        file = %selected_file.name,
+                        elapsed_ms = elapsed.as_millis() as u64,
+                        selected_file_bytes = snapshot.selected_file_bytes,
+                        selected_file_total_bytes = selected_file.length,
+                        selected_file_growth_mib_s,
+                        downloaded_and_checked_bytes = snapshot.downloaded_and_checked_bytes,
+                        live_peers = snapshot.live_peers,
+                        connecting_peers = snapshot.connecting_peers,
+                        seen_peers = snapshot.seen_peers,
+                        torrent_download_mib_s = snapshot.torrent_download_mib_s,
+                        "torrent selected-file progress"
+                    );
+                    if snapshot.selected_file_bytes >= selected_file.length {
+                        break;
+                    }
+                    previous_elapsed = elapsed;
+                    previous_bytes = snapshot.selected_file_bytes;
+                }
+                progress_observers
+                    .lock()
+                    .await
+                    .remove(&(torrent_id, file_idx));
+            });
+        }
+
+        Ok((
+            format!(
+                "http://127.0.0.1:{}/torrents/{}/stream/{}",
+                self.http_port, torrent_id, file_idx
+            ),
+            file_idx,
         ))
     }
 
@@ -553,6 +1033,11 @@ impl TorrentManager {
         &self,
         active: &std::collections::HashSet<usize>,
     ) -> Result<usize> {
+        // Match the lock order used by pause/delete to avoid deadlocking cleanup.
+        let background = self
+            .background_downloads
+            .lock()
+            .await;
         let leases = self
             .leases
             .lock()
@@ -575,6 +1060,13 @@ impl TorrentManager {
                             .to_ascii_lowercase(),
                     )
                     .is_some_and(|lease| lease.strong_count() != 0)
+            })
+            .filter(|torrent| {
+                !background.contains_key(
+                    &torrent
+                        .info_hash
+                        .to_ascii_lowercase(),
+                )
             })
             .filter_map(|t| t.id)
             .filter(|id| !active.contains(id))
@@ -640,6 +1132,589 @@ impl TorrentManager {
         self.session
             .ratelimits
             .set_download_bps(download);
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct BackgroundDownload {
+    owner_id: String,
+    info_hash: String,
+    magnet: String,
+    file_idx: usize,
+    file_name: String,
+    total_bytes: u64,
+    paused: bool,
+    created_at: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct BackgroundLimits {
+    max_active: usize,
+    max_bytes: u64,
+    max_age_hours: u64,
+}
+
+impl Default for BackgroundLimits {
+    fn default() -> Self {
+        Self {
+            max_active: 2,
+            max_bytes: 32 * 1024 * 1024 * 1024,
+            max_age_hours: 168,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct BackgroundDownloadStatus {
+    pub info_hash: String,
+    pub file_idx: usize,
+    pub file_name: String,
+    pub total_bytes: u64,
+    pub downloaded_bytes: u64,
+    pub peers: usize,
+    pub download_mib_s: f64,
+    pub paused: bool,
+    pub created_at: u64,
+}
+
+#[cfg(unix)]
+fn filesystem_free_bytes(path: &std::path::Path) -> Result<u64> {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::ffi::CString::new(
+        path.as_os_str()
+            .as_bytes(),
+    )?;
+    let mut stats = std::mem::MaybeUninit::<libc::statvfs>::uninit();
+    if unsafe { libc::statvfs(path.as_ptr(), stats.as_mut_ptr()) } != 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("reading torrent filesystem free space");
+    }
+    let stats = unsafe { stats.assume_init() };
+    Ok(stats
+        .f_bavail
+        .saturating_mul(stats.f_frsize as u64))
+}
+
+#[cfg(not(unix))]
+fn filesystem_free_bytes(_path: &std::path::Path) -> Result<u64> {
+    Ok(u64::MAX)
+}
+
+fn unix_time() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
+}
+
+impl TorrentManager {
+    async fn save_background_downloads(
+        &self,
+        jobs: &std::collections::HashMap<String, BackgroundDownload>,
+    ) -> Result<()> {
+        let mut entries: Vec<_> = jobs
+            .values()
+            .cloned()
+            .collect();
+        entries.sort_by(|a, b| {
+            a.info_hash
+                .cmp(&b.info_hash)
+        });
+        let contents = serde_json::to_vec_pretty(&entries)?;
+        let parent = self
+            .background_downloads_path
+            .parent()
+            .context("background download path has no parent")?;
+        tokio::fs::create_dir_all(parent).await?;
+        let temporary = self
+            .background_downloads_path
+            .with_extension("json.tmp");
+        tokio::fs::write(&temporary, contents).await?;
+        tokio::fs::rename(&temporary, &self.background_downloads_path).await?;
+        Ok(())
+    }
+
+    fn background_status(&self, job: &BackgroundDownload) -> BackgroundDownloadStatus {
+        let snapshot = librqbit::Magnet::parse(&job.magnet)
+            .ok()
+            .and_then(|m| m.as_id20())
+            .and_then(|hash| {
+                self.session
+                    .get(TorrentIdOrHash::Hash(hash))
+            })
+            .and_then(|handle| {
+                torrent_stream_snapshot(&self.session, handle.id(), job.file_idx)
+            });
+        BackgroundDownloadStatus {
+            info_hash: job
+                .info_hash
+                .clone(),
+            file_idx: job.file_idx,
+            file_name: job
+                .file_name
+                .clone(),
+            total_bytes: job.total_bytes,
+            downloaded_bytes: snapshot
+                .as_ref()
+                .map_or(0, |s| s.selected_file_bytes),
+            peers: snapshot
+                .as_ref()
+                .map_or(0, |s| s.live_peers),
+            download_mib_s: snapshot
+                .as_ref()
+                .map_or(0.0, |s| s.torrent_download_mib_s),
+            paused: job.paused,
+            created_at: job.created_at,
+        }
+    }
+
+    pub async fn list_background_downloads(
+        &self,
+        owner_id: &str,
+    ) -> Vec<BackgroundDownloadStatus> {
+        let jobs = self
+            .background_downloads
+            .lock()
+            .await;
+        let mut items: Vec<_> = jobs
+            .values()
+            .filter(|job| job.owner_id == owner_id)
+            .map(|job| self.background_status(job))
+            .collect();
+        items.sort_by_key(|item| item.created_at);
+        items
+    }
+
+    pub async fn create_background_download(
+        &self,
+        owner_id: &str,
+        magnet: &str,
+        advertised_height: u32,
+    ) -> Result<BackgroundDownloadStatus> {
+        anyhow::ensure!(
+            advertised_height >= 720,
+            "background downloads require >=720p source"
+        );
+        let hash = librqbit::Magnet::parse(magnet)
+            .context("invalid torrent magnet")?
+            .as_id20()
+            .context("torrent magnet has no info hash")?
+            .as_string();
+        {
+            let jobs = self
+                .background_downloads
+                .lock()
+                .await;
+            if let Some(existing) = jobs.get(&hash) {
+                anyhow::ensure!(
+                    existing.owner_id == owner_id,
+                    "torrent owned by another user"
+                );
+                return Ok(self.background_status(existing));
+            }
+            anyhow::ensure!(
+                jobs.values()
+                    .filter(|job| !job.paused)
+                    .count()
+                    < self
+                        .background_limits
+                        .max_active,
+                "background download concurrency limit reached"
+            );
+        }
+        let (_, file_idx) = self
+            .resolve_url(magnet)
+            .await?;
+        let files = self
+            .managed_torrent_files(&hash)
+            .context("torrent metadata unavailable")?;
+        let chosen = files
+            .get(file_idx)
+            .context("torrent file not found")?;
+        anyhow::ensure!(
+            is_video_file(&chosen.name),
+            "selected torrent file is not video"
+        );
+        anyhow::ensure!(chosen.length > 0, "selected torrent file is empty");
+        let mut jobs = self
+            .background_downloads
+            .lock()
+            .await;
+        if let Some(existing) = jobs.get(&hash) {
+            anyhow::ensure!(
+                existing.owner_id == owner_id,
+                "torrent owned by another user"
+            );
+            return Ok(self.background_status(existing));
+        }
+        anyhow::ensure!(
+            jobs.values()
+                .filter(|job| !job.paused)
+                .count()
+                < self
+                    .background_limits
+                    .max_active,
+            "background download concurrency limit reached"
+        );
+        let reserved_bytes: u64 = jobs
+            .values()
+            .map(|job| job.total_bytes)
+            .sum();
+        anyhow::ensure!(
+            chosen.length
+                <= self
+                    .background_limits
+                    .max_bytes
+                    .saturating_sub(reserved_bytes),
+            "background download disk budget exceeded"
+        );
+        // Reserve enough room for the selected file on the *torrent* filesystem,
+        // not just in the configured aggregate reservation counter.
+        const FREE_SPACE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
+        let free_bytes = filesystem_free_bytes(&self.torrent_data_path)?;
+        anyhow::ensure!(
+            chosen.length <= free_bytes.saturating_sub(FREE_SPACE_RESERVE),
+            "insufficient free disk space for background download"
+        );
+        let api = Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
+        let torrent_id = self
+            .session
+            .get(TorrentIdOrHash::Hash(
+                librqbit::Magnet::parse(magnet)?
+                    .as_id20()
+                    .context("missing hash")?,
+            ))
+            .context("torrent disappeared")?
+            .id();
+        api.api_torrent_action_update_only_files(
+            TorrentIdOrHash::Id(torrent_id),
+            &std::collections::HashSet::from([file_idx]),
+        )
+        .await?;
+        let job = BackgroundDownload {
+            owner_id: owner_id.to_owned(),
+            info_hash: hash.clone(),
+            magnet: magnet.to_owned(),
+            file_idx,
+            file_name: chosen
+                .name
+                .clone(),
+            total_bytes: chosen.length,
+            paused: false,
+            created_at: unix_time(),
+        };
+        jobs.insert(hash.clone(), job.clone());
+        if let Err(error) = self
+            .save_background_downloads(&jobs)
+            .await
+        {
+            jobs.remove(&hash);
+            return Err(error);
+        }
+        Ok(self.background_status(&job))
+    }
+
+    pub async fn set_background_download_paused(
+        &self,
+        owner_id: &str,
+        hash: &str,
+        paused: bool,
+    ) -> Result<BackgroundDownloadStatus> {
+        let hash = normalized_info_hash(hash);
+        let mut jobs = self
+            .background_downloads
+            .lock()
+            .await;
+        let mut job = jobs
+            .get(&hash)
+            .context("background download not found")?
+            .clone();
+        anyhow::ensure!(
+            job.owner_id == owner_id,
+            "background download not owned by user"
+        );
+        anyhow::ensure!(
+            unix_time().saturating_sub(job.created_at)
+                <= self
+                    .background_limits
+                    .max_age_hours
+                    .saturating_mul(3600),
+            "background download expired"
+        );
+        if !paused {
+            anyhow::ensure!(
+                jobs.values()
+                    .filter(|other| !other.paused && other.info_hash != hash)
+                    .count()
+                    < self
+                        .background_limits
+                        .max_active,
+                "background download concurrency limit reached"
+            );
+        }
+        if job.paused == paused {
+            return Ok(self.background_status(&job));
+        }
+        let leases = self
+            .leases
+            .lock()
+            .await;
+        anyhow::ensure!(
+            !leases
+                .get(&hash)
+                .is_some_and(|lease| lease.strong_count() > 0),
+            "cannot pause a torrent currently in use by playback"
+        );
+        let handle = self
+            .session
+            .get(TorrentIdOrHash::Hash(
+                librqbit::Magnet::parse(&job.magnet)?
+                    .as_id20()
+                    .context("invalid stored hash")?,
+            ))
+            .context("torrent not currently managed")?;
+        let api = Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
+        let id = TorrentIdOrHash::Id(handle.id());
+        if paused {
+            api.api_torrent_action_update_only_files(id, &Default::default())
+                .await?;
+            api.api_torrent_action_pause(id)
+                .await?;
+        } else {
+            api.api_torrent_action_update_only_files(
+                id,
+                &std::collections::HashSet::from([job.file_idx]),
+            )
+            .await?;
+            api.api_torrent_action_start(id)
+                .await?;
+        }
+        job.paused = paused;
+        jobs.insert(hash.clone(), job.clone());
+        self.save_background_downloads(&jobs)
+            .await?;
+        Ok(self.background_status(&job))
+    }
+
+    pub async fn delete_background_download(
+        &self,
+        owner_id: &str,
+        hash: &str,
+    ) -> Result<()> {
+        let hash = normalized_info_hash(hash);
+        let mut jobs = self
+            .background_downloads
+            .lock()
+            .await;
+        let existing = jobs
+            .get(&hash)
+            .context("background download not found")?;
+        anyhow::ensure!(
+            existing.owner_id == owner_id,
+            "background download not owned by user"
+        );
+        let leases = self
+            .leases
+            .lock()
+            .await;
+        anyhow::ensure!(
+            !leases
+                .get(&hash)
+                .is_some_and(|lease| lease.strong_count() > 0),
+            "cannot delete a torrent currently in use by playback"
+        );
+        if let Some(torrent) = Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        )
+        .api_torrent_list()
+        .torrents
+        .into_iter()
+        .find(|torrent| {
+            torrent
+                .info_hash
+                .eq_ignore_ascii_case(&hash)
+        }) {
+            if let Some(id) = torrent.id {
+                Api::new(
+                    self.session
+                        .clone(),
+                    None,
+                    None,
+                )
+                .api_torrent_action_delete(TorrentIdOrHash::Id(id))
+                .await?;
+            }
+        }
+        jobs.remove(&hash);
+        self.save_background_downloads(&jobs)
+            .await?;
+        Ok(())
+    }
+
+    async fn restore_background_downloads(&self) -> Result<()> {
+        let mut jobs = self
+            .background_downloads
+            .lock()
+            .await;
+        let expiration = self
+            .background_limits
+            .max_age_hours
+            .saturating_mul(3600);
+        let expired: Vec<String> = jobs
+            .values()
+            .filter(|job| unix_time().saturating_sub(job.created_at) > expiration)
+            .map(|job| {
+                job.info_hash
+                    .clone()
+            })
+            .collect();
+        let api = Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        );
+        for hash in expired {
+            let managed = api
+                .api_torrent_list()
+                .torrents
+                .into_iter()
+                .find(|torrent| {
+                    torrent
+                        .info_hash
+                        .eq_ignore_ascii_case(&hash)
+                })
+                .and_then(|torrent| torrent.id);
+            if let Some(id) = managed {
+                if let Err(error) = api
+                    .api_torrent_action_delete(TorrentIdOrHash::Id(id))
+                    .await
+                {
+                    warn!(%hash, "failed to purge expired background torrent: {error:#}");
+                    continue;
+                }
+            }
+            jobs.remove(&hash);
+        }
+        let mut active = 0;
+        let mut oldest_first: Vec<_> = jobs
+            .keys()
+            .cloned()
+            .collect();
+        oldest_first.sort_by_key(|hash| {
+            jobs.get(hash)
+                .map_or(u64::MAX, |job| job.created_at)
+        });
+        for hash in &oldest_first {
+            let job = jobs
+                .get_mut(hash)
+                .expect("saved key");
+            if !job.paused {
+                if active
+                    >= self
+                        .background_limits
+                        .max_active
+                {
+                    job.paused = true;
+                } else {
+                    active += 1;
+                }
+            }
+        }
+        for hash in oldest_first {
+            let job = jobs
+                .get(&hash)
+                .expect("saved key");
+            let options = AddTorrentOptions {
+                paused: job.paused,
+                only_files: Some(if job.paused {
+                    vec![]
+                } else {
+                    vec![job.file_idx]
+                }),
+                ..Default::default()
+            };
+            let added = self
+                .session
+                .add_torrent(AddTorrent::from_url(&job.magnet), Some(options))
+                .await;
+            let handle = match added {
+                Ok(
+                    AddTorrentResponse::Added(_, handle)
+                    | AddTorrentResponse::AlreadyManaged(_, handle),
+                ) => handle,
+                Ok(AddTorrentResponse::ListOnly(_)) => continue,
+                Err(error) => {
+                    warn!(hash = %job.info_hash, "background download restore failed: {error:#}");
+                    continue;
+                }
+            };
+            match tokio::time::timeout(
+                Duration::from_secs(30),
+                handle.wait_until_initialized(),
+            )
+            .await
+            {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => {
+                    warn!(hash = %job.info_hash, "background download metadata failed: {error:#}");
+                    continue;
+                }
+                Err(error) => {
+                    warn!(hash = %job.info_hash, "background download metadata timed out: {error}");
+                    continue;
+                }
+            }
+            let api = Api::new(
+                self.session
+                    .clone(),
+                None,
+                None,
+            );
+            let files = std::collections::HashSet::from_iter(if job.paused {
+                None
+            } else {
+                Some(job.file_idx)
+            });
+            if let Err(error) = api
+                .api_torrent_action_update_only_files(
+                    TorrentIdOrHash::Id(handle.id()),
+                    &files,
+                )
+                .await
+            {
+                warn!(hash = %job.info_hash, "background download selection restore failed: {error:#}");
+            }
+            if job.paused {
+                if let Err(error) = api
+                    .api_torrent_action_pause(TorrentIdOrHash::Id(handle.id()))
+                    .await
+                {
+                    warn!(hash = %job.info_hash, "background download pause restore failed: {error:#}");
+                }
+            } else if let Err(error) = api
+                .api_torrent_action_start(TorrentIdOrHash::Id(handle.id()))
+                .await
+            {
+                warn!(hash = %job.info_hash, "background download resume failed: {error:#}");
+            }
+        }
+        self.save_background_downloads(&jobs)
+            .await?;
         Ok(())
     }
 }
@@ -1143,6 +2218,138 @@ mod tests {
                 .is_err()
         );
         manager
+            .shutdown()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn background_download_state_survives_restart_and_protects_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let data = dir
+            .path()
+            .join("data");
+        let cache = dir
+            .path()
+            .join("cache");
+        let manager =
+            TorrentManager::new(data.clone(), cache.clone(), None, true, None)
+                .await
+                .unwrap();
+        let bytes = b"d4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:....................ee";
+        manager
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(&bytes[..]),
+                Some(AddTorrentOptions {
+                    paused: true,
+                    disable_trackers: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let api = Api::new(
+            manager
+                .session
+                .clone(),
+            None,
+            None,
+        );
+        let hash = api
+            .api_torrent_list()
+            .torrents[0]
+            .info_hash
+            .clone();
+        let magnet = format!("magnet:?xt=urn:btih:{hash}");
+        let job = BackgroundDownload {
+            owner_id: "test".into(),
+            info_hash: hash.clone(),
+            magnet,
+            file_idx: 0,
+            file_name: "fixture.mkv".into(),
+            total_bytes: 1,
+            paused: true,
+            created_at: unix_time(),
+        };
+        {
+            let mut jobs = manager
+                .background_downloads
+                .lock()
+                .await;
+            jobs.insert(hash.clone(), job);
+            manager
+                .save_background_downloads(&jobs)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            manager
+                .delete_unused_with_files(&Default::default())
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            manager
+                .list_background_downloads("test")
+                .await
+                .len(),
+            1
+        );
+        let running = manager
+            .set_background_download_paused("test", &hash, false)
+            .await
+            .unwrap();
+        assert!(!running.paused);
+        let paused = manager
+            .set_background_download_paused("test", &hash, true)
+            .await
+            .unwrap();
+        assert!(paused.paused);
+        let running = manager
+            .set_background_download_paused("test", &hash, false)
+            .await
+            .unwrap();
+        assert!(!running.paused);
+        let paused = manager
+            .set_background_download_paused("test", &hash, true)
+            .await
+            .unwrap();
+        assert!(paused.paused);
+        let running = manager
+            .set_background_download_paused("test", &hash, false)
+            .await
+            .unwrap();
+        assert!(!running.paused);
+        let paused = manager
+            .set_background_download_paused("test", &hash, true)
+            .await
+            .unwrap();
+        assert!(paused.paused);
+        let running = manager
+            .set_background_download_paused("test", &hash, false)
+            .await
+            .unwrap();
+        assert!(!running.paused);
+        let paused = manager
+            .set_background_download_paused("test", &hash, true)
+            .await
+            .unwrap();
+        assert!(paused.paused);
+        manager
+            .shutdown()
+            .await;
+        drop(manager);
+        let reopened = TorrentManager::new(data, cache, None, true, None)
+            .await
+            .unwrap();
+        let restored = reopened
+            .list_background_downloads("test")
+            .await;
+        assert_eq!(restored.len(), 1);
+        assert_eq!(restored[0].info_hash, hash);
+        assert!(restored[0].paused);
+        reopened
             .shutdown()
             .await;
     }

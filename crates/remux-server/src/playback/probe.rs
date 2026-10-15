@@ -1425,13 +1425,21 @@ enum TorrentCodecFamily {
 }
 
 fn torrent_codec_family(stream: &db::Media) -> Option<TorrentCodecFamily> {
-    let info = stream.stream_info.as_ref();
+    let info = stream
+        .stream_info
+        .as_ref();
     let mut hint = info
-        .and_then(|value| value.filename.as_deref())
+        .and_then(|value| {
+            value
+                .filename
+                .as_deref()
+        })
         .unwrap_or(&stream.title)
         .to_ascii_lowercase();
     if hint.is_empty() {
-        hint = stream.title.to_ascii_lowercase();
+        hint = stream
+            .title
+            .to_ascii_lowercase();
     }
 
     if hint.contains("av1") {
@@ -1534,7 +1542,8 @@ fn select_candidates(
     // only after the primary and first fallback have already failed, so a
     // healthy 1080p/4K primary still starts with zero extra work. Filename
     // codec hints are deliberately a soft ordering signal, never health proof.
-    let same_tier_budget = max_retries.saturating_sub(usize::from(lower_recovery.is_some()));
+    let same_tier_budget =
+        max_retries.saturating_sub(usize::from(lower_recovery.is_some()));
     let primary_height = resolution_height(primary);
     let mut selected: Vec<&db::Media> = Vec::with_capacity(max_retries);
     let mut seen_codec_families = Vec::new();
@@ -1553,7 +1562,9 @@ fn select_candidates(
         .collect();
 
     if same_tier_budget > 0
-        && let Some(first) = same_tier.first().copied()
+        && let Some(first) = same_tier
+            .first()
+            .copied()
     {
         selected.push(first);
         if let Some(family) = torrent_codec_family(first)
@@ -1573,23 +1584,33 @@ fn select_candidates(
             .iter()
             .copied()
             .find(|candidate| {
-                !selected.iter().any(|chosen| chosen.id == candidate.id)
+                !selected
+                    .iter()
+                    .any(|chosen| chosen.id == candidate.id)
                     && torrent_codec_family(candidate) == Some(TorrentCodecFamily::Avc)
             });
         let distinct = same_tier
             .iter()
             .copied()
             .find(|candidate| {
-                !selected.iter().any(|chosen| chosen.id == candidate.id)
+                !selected
+                    .iter()
+                    .any(|chosen| chosen.id == candidate.id)
                     && torrent_codec_family(candidate)
                         .is_some_and(|family| !seen_codec_families.contains(&family))
             });
-        let next = avc_rescue.or(distinct).or_else(|| {
-            same_tier
-                .iter()
-                .copied()
-                .find(|candidate| !selected.iter().any(|chosen| chosen.id == candidate.id))
-        });
+        let next = avc_rescue
+            .or(distinct)
+            .or_else(|| {
+                same_tier
+                    .iter()
+                    .copied()
+                    .find(|candidate| {
+                        !selected
+                            .iter()
+                            .any(|chosen| chosen.id == candidate.id)
+                    })
+            });
         let Some(next) = next else {
             break;
         };
@@ -1605,18 +1626,26 @@ fn select_candidates(
     // best lower-resolution candidate (still >=720p). This does not impose a
     // 720p-first policy and cannot slow an already-healthy high-quality source.
     if let Some(lower) = lower_recovery
-        && !selected.iter().any(|candidate| candidate.id == lower.id)
+        && !selected
+            .iter()
+            .any(|candidate| candidate.id == lower.id)
     {
         selected.push(lower);
     }
 
     // Non-P2P and resolution-restricted paths retain the original bounded
     // best-ranked fallback behavior when the diversity path did not fill them.
-    for candidate in eligible.iter().copied() {
+    for candidate in eligible
+        .iter()
+        .copied()
+    {
         if selected.len() >= max_retries {
             break;
         }
-        if !selected.iter().any(|chosen| chosen.id == candidate.id) {
+        if !selected
+            .iter()
+            .any(|chosen| chosen.id == candidate.id)
+        {
             selected.push(candidate);
         }
     }
@@ -1727,8 +1756,12 @@ where
                 }
                 _ => false,
             };
-        let effective_timeout =
-            probe_attempt_timeout(&stream, timeout_secs, diversified_recovery, attempt_index == 0);
+        let effective_timeout = probe_attempt_timeout(
+            &stream,
+            timeout_secs,
+            diversified_recovery,
+            attempt_index == 0,
+        );
         let url = match url_opt {
             Some(u) => u,
             None => {

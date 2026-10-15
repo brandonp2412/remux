@@ -544,15 +544,17 @@ impl TorrentSource {
     /// the title's duration. Without this, an unprobed 30 GB 4K source could
     /// incorrectly pass the generic 1 MiB/s readiness floor.
     fn expected_playback_bitrate_bps(&self, selected_bytes: u64) -> Option<i64> {
-        self.expected_bitrate_bps.filter(|bitrate| *bitrate > 0).or_else(|| {
-            let seconds = u64::try_from(self.expected_duration_secs?).ok()?;
-            if seconds < 60 || selected_bytes == 0 {
-                return None;
-            }
-            i64::try_from(u128::from(selected_bytes) * 8 / u128::from(seconds))
-                .ok()
-                .filter(|bitrate| *bitrate > 0)
-        })
+        self.expected_bitrate_bps
+            .filter(|bitrate| *bitrate > 0)
+            .or_else(|| {
+                let seconds = u64::try_from(self.expected_duration_secs?).ok()?;
+                if seconds < 60 || selected_bytes == 0 {
+                    return None;
+                }
+                i64::try_from(u128::from(selected_bytes) * 8 / u128::from(seconds))
+                    .ok()
+                    .filter(|bitrate| *bitrate > 0)
+            })
     }
 
     fn to_magnet(&self) -> String {
@@ -666,7 +668,8 @@ impl TorrentSource {
             let max_bytes = if needs_buffer { 8 * MIB } else { 4 * MIB };
             let startup_bytes = (playback_mibps * seconds_to_buffer * MIB as f64)
                 .ceil()
-                .clamp(MIB as f64, max_bytes as f64) as usize;
+                .clamp(MIB as f64, max_bytes as f64)
+                as usize;
             return Some((startup_bytes, minimum_sustainable, needs_buffer));
         }
         // No trustworthy duration/bitrate: retain the conservative 4-MiB
@@ -686,7 +689,7 @@ impl TorrentSource {
         // there is enough aggregate activity for one probe chunk instead of waiting
         // for 4 MiB of unrelated pieces; the old 4 MiB gate could consume nearly
         // the entire readiness budget before checking the bytes the client needs.
-                const RANGE_PROBE_BYTES: usize = 1024 * 1024;
+        const RANGE_PROBE_BYTES: usize = 1024 * 1024;
         const RANGE_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
         let deadline = tokio::time::Instant::now() + READY_WAIT;
@@ -702,7 +705,8 @@ impl TorrentSource {
                     && status.current_cached_bytes >= status.current_total_bytes;
                 let expected_bitrate_bps =
                     self.expected_playback_bitrate_bps(status.current_total_bytes);
-                let plan = Self::readiness_plan(expected_bitrate_bps, status.download_mibps);
+                let plan =
+                    Self::readiness_plan(expected_bitrate_bps, status.download_mibps);
                 if fully_cached {
                     tracing::info!(
                         cached_bytes = status.current_cached_bytes,
@@ -712,8 +716,15 @@ impl TorrentSource {
                     );
                     return Ok(());
                 }
-                if let Some((startup_target_bytes, required_download_mibps, buffering)) = plan {
-                    let required = status.current_total_bytes.min(startup_target_bytes as u64);
+                if let Some((
+                    startup_target_bytes,
+                    required_download_mibps,
+                    buffering,
+                )) = plan
+                {
+                    let required = status
+                        .current_total_bytes
+                        .min(startup_target_bytes as u64);
                     if required == 0 || status.current_cached_bytes < required {
                         last_status = Some(status);
                         if tokio::time::Instant::now() >= deadline {
@@ -1101,7 +1112,7 @@ impl StreamSource for TorrentSource {
         let lease = torrent
             .acquire(&self.info_hash)
             .await;
-        let resolved = match tokio::time::timeout(
+        let (resolved, selected_file_idx) = match tokio::time::timeout(
             TORRENT_RESOLVE_WAIT,
             torrent.resolve_url(&self.to_magnet()),
         )
@@ -1146,6 +1157,7 @@ impl StreamSource for TorrentSource {
                     .to_str()
                     .ok()
             });
+        torrent.note_range_requested(&self.info_hash, selected_file_idx);
         if let Err(error) = self
             .wait_until_ready(&torrent, &resolved, requested_range)
             .await
