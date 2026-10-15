@@ -2236,7 +2236,7 @@ mod tests {
                 .await
                 .unwrap();
         let bytes = b"d4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:....................ee";
-        manager
+        let added = manager
             .session
             .add_torrent(
                 AddTorrent::from_bytes(&bytes[..]),
@@ -2247,6 +2247,15 @@ mod tests {
                 }),
             )
             .await
+            .unwrap();
+        let handle = match added {
+            AddTorrentResponse::Added(_, handle)
+            | AddTorrentResponse::AlreadyManaged(_, handle) => handle,
+            AddTorrentResponse::ListOnly(_) => panic!("expected managed test torrent"),
+        };
+        tokio::time::timeout(Duration::from_secs(10), handle.wait_until_initialized())
+            .await
+            .unwrap()
             .unwrap();
         let api = Api::new(
             manager
