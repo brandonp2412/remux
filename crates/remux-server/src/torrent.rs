@@ -2232,7 +2232,7 @@ mod tests {
             .path()
             .join("cache");
         let manager =
-            TorrentManager::new(data.clone(), cache.clone(), None, true, None)
+            TorrentManager::new(data.clone(), cache.clone(), None, true, None, true)
                 .await
                 .unwrap();
         let bytes = b"d4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:....................ee";
@@ -2340,7 +2340,7 @@ mod tests {
             .shutdown()
             .await;
         drop(manager);
-        let reopened = TorrentManager::new(data, cache, None, true, None)
+        let reopened = TorrentManager::new(data, cache, None, true, None, true)
             .await
             .unwrap();
         let restored = reopened
