@@ -1192,10 +1192,61 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::{
-        HttpSource, STREAM_PROXY_CLIENT, StreamDescriptor, TrackerUrl, is_tracker_url,
-        mime_from_path,
+        HttpSource, STREAM_PROXY_CLIENT, StreamDescriptor, TorrentSource, TrackerUrl,
+        is_tracker_url, mime_from_path,
     };
     use std::path::Path;
+
+    #[tokio::test]
+    async fn idle_swarm_can_prove_a_cached_startup_range() {
+        // Paused/idle swarms report zero current throughput even when opening
+        // bytes remain cached. Only a real range read decides readiness.
+        let (bytes, minimum_mibps, _) =
+            TorrentSource::readiness_plan(Some(8 * 1024 * 1024), 0.0).unwrap();
+        let server = httpmock::MockServer::start();
+        let startup = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/cached")
+                .header("Range", "bytes=0-");
+            then.status(206)
+                .body(vec![0u8; bytes]);
+        });
+        let result = TorrentSource::probe_readable_range(
+            &format!("{}/cached", server.base_url()),
+            0,
+            bytes,
+            minimum_mibps,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert!(result.0 >= bytes);
+        startup.assert();
+    }
+
+    #[tokio::test]
+    async fn range_readiness_rejects_unavailable_requested_bytes() {
+        let (bytes, minimum_mibps, _) =
+            TorrentSource::readiness_plan(None, 0.0).unwrap();
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/short");
+            then.status(206)
+                .body(vec![0u8; 1024]);
+        });
+        assert!(
+            TorrentSource::probe_readable_range(
+                &format!("{}/short", server.base_url()),
+                0,
+                bytes,
+                minimum_mibps,
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            .is_err()
+        );
+    }
 
     #[test]
     fn mime_from_path_video() {
