@@ -1381,12 +1381,17 @@ pub(crate) async fn probe_stream(
             debug!(id = %stream.id, "probe cache stale or filename-guess only, re-probing");
         }
     }
+    let p2p_max_retries = if is_p2p {
+        max_retries.min(2)
+    } else {
+        max_retries
+    };
     let result = probe_with_fallback(
         stream.clone(),
         url_opt,
         timeout_secs,
         auto_next_stream,
-        max_retries,
+        p2p_max_retries,
         probe_pool,
         restrict_resolution,
         port,
@@ -1482,6 +1487,34 @@ fn torrent_codec_family(stream: &db::Media) -> Option<TorrentCodecFamily> {
     }
 }
 
+fn filename_episode_marker(media: &db::Media) -> Option<(u16, u16)> {
+    static EPISODE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(
+        || {
+            regex::Regex::new(
+                r"(?i)(?:^|[^a-z0-9])(?:s(\d{1,2})[ ._-]*e|(\d{1,2})[ ._-]*x[ ._-]*)(\d{1,3})(?:[^a-z0-9]|$)",
+            )
+            .expect("valid episode filename regex")
+        },
+    );
+    let filename = media
+        .stream_info
+        .as_ref()?
+        .filename
+        .as_deref()?;
+    let matches = EPISODE.captures(filename)?;
+    Some((
+        matches
+            .get(1)
+            .or_else(|| matches.get(2))?
+            .as_str()
+            .parse()
+            .ok()?,
+        matches[3]
+            .parse()
+            .ok()?,
+    ))
+}
+
 fn select_candidates(
     primary: &db::Media,
     probe_pool: &[db::Media],
@@ -1502,10 +1535,19 @@ fn select_candidates(
         .as_ref()
         .and_then(|si| si.resolution_tag());
 
+    let primary_episode = filename_episode_marker(primary);
     let eligible: Vec<&db::Media> = probe_pool
         .iter()
         .filter(|candidate| {
             if candidate.id == primary.id {
+                return false;
+            }
+            // Addons can attach a torrent for S04E01 to an S01E01 item.
+            // Never play an explicitly mismatched episode as a fallback.
+            if primary_episode.is_some_and(|expected| {
+                filename_episode_marker(candidate)
+                    .is_some_and(|actual| actual != expected)
+            }) {
                 return false;
             }
             let candidate_p2p = candidate
@@ -1543,12 +1585,38 @@ fn select_candidates(
 
     let lower_recovery = if pri_p2p && !restrict_resolution && max_retries >= 2 {
         resolution_height(primary).and_then(|primary_height| {
+            let same_tier_count = eligible
+                .iter()
+                .filter(|candidate| {
+                    resolution_height(candidate) == Some(primary_height)
+                })
+                .count();
             eligible
                 .iter()
                 .copied()
-                .find(|candidate| {
+                .filter(|candidate| {
                     resolution_height(candidate)
                         .is_some_and(|height| height < primary_height && height >= 720)
+                })
+                .filter(|candidate| {
+                    let seeders = candidate
+                        .stream_info
+                        .as_ref()
+                        .and_then(|info| info.seeders)
+                        .unwrap_or(0);
+                    seeders >= 3 || same_tier_count < max_retries
+                })
+                .max_by_key(|candidate| {
+                    (
+                        resolution_height(candidate).unwrap_or_default(),
+                        torrent_codec_family(candidate)
+                            == Some(TorrentCodecFamily::Avc),
+                        candidate
+                            .stream_info
+                            .as_ref()
+                            .and_then(|info| info.seeders)
+                            .unwrap_or(0),
+                    )
                 })
         })
     } else {
@@ -1693,6 +1761,19 @@ fn probe_attempt_timeout(
         .as_ref()
         .is_some_and(|info| info.is_p2p())
     {
+        let sparse_mp4 = stream
+            .stream_info
+            .as_ref()
+            .and_then(|info| {
+                info.filename
+                    .as_deref()
+            })
+            .and_then(|name| std::path::Path::new(name).extension())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("mp4")
+                    || ext.eq_ignore_ascii_case("m4v")
+                    || ext.eq_ignore_ascii_case("mov")
+            });
         // PlaybackInfo clients currently allow about 90 seconds for the entire
         // request. Keep the primary and same-tier retries tightly bounded so
         // dead swarms cannot consume that budget. If those attempts already
@@ -1704,10 +1785,17 @@ fn probe_attempt_timeout(
             // This is a bounded recovery allowance, not the generic P2P
             // timeout. The normal configured value is 15s on the deployed
             // server; E2E showed the viable diversified source completing at
-            // ~20s, so it must be allowed to outlive that normal cap.
-            25
+            // ~20s, so it must be allowed to outlive that normal cap. Two
+            // P2P fallback slots keep the total request budget bounded.
+            35
         } else if configured_secs >= 15 {
-            if primary_attempt { 22 } else { 18 }
+            if sparse_mp4 {
+                if primary_attempt { 30 } else { 20 }
+            } else if primary_attempt {
+                22
+            } else {
+                18
+            }
         } else {
             configured_secs
         }
@@ -2201,6 +2289,17 @@ mod probe_tests {
         }
     }
 
+    fn p2p_media_with_filename(filename: &str, seeders: i64) -> db::Media {
+        let mut media = p2p_media();
+        let info = media
+            .stream_info
+            .as_mut()
+            .unwrap();
+        info.filename = Some(filename.to_string());
+        info.seeders = Some(seeders);
+        media
+    }
+
     fn video_probe() -> anyhow::Result<(api::MediaSourceInfo, MediaSegments)> {
         Ok((
             api::MediaSourceInfo {
@@ -2281,6 +2380,37 @@ mod probe_tests {
     }
 
     #[test]
+    fn fallback_rejects_explicitly_wrong_episode() {
+        let primary = http_media_with_filename(
+            "http://a.example.com",
+            "American Dad S01E01 Pilot 1080p.mkv",
+        );
+        let wrong = http_media_with_filename(
+            "http://b.example.com",
+            "American.Dad.6x01.100.A.D.720p.mkv",
+        );
+        let correct = http_media_with_filename(
+            "http://c.example.com",
+            "American Dad S01 E01 WEB-DL 720p.mkv",
+        );
+        let result = select_candidates(
+            &primary,
+            &[wrong, correct.clone()],
+            true,
+            3,
+            false,
+            3000,
+        );
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0]
+                .0
+                .id,
+            correct.id
+        );
+    }
+
+    #[test]
     fn resolution_mismatch_excluded_when_restricted() {
         let primary =
             http_media_with_filename("http://a.example.com", "Movie.1080p.BluRay.mkv");
@@ -2329,13 +2459,91 @@ mod probe_tests {
     }
 
     #[test]
+    fn dead_lower_resolution_does_not_displace_healthy_tier_retry() {
+        let primary = p2p_media_with_filename("Show.S01E01.1080p.HEVC.mkv", 100);
+        let same_a = p2p_media_with_filename("Show.S01E01.1080p.HEVC.A.mkv", 50);
+        let same_b = p2p_media_with_filename("Show.S01E01.1080p.H264.B.mkv", 40);
+        let same_c = p2p_media_with_filename("Show.S01E01.1080p.H264.C.mkv", 30);
+        let lower = p2p_media_with_filename("Show.S01E01.720p.H264.mkv", 1);
+        let lower_id = lower.id;
+
+        let result = select_candidates(
+            &primary,
+            &[same_a, same_b, same_c, lower],
+            true,
+            3,
+            false,
+            3000,
+        );
+
+        assert_eq!(result.len(), 3);
+        assert!(
+            result
+                .iter()
+                .all(|(media, _)| media.id != lower_id)
+        );
+    }
+
+    #[test]
+    fn lower_resolution_recovery_prefers_avc_within_best_tier() {
+        let primary = p2p_media_with_filename("Movie.2160p.AV1.mkv", 300);
+        let same = p2p_media_with_filename("Movie.2160p.HEVC.mkv", 200);
+        let vc1 = p2p_media_with_filename("Movie.1080p.REMUX.VC-1.mkv", 250);
+        let avc = p2p_media_with_filename("Movie.1080p.x264.mkv", 100);
+        let lower_avc = p2p_media_with_filename("Movie.720p.x264.mkv", 500);
+        let avc_id = avc.id;
+        let lower_avc_id = lower_avc.id;
+
+        let result = select_candidates(
+            &primary,
+            &[same, vc1, avc, lower_avc],
+            true,
+            2,
+            false,
+            3000,
+        );
+
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[1]
+                .0
+                .id,
+            avc_id
+        );
+        assert_ne!(
+            result[1]
+                .0
+                .id,
+            lower_avc_id
+        );
+    }
+
+    #[test]
     fn p2p_probe_timeout_is_capped_without_changing_http_timeout() {
         assert_eq!(probe_attempt_timeout(&p2p_media(), 60, false, true), 22);
         assert_eq!(probe_attempt_timeout(&p2p_media(), 10, false, true), 10);
         assert_eq!(probe_attempt_timeout(&p2p_media(), 15, false, true), 22);
         assert_eq!(probe_attempt_timeout(&p2p_media(), 15, false, false), 18);
-        assert_eq!(probe_attempt_timeout(&p2p_media(), 15, true, false), 25);
-        assert_eq!(probe_attempt_timeout(&p2p_media(), 60, true, false), 25);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 15, true, false), 35);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 60, true, false), 35);
+        assert_eq!(
+            probe_attempt_timeout(
+                &p2p_media_with_filename("Movie.1080p.mp4", 100),
+                60,
+                false,
+                true
+            ),
+            30
+        );
+        assert_eq!(
+            probe_attempt_timeout(
+                &p2p_media_with_filename("Movie.1080p.mp4", 100),
+                60,
+                false,
+                false
+            ),
+            20
+        );
         assert_eq!(
             probe_attempt_timeout(&http_media("http://example.com"), 60, false, true),
             60

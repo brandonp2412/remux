@@ -1520,7 +1520,13 @@ async fn videos_stream_inner(
         } else {
             descriptor
                 .clone()
-                .into_source()
+                .into_source_with_expected_bitrate(
+                    media
+                        .probe_data
+                        .as_ref()
+                        .and_then(|probe| probe.bitrate),
+                    media.runtime,
+                )
                 .serve(&state, &headers)
                 .await?
         };
@@ -1646,7 +1652,13 @@ async fn videos_stream_inner(
         } else {
             descriptor
                 .clone()
-                .into_source()
+                .into_source_with_expected_bitrate(
+                    media
+                        .probe_data
+                        .as_ref()
+                        .and_then(|probe| probe.bitrate),
+                    media.runtime,
+                )
                 .serve(&state, &headers)
                 .await?
         };

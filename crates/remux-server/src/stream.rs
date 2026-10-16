@@ -467,13 +467,30 @@ impl StreamInfo {
     }
 
     pub fn resolution_tag(&self) -> Option<String> {
-        let src = self
-            .filename
+        let parse = |src: &str| {
+            crate::db::min_screen_size(&hunch::hunch(src))
+                .map(str::to_owned)
+                .or_else(|| {
+                    src.split(|c: char| !c.is_ascii_alphanumeric())
+                        .find_map(|token| {
+                            let normalized = token.to_ascii_lowercase();
+                            match normalized.as_str() {
+                                "4k" => Some("2160p".to_string()),
+                                "2160p" | "1440p" | "1080p" | "720p" | "576p"
+                                | "480p" | "360p" => Some(normalized),
+                                _ => None,
+                            }
+                        })
+                })
+        };
+        self.filename
             .as_deref()
-            .or(self
-                .name
-                .as_deref())?;
-        crate::db::min_screen_size(&hunch::hunch(src)).map(|s| s.to_owned())
+            .and_then(parse)
+            .or_else(|| {
+                self.name
+                    .as_deref()
+                    .and_then(parse)
+            })
     }
 }
 
@@ -586,14 +603,16 @@ impl TorrentSource {
         required_download_mibps: f64,
         wait: std::time::Duration,
     ) -> anyhow::Result<(usize, f64)> {
-        let probe_range = format!("bytes={start}-");
         let started_at = tokio::time::Instant::now();
         let received = tokio::time::timeout(wait, async {
-            let response = STREAM_PROXY_CLIENT
-                .get(resolved_url)
-                .header(http::header::RANGE, &probe_range)
-                .send()
-                .await?;
+            let mut request = STREAM_PROXY_CLIENT.get(resolved_url);
+            // librqbit only accepts open-ended byte ranges. A plain GET is
+            // preferable at byte zero; for seeks, preserve bytes=N- and bound
+            // how many response bytes we consume below.
+            if start > 0 {
+                request = request.header(http::header::RANGE, format!("bytes={start}-"));
+            }
+            let response = request.send().await?;
             anyhow::ensure!(
                 response.status() == http::StatusCode::PARTIAL_CONTENT
                     || start == 0 && response.status().is_success(),
@@ -663,7 +682,10 @@ impl TorrentSource {
             let minimum_sustainable = (playback_mibps * 0.8).max(0.06);
             let needs_buffer = download_mibps < playback_mibps * 1.1;
             let seconds_to_buffer = if needs_buffer { 6.0 } else { 4.0 };
-            let max_bytes = if needs_buffer { 8 * MIB } else { 4 * MIB };
+            // Keep a real multi-second media buffer for high-bitrate remuxes.
+            // A 4-8 MiB cap is barely a second at typical Blu-ray bitrates and
+            // lets the player outrun a healthy swarm immediately after startup.
+            let max_bytes = 128 * MIB;
             let startup_bytes = (playback_mibps * seconds_to_buffer * MIB as f64)
                 .ceil()
                 .clamp(MIB as f64, max_bytes as f64)
@@ -681,7 +703,11 @@ impl TorrentSource {
         resolved_url: &str,
         requested_range: Option<&str>,
     ) -> anyhow::Result<()> {
-        const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(14);
+        // The final diversified PlaybackInfo recovery probe is allowed 35s.
+        // Keep this inner readiness window long enough for a healthy cold swarm
+        // to make a requested sparse range readable; earlier attempts remain
+        // bounded by their 18-22s outer probe timeouts.
+        const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
         const POLL: std::time::Duration = std::time::Duration::from_millis(250);
         // Aggregate activity is only a gate; the actual requested range below
         // must be readable at a sustainable rate before serving the client.
@@ -811,14 +837,18 @@ impl TorrentSource {
         }
         if let Some(status) = last_status {
             anyhow::bail!(
-                "torrent cached {} of {} bytes at {:.2} MiB/s in 14 seconds, but could not prove the requested buffered range (media bitrate {:?} bit/s)",
+                "torrent cached {} of {} bytes at {:.2} MiB/s in {} seconds, but could not prove the requested buffered range (media bitrate {:?} bit/s)",
                 status.current_cached_bytes,
                 status.current_total_bytes,
                 status.download_mibps,
+                READY_WAIT.as_secs(),
                 self.expected_playback_bitrate_bps(status.current_total_bytes),
             );
         }
-        anyhow::bail!("torrent readiness status unavailable within 14 seconds");
+        anyhow::bail!(
+            "torrent readiness status unavailable within {} seconds",
+            READY_WAIT.as_secs()
+        );
     }
 }
 
@@ -1100,6 +1130,17 @@ impl StreamSource for TorrentSource {
             drop(lease);
             return Err(error).context_bad_request("torrent source is not ready");
         }
+        if let Err(error) = torrent
+            .enable_next_episode_prefetch(&self.info_hash, selected_file_idx)
+            .await
+        {
+            tracing::debug!(
+                %error,
+                info_hash = %self.info_hash,
+                selected_file_idx,
+                "failed to enable next-episode prefetch after startup"
+            );
+        }
 
         let response = HttpSource {
             url: resolved,
@@ -1190,6 +1231,17 @@ mod tests {
     };
     use std::path::Path;
 
+    #[test]
+    fn high_bitrate_readiness_keeps_multiple_seconds_of_media() {
+        const MIB: usize = 1024 * 1024;
+        let (bytes, minimum_mibps, buffering) =
+            TorrentSource::readiness_plan(Some(23_347_839), 6.0).unwrap();
+
+        assert!(!buffering);
+        assert!((11 * MIB..=12 * MIB).contains(&bytes));
+        assert!((2.2..2.3).contains(&minimum_mibps));
+    }
+
     #[tokio::test]
     async fn idle_swarm_can_prove_a_cached_startup_range() {
         // Paused/idle swarms report zero current throughput even when opening
@@ -1199,8 +1251,7 @@ mod tests {
         let server = httpmock::MockServer::start();
         let startup = server.mock(|when, then| {
             when.method(httpmock::Method::GET)
-                .path("/cached")
-                .header("Range", "bytes=0-");
+                .path("/cached");
             then.status(206)
                 .body(vec![0u8; bytes]);
         });
@@ -1215,6 +1266,29 @@ mod tests {
         .unwrap();
         assert!(result.0 >= bytes);
         startup.assert();
+    }
+
+    #[tokio::test]
+    async fn seek_readiness_uses_librqbit_open_ended_range() {
+        let bytes = 64 * 1024;
+        let server = httpmock::MockServer::start();
+        let seek = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/seek")
+                .header("Range", "bytes=3306-");
+            then.status(206)
+                .body(vec![0u8; bytes]);
+        });
+        TorrentSource::probe_readable_range(
+            &format!("{}/seek", server.base_url()),
+            3306,
+            bytes,
+            0.01,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        seek.assert();
     }
 
     #[tokio::test]
@@ -1238,6 +1312,27 @@ mod tests {
             )
             .await
             .is_err()
+        );
+    }
+
+    #[test]
+    fn resolution_tag_falls_back_to_stream_name() {
+        let mut info = super::StreamInfo {
+            filename: Some("Inception (2010).mkv".to_string()),
+            name: Some("Torrentio\n4k DV | HDR".to_string()),
+            ..Default::default()
+        };
+        assert_eq!(
+            info.resolution_tag()
+                .as_deref(),
+            Some("2160p")
+        );
+
+        info.name = Some("Torrentio\n720p".to_string());
+        assert_eq!(
+            info.resolution_tag()
+                .as_deref(),
+            Some("720p")
         );
     }
 

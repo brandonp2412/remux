@@ -11,11 +11,11 @@ use librqbit::{
 use serde::{Deserialize, Serialize};
 use tracing::{debug, info, warn};
 
-// Keep cached pieces briefly reusable after playback, but stop peer traffic
-// almost immediately once the last playback/response lease disappears. The
-// longer retention window is disk-cache retention only; paused torrents are
-// restarted on demand by resolve_url().
-const TORRENT_IDLE_PAUSE_GRACE: Duration = Duration::from_secs(5);
+// Keep cached pieces briefly reusable after playback, but stop requesting
+// pieces almost immediately once the last playback/response lease disappears.
+// Idle playback torrents stay live with no selected files so librqbit can drain
+// peer writers without racing its pause transition; resolve_url() reselects on demand.
+const TORRENT_IDLE_QUIESCE_GRACE: Duration = Duration::from_secs(5);
 const TORRENT_IDLE_GRACE: Duration = Duration::from_secs(2 * 60 * 60);
 const TORRENT_CONTROL_WAIT: Duration = Duration::from_secs(2);
 
@@ -185,16 +185,16 @@ impl Drop for TorrentLease {
             runtime.spawn(async move {
                 // Allow a short seek/reconnect window, then stop consuming
                 // bandwidth while retaining cached pieces for a later request.
-                tokio::time::sleep(TORRENT_IDLE_PAUSE_GRACE).await;
+                tokio::time::sleep(TORRENT_IDLE_QUIESCE_GRACE).await;
                 if let Err(error) = manager
-                    .pause_if_unused(&hash)
+                    .quiesce_if_unused(&hash)
                     .await
                 {
-                    warn!(%hash, "failed to pause idle torrent: {error:#}");
+                    warn!(%hash, "failed to quiesce idle torrent: {error:#}");
                 }
 
                 tokio::time::sleep(
-                    TORRENT_IDLE_GRACE.saturating_sub(TORRENT_IDLE_PAUSE_GRACE),
+                    TORRENT_IDLE_GRACE.saturating_sub(TORRENT_IDLE_QUIESCE_GRACE),
                 )
                 .await;
                 if let Err(error) = manager
@@ -209,20 +209,15 @@ impl Drop for TorrentLease {
 }
 
 impl TorrentLease {
-    /// Drop this request's lease and immediately remove a failed candidate when
-    /// nobody else is using the same torrent. Unlike the normal two-hour idle
-    /// grace, probe/readiness failures should not leave loser swarms running.
+    /// Release a failed candidate through the normal idle lifecycle.
+    ///
+    /// Deleting immediately races librqbit peer writers that are still winding
+    /// down and can leave them writing through storage slots that deletion has
+    /// already cleared. The regular lease drop deselects files after the short
+    /// idle grace while retaining any downloaded pieces for retries.
     pub async fn discard_failed(self: Arc<Self>) -> Result<()> {
-        let manager = self
-            .manager
-            .clone();
-        let hash = self
-            .hash
-            .clone();
         drop(self);
-        manager
-            .delete_if_unused(&hash)
-            .await
+        Ok(())
     }
 }
 
@@ -473,29 +468,30 @@ impl TorrentManager {
         lease
     }
 
-    async fn pause_if_unused(&self, hash: &str) -> Result<()> {
-        if self
+    async fn quiesce_if_unused(&self, hash: &str) -> Result<()> {
+        // Serialize the short file-selection update with both background job
+        // changes and playback acquisition. Unlike librqbit pause(), this does
+        // not cancel peer tasks or take file/chunk storage out from under
+        // in-flight writers.
+        let background_downloads = self
             .background_downloads
             .lock()
-            .await
+            .await;
+        if background_downloads
             .get(hash)
             .is_some_and(|job| !job.paused)
         {
             return Ok(());
         }
-        // Do not hold the global lease-map mutex across rqbit control I/O.
-        // A slow pause must not block unrelated torrent acquisitions.
+        let leases = self
+            .leases
+            .lock()
+            .await;
+        if leases
+            .get(hash)
+            .is_none_or(|lease| lease.strong_count() != 0)
         {
-            let leases = self
-                .leases
-                .lock()
-                .await;
-            if leases
-                .get(hash)
-                .is_none_or(|lease| lease.strong_count() != 0)
-            {
-                return Ok(());
-            }
+            return Ok(());
         }
 
         let api = Api::new(
@@ -520,32 +516,21 @@ impl TorrentManager {
         {
             tokio::time::timeout(
                 TORRENT_CONTROL_WAIT,
-                api.api_torrent_action_pause(TorrentIdOrHash::Id(id)),
+                api.api_torrent_action_update_only_files(
+                    TorrentIdOrHash::Id(id),
+                    &Default::default(),
+                ),
             )
             .await
-            .context("timed out pausing idle torrent")??;
-            debug!(%hash, torrent_id = id, "paused idle torrent while retaining cache");
-
-            let acquired_during_pause = self
-                .leases
-                .lock()
-                .await
-                .get(hash)
-                .is_some_and(|lease| lease.strong_count() != 0);
-            if acquired_during_pause
-                && !api
-                    .api_stats_v1(TorrentIdOrHash::Id(id))
-                    .is_ok_and(|stats| matches!(stats.state, TorrentStatsState::Live))
-            {
-                tokio::time::timeout(
-                    TORRENT_CONTROL_WAIT,
-                    api.api_torrent_action_start(TorrentIdOrHash::Id(id)),
-                )
-                .await
-                .context("timed out restarting torrent acquired during idle pause")??;
-                debug!(%hash, torrent_id = id, "restarted torrent acquired during idle pause");
-            }
+            .context("timed out quiescing idle torrent")??;
+            debug!(
+                %hash,
+                torrent_id = id,
+                "deselected idle torrent files while retaining cache"
+            );
         }
+        drop(leases);
+        drop(background_downloads);
         Ok(())
     }
 
@@ -753,8 +738,66 @@ impl TorrentManager {
             .await;
     }
 
-    /// Resolve a magnet URI (possibly with `&tr=`, `&file_idx=`, `&file=` params
-    /// we encode) to a local `http://127.0.0.1:<port>/torrents/<id>/stream/<file_idx>` URL
+    /// Add the adjacent episode back to rqbit's selected files after the
+    /// requested episode has demonstrated a readable startup range.
+    pub(crate) async fn enable_next_episode_prefetch(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+    ) -> Result<()> {
+        let Some(hash) =
+            librqbit::Magnet::parse(&format!("magnet:?xt=urn:btih:{info_hash}"))
+                .ok()
+                .and_then(|magnet| magnet.as_id20())
+        else {
+            return Ok(());
+        };
+        let Some(handle) = self
+            .session
+            .get(TorrentIdOrHash::Hash(hash))
+        else {
+            return Ok(());
+        };
+        let files = handle.with_metadata(|metadata| {
+            metadata
+                .file_infos
+                .iter()
+                .map(|file| TorrentFile {
+                    name: file
+                        .relative_filename
+                        .to_string_lossy()
+                        .into_owned(),
+                    length: file.len,
+                })
+                .collect::<Vec<_>>()
+        })?;
+        if file_idx >= files.len() {
+            return Ok(());
+        }
+
+        let torrent_id = handle.id();
+        let existing = api_details_included(&self.session, torrent_id);
+        let selected = merge_episode_prefetch_selection(&files, file_idx, &existing);
+        if selected == existing {
+            return Ok(());
+        }
+        Api::new(
+            self.session
+                .clone(),
+            None,
+            None,
+        )
+        .api_torrent_action_update_only_files(
+            TorrentIdOrHash::Id(torrent_id),
+            &selected,
+        )
+        .await
+        .map(|_| ())
+        .context("failed to enable next-episode torrent prefetch")
+    }
+
+    /// Resolve a magnet URI with the tracker/file parameters we encode to
+    /// the local rqbit HTTP stream URL for the selected file.
     pub async fn resolve_url(&self, magnet: &str) -> Result<(String, usize)> {
         let file_idx_override = parse_file_idx_param(magnet);
         let wanted_file = parse_file_param(magnet);
@@ -814,12 +857,13 @@ impl TorrentManager {
         let file_idx =
             select_file_index(&files, file_idx_override, wanted_file.as_deref())?;
 
-        // Start rqbit's natural piece download queue for the resolved file.
-        // Also retain the current/next episode prefetch selection rather than
-        // replacing it with a single file and interrupting active playback.
+        // Give the requested file exclusive startup priority. Selecting the
+        // next episode here can let rqbit spend the whole readiness budget on
+        // speculative pieces while byte 0 of the requested episode stays
+        // unreadable. Once startup is proven, the stream path enables the next
+        // episode again for background prefetch.
         let existing = api_details_included(&self.session, torrent_id);
-        let mut selected_files =
-            merge_episode_prefetch_selection(&files, file_idx, &existing);
+        let mut selected_files = merge_playback_selection(&files, file_idx, &existing);
         if let Some(background_index) = self
             .background_downloads
             .lock()
@@ -1790,13 +1834,34 @@ fn api_details_included(
 // Keep already-prefetched episode files when the next episode is resolved.
 // A new lookup must not stop the download of the episode that is playing.
 // This is bounded to four files per torrent, not a season-wide selection.
+fn merge_playback_selection(
+    files: &[TorrentFile],
+    selected_idx: usize,
+    already: &std::collections::HashSet<usize>,
+) -> std::collections::HashSet<usize> {
+    merge_torrent_selection(files, selected_idx, already, false)
+}
+
 fn merge_episode_prefetch_selection(
     files: &[TorrentFile],
     selected_idx: usize,
     already: &std::collections::HashSet<usize>,
 ) -> std::collections::HashSet<usize> {
+    merge_torrent_selection(files, selected_idx, already, true)
+}
+
+fn merge_torrent_selection(
+    files: &[TorrentFile],
+    selected_idx: usize,
+    already: &std::collections::HashSet<usize>,
+    prefetch_next: bool,
+) -> std::collections::HashSet<usize> {
     const MAX_SELECTED: usize = 4;
-    let mut selected = episode_prefetch_selection(files, selected_idx);
+    let mut selected = if prefetch_next {
+        episode_prefetch_selection(files, selected_idx)
+    } else {
+        std::collections::HashSet::from([selected_idx])
+    };
     let mut previous = already
         .iter()
         .copied()
@@ -2364,6 +2429,130 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn failed_candidate_release_does_not_delete_live_torrent_immediately() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            TorrentManager::new(
+                dir.path()
+                    .join("data"),
+                dir.path()
+                    .join("cache"),
+                None,
+                true,
+                None,
+                true,
+            )
+            .await
+            .unwrap(),
+        );
+        manager
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(
+                    &b"d4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:....................ee"[..],
+                ),
+                Some(AddTorrentOptions {
+                    paused: true,
+                    disable_trackers: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let api = Api::new(
+            manager
+                .session
+                .clone(),
+            None,
+            None,
+        );
+        let hash = api
+            .api_torrent_list()
+            .torrents[0]
+            .info_hash
+            .clone();
+
+        manager
+            .acquire(&hash)
+            .await
+            .discard_failed()
+            .await
+            .unwrap();
+
+        assert_eq!(
+            api.api_torrent_list()
+                .torrents
+                .len(),
+            1
+        );
+        manager
+            .shutdown()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn idle_quiesce_deselects_without_pausing() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            TorrentManager::new(
+                dir.path()
+                    .join("data"),
+                dir.path()
+                    .join("cache"),
+                None,
+                true,
+                None,
+                true,
+            )
+            .await
+            .unwrap(),
+        );
+        let response = manager
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(
+                    &b"d4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:....................ee"[..],
+                ),
+                Some(AddTorrentOptions {
+                    paused: false,
+                    disable_trackers: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let handle = match response {
+            AddTorrentResponse::Added(_, handle)
+            | AddTorrentResponse::AlreadyManaged(_, handle) => handle,
+            AddTorrentResponse::ListOnly(_) => panic!("unexpected list-only torrent"),
+        };
+        handle
+            .wait_until_initialized()
+            .await
+            .unwrap();
+        let hash = handle
+            .info_hash()
+            .as_string()
+            .to_ascii_lowercase();
+        let lease = manager
+            .acquire(&hash)
+            .await;
+        drop(lease);
+
+        manager
+            .quiesce_if_unused(&hash)
+            .await
+            .unwrap();
+
+        let stats = handle.stats();
+        assert!(matches!(stats.state, TorrentStatsState::Live));
+        assert!(api_details_included(&manager.session, handle.id()).is_empty());
+        manager
+            .shutdown()
+            .await;
+    }
+
+    #[tokio::test]
     async fn cleanup_waits_for_sessions_and_readers_and_respects_reacquisition() {
         let dir = tempfile::tempdir().unwrap();
         let manager = Arc::new(
@@ -2628,6 +2817,27 @@ mod tests {
         assert_eq!(episode_prefetch_selection(&files, 4), [4].into());
         assert_eq!(episode_prefetch_selection(&files, 1), [1].into());
         assert_eq!(episode_prefetch_selection(&files, 5), [5].into());
+    }
+
+    #[test]
+    fn playback_start_prioritizes_only_requested_episode() {
+        let files = vec![
+            file("Show/S01E01.mkv", 1000),
+            file("Show/S01E02.mkv", 1000),
+            file("Show/S01E03.mkv", 1000),
+        ];
+        assert_eq!(
+            merge_playback_selection(&files, 0, &Default::default()),
+            [0].into()
+        );
+        assert_eq!(
+            merge_playback_selection(&files, 1, &[0].into()),
+            [0, 1].into()
+        );
+        assert_eq!(
+            merge_episode_prefetch_selection(&files, 0, &Default::default()),
+            [0, 1].into()
+        );
     }
 
     #[test]
