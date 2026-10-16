@@ -709,9 +709,11 @@ impl TorrentSource {
         // bounded by their 18-22s outer probe timeouts.
         const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
         const POLL: std::time::Duration = std::time::Duration::from_millis(250);
-        // Aggregate activity is only a gate; the actual requested range below
-        // must be readable at a sustainable rate before serving the client.
-        const RANGE_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
+        // The actual requested range must be readable at a sustainable rate
+        // before serving the client.
+        // Keep one reader alive for the remaining readiness budget. Restarting
+        // it every eight seconds drops its sparse-piece priority before a slow
+        // swarm can finish a large boundary piece, despite download progress.
 
         let deadline = tokio::time::Instant::now() + READY_WAIT;
         let mut last_status = None;
@@ -783,7 +785,7 @@ impl TorrentSource {
                                 probe_start,
                                 probe_bytes_needed,
                                 required_download_mibps,
-                                RANGE_PROBE_WAIT.min(remaining),
+                                remaining,
                             )
                             .await?;
 
