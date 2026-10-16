@@ -649,20 +649,18 @@ impl TorrentSource {
         download_mibps: f64,
     ) -> Option<(usize, f64, bool)> {
         const MIB: usize = 1024 * 1024;
-        if !download_mibps.is_finite() || download_mibps <= 0.0 {
+        if !download_mibps.is_finite() || download_mibps < 0.0 {
             return None;
         }
         if let Some(playback_mibps) = expected_bitrate_bps
             .filter(|bps| *bps > 0)
             .map(|bps| bps as f64 / 8.0 / MIB as f64)
         {
-            // Permit an 80%-of-real-time swarm to use a modest head start.
+            // Verify at least 80% of real-time throughput in the requested read.
+            // Current swarm throughput can be zero when these bytes are cached.
             // The tiny floor only rejects effectively dead peers; it must
             // not exceed the required speed of low-bitrate video.
             let minimum_sustainable = (playback_mibps * 0.8).max(0.06);
-            if download_mibps < minimum_sustainable {
-                return None;
-            }
             let needs_buffer = download_mibps < playback_mibps * 1.1;
             let seconds_to_buffer = if needs_buffer { 6.0 } else { 4.0 };
             let max_bytes = if needs_buffer { 8 * MIB } else { 4 * MIB };
@@ -674,7 +672,7 @@ impl TorrentSource {
         }
         // No trustworthy duration/bitrate: retain the conservative 4-MiB
         // proof and 1 MiB/s throughput baseline until ffprobe can help.
-        (download_mibps >= 1.0).then_some((4 * MIB, 1.0, false))
+        Some((4 * MIB, 1.0, download_mibps < 1.0))
     }
 
     async fn wait_until_ready(
@@ -722,14 +720,9 @@ impl TorrentSource {
                     let required = status
                         .current_total_bytes
                         .min(startup_target_bytes as u64);
-                    if required == 0 || status.current_cached_bytes < required {
-                        last_status = Some(status);
-                        if tokio::time::Instant::now() >= deadline {
-                            break;
-                        }
-                        tokio::time::sleep(POLL).await;
-                        continue;
-                    }
+                    // A cached range may be immediately readable while the
+                    // swarm is idle, and a range read prioritizes missing pieces.
+                    // Do not gate this proof on aggregate bytes or download rate.
                     // Aggregate torrent bytes are not a playable buffer. Verify actual
                     // consecutive bytes at the requested startup or seek offset.
                     // When bandwidth is slightly below the estimated media bitrate,

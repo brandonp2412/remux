@@ -1392,7 +1392,12 @@ pub(crate) async fn probe_stream(
         port,
         db,
         move |url, attempt_timeout_secs, sequential_matroska| {
-            let local_stream_rw_timeout = if attempt_timeout_secs > 15 {
+            let local_stream_rw_timeout = if sequential_matroska {
+                // The outer attempt already bounds the whole operation. A
+                // shorter socket deadline can expire before the proxy's cold
+                // readiness check, even when the requested bytes are arriving.
+                std::time::Duration::from_secs(attempt_timeout_secs)
+            } else if attempt_timeout_secs > 15 {
                 // A cold but promising swarm may need up to fourteen seconds
                 // to assemble a verified startup buffer. Do not abort the
                 // individual ffprobe socket before readiness can finish.
