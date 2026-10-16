@@ -1569,11 +1569,9 @@ mod tests {
         assert!(!super::should_serve_ffmpeg_variant_playlist(
             false, false, 0
         ));
-        assert!(!super::should_serve_ffmpeg_variant_playlist(
-            false, false, 1
-        ));
-        // fMP4 now also uses synthetic VOD playlist — full seek bar from the start.
-        assert!(!super::should_serve_ffmpeg_variant_playlist(false, true, 0));
+        assert!(super::should_serve_ffmpeg_variant_playlist(false, false, 1));
+        // FFmpeg writes actual fMP4 segment boundaries and seek numbers.
+        assert!(super::should_serve_ffmpeg_variant_playlist(false, true, 0));
         assert!(super::should_serve_ffmpeg_variant_playlist(true, false, 0));
     }
 
