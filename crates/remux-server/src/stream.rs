@@ -1095,16 +1095,9 @@ impl StreamSource for TorrentSource {
             .wait_until_ready(&torrent, &resolved, requested_range)
             .await
         {
-            if let Err(cleanup_error) = lease
-                .discard_failed()
-                .await
-            {
-                tracing::warn!(
-                    error = %cleanup_error,
-                    info_hash = %self.info_hash,
-                    "failed to discard unready torrent candidate"
-                );
-            }
+            // Preserve verified pieces for a cold retry. The lease's normal
+            // reconnect grace pauses an unused swarm without destroying data.
+            drop(lease);
             return Err(error).context_bad_request("torrent source is not ready");
         }
 

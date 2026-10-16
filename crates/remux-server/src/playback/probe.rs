@@ -1392,19 +1392,10 @@ pub(crate) async fn probe_stream(
         port,
         db,
         move |url, attempt_timeout_secs, sequential_matroska| {
-            let local_stream_rw_timeout = if sequential_matroska {
-                // The outer attempt already bounds the whole operation. A
-                // shorter socket deadline can expire before the proxy's cold
-                // readiness check, even when the requested bytes are arriving.
-                std::time::Duration::from_secs(attempt_timeout_secs)
-            } else if attempt_timeout_secs > 15 {
-                // A cold but promising swarm may need up to fourteen seconds
-                // to assemble a verified startup buffer. Do not abort the
-                // individual ffprobe socket before readiness can finish.
-                std::time::Duration::from_secs(15)
-            } else {
-                std::time::Duration::from_secs(7)
-            };
+            // Readiness may hold headers until near the attempt deadline.
+            // The outer timeout still bounds ffprobe, including optional seeks.
+            let local_stream_rw_timeout =
+                std::time::Duration::from_secs(attempt_timeout_secs);
             probe_media_with_local_stream_rw_timeout(
                 &url,
                 None,
@@ -1715,8 +1706,10 @@ fn probe_attempt_timeout(
             // server; E2E showed the viable diversified source completing at
             // ~20s, so it must be allowed to outlive that normal cap.
             25
+        } else if configured_secs >= 15 {
+            if primary_attempt { 22 } else { 18 }
         } else {
-            configured_secs.min(if primary_attempt { 22 } else { 18 })
+            configured_secs
         }
     } else {
         configured_secs
@@ -2339,6 +2332,8 @@ mod probe_tests {
     fn p2p_probe_timeout_is_capped_without_changing_http_timeout() {
         assert_eq!(probe_attempt_timeout(&p2p_media(), 60, false, true), 22);
         assert_eq!(probe_attempt_timeout(&p2p_media(), 10, false, true), 10);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 15, false, true), 22);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 15, false, false), 18);
         assert_eq!(probe_attempt_timeout(&p2p_media(), 15, true, false), 25);
         assert_eq!(probe_attempt_timeout(&p2p_media(), 60, true, false), 25);
         assert_eq!(
