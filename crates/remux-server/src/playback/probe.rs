@@ -1804,6 +1804,46 @@ fn probe_attempt_timeout(
     }
 }
 
+// P2P cached metadata is not evidence that a torrent is currently playable.
+// Before reusing a previously completed probe, ask the same local stream proxy
+// used by ffprobe for a real, bounded startup range. The proxy itself checks
+// consecutive torrent pieces and sustainable read speed.
+async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result<()> {
+    const PROOF_BYTES: usize = 1024 * 1024;
+    let parsed = url::Url::parse(url)?;
+    anyhow::ensure!(
+        matches!(parsed.host_str(), Some("127.0.0.1" | "::1" | "localhost"))
+            && parsed
+                .path()
+                .starts_with("/stream/"),
+        "cached torrent readiness must use the local stream proxy"
+    );
+    let response = reqwest::Client::new()
+        .get(url)
+        .header(
+            reqwest::header::RANGE,
+            format!("bytes=0-{}", PROOF_BYTES - 1),
+        )
+        .timeout(std::time::Duration::from_secs(timeout_secs))
+        .send()
+        .await?;
+    anyhow::ensure!(
+        response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
+        "cached torrent startup range was not served: {}",
+        response.status()
+    );
+    let bytes = response
+        .bytes()
+        .await?;
+    anyhow::ensure!(
+        bytes.len() == PROOF_BYTES,
+        "cached torrent startup range was truncated ({} of {} bytes)",
+        bytes.len(),
+        PROOF_BYTES
+    );
+    Ok(())
+}
+
 /// Probe a stream URL, retrying with the next matching candidate on failure.
 ///
 /// Returns a 500 error if all candidates fail to probe.
@@ -1880,6 +1920,34 @@ where
             }
         };
         attempts += 1;
+        if let Some(cached) = stream
+            .probe_data
+            .as_ref()
+            .filter(|cached| {
+                is_reusable_probe_cache(cached)
+                    && stream
+                        .stream_info
+                        .as_ref()
+                        .is_some_and(|info| info.is_p2p())
+            })
+        {
+            match verify_cached_p2p_startup_range(&url, effective_timeout).await {
+                Ok(()) => {
+                    info!(
+                        id = %stream.id,
+                        attempt = attempts,
+                        "reused cached torrent probe after verifying a live startup range"
+                    );
+                    let mut info = api::MediaSourceInfo::from(stream.clone());
+                    apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
+                    return Ok((info, stream));
+                }
+                Err(error) => {
+                    warn!(id = %stream.id, %error, "cached torrent startup range was not ready");
+                    continue;
+                }
+            }
+        }
         if is_retry {
             info!(
                 failed_id = %primary.id,
@@ -2548,6 +2616,101 @@ mod probe_tests {
             probe_attempt_timeout(&http_media("http://example.com"), 60, false, true),
             60
         );
+    }
+
+    async fn startup_range_test_server(
+        status: reqwest::StatusCode,
+        body_size: usize,
+    ) -> (String, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        let app = axum::Router::new().route(
+            "/stream/test",
+            axum::routing::get(move || async move { (status, vec![0_u8; body_size]) }),
+        );
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        (format!("http://{addr}/stream/test"), task)
+    }
+
+    #[tokio::test]
+    async fn cached_torrent_requires_full_partial_content_range() {
+        let (good_url, good_server) = startup_range_test_server(
+            reqwest::StatusCode::PARTIAL_CONTENT,
+            1024 * 1024,
+        )
+        .await;
+        assert!(
+            verify_cached_p2p_startup_range(&good_url, 3)
+                .await
+                .is_ok()
+        );
+        good_server.abort();
+
+        let (bad_url, bad_server) =
+            startup_range_test_server(reqwest::StatusCode::OK, 1024 * 1024).await;
+        assert!(
+            verify_cached_p2p_startup_range(&bad_url, 3)
+                .await
+                .is_err()
+        );
+        bad_server.abort();
+
+        let (short_url, short_server) =
+            startup_range_test_server(reqwest::StatusCode::PARTIAL_CONTENT, 1024).await;
+        assert!(
+            verify_cached_p2p_startup_range(&short_url, 3)
+                .await
+                .is_err()
+        );
+        short_server.abort();
+    }
+
+    #[tokio::test]
+    async fn ready_cached_torrent_does_not_rerun_ffprobe() {
+        let db = test_db().await;
+        let mut primary = p2p_media();
+        primary.probe_data = Some(
+            video_probe()
+                .unwrap()
+                .0,
+        );
+        let id = primary.id;
+        let (url, server) = startup_range_test_server(
+            reqwest::StatusCode::PARTIAL_CONTENT,
+            1024 * 1024,
+        )
+        .await;
+        let result = probe_with_fallback(
+            primary.clone(),
+            Some(url),
+            5,
+            false,
+            0,
+            &[primary],
+            false,
+            3000,
+            &db,
+            |_url, _timeout, _sequential| {
+                panic!("ffprobe must be skipped for readable cached torrent")
+            },
+        )
+        .await;
+        server.abort();
+        let (media_info, source) = result.unwrap();
+        assert!(
+            media_info
+                .video_stream()
+                .is_some()
+        );
+        assert_eq!(source.id, id);
     }
 
     #[tokio::test]
