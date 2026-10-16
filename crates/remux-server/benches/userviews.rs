@@ -1,5 +1,7 @@
 use criterion::{Criterion, criterion_group, criterion_main};
 
+// This benchmark uses only the shared HTTP runner, not the query builders.
+#[allow(dead_code)]
 #[path = "common.rs"]
 mod common;
 

@@ -21,18 +21,22 @@ pub fn auth_header_with_token(token: &str) -> String {
 
 /// RAII guard that shuts down the `AppContext` (releases torrent/DHT sockets)
 /// when the test ends. Hold this for the lifetime of the test.
-pub struct TestGuard(pub AppContext);
+pub struct TestGuard(pub AppContext, Option<tempfile::TempDir>);
 
 impl Drop for TestGuard {
     fn drop(&mut self) {
         let ctx = self
             .0
             .clone();
+        let data_dir = self
+            .1
+            .take();
         // Fire-and-forget shutdown: releases sockets so the next test (or a
         // server restart) can bind the same ports without "address in use" errors.
         tokio::spawn(async move {
             ctx.shutdown()
                 .await;
+            drop(data_dir);
         });
     }
 }
@@ -40,8 +44,20 @@ impl Drop for TestGuard {
 /// Creates a test server from the given config, seeds an admin user "test"/"test",
 /// and returns the server alongside a [`TestGuard`].
 pub async fn new_test_server_with_config(
-    config: Config,
+    mut config: Config,
 ) -> Result<(TestServer, TestGuard)> {
+    // Parallel test servers must not share librqbit persistence or transcode
+    // storage with each other (or with a real local server). Keep explicitly
+    // configured fixture directories, and isolate the default directory.
+    let data_dir = if config.data_dir == Config::default().data_dir {
+        let dir = tempfile::tempdir()?;
+        config.data_dir = dir
+            .path()
+            .to_path_buf();
+        Some(dir)
+    } else {
+        None
+    };
     let (app, ctx) = init_app_with_ctx(config).await?;
 
     let server = TestServer::builder()
@@ -60,7 +76,7 @@ pub async fn new_test_server_with_config(
         .post("/startup/complete")
         .await;
 
-    Ok((server, TestGuard(ctx)))
+    Ok((server, TestGuard(ctx, data_dir)))
 }
 
 /// Creates a test server with an in-memory SQLite DB, seeds an admin user
