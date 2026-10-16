@@ -685,11 +685,8 @@ impl TorrentSource {
     ) -> anyhow::Result<()> {
         const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(14);
         const POLL: std::time::Duration = std::time::Duration::from_millis(250);
-        // The HTTP Range proof is the authoritative readiness check. Trigger it once
-        // there is enough aggregate activity for one probe chunk instead of waiting
-        // for 4 MiB of unrelated pieces; the old 4 MiB gate could consume nearly
-        // the entire readiness budget before checking the bytes the client needs.
-        const RANGE_PROBE_BYTES: usize = 1024 * 1024;
+        // Aggregate activity is only a gate; the actual requested range below
+        // must be readable at a sustainable rate before serving the client.
         const RANGE_PROBE_WAIT: std::time::Duration = std::time::Duration::from_secs(8);
 
         let deadline = tokio::time::Instant::now() + READY_WAIT;
@@ -734,7 +731,7 @@ impl TorrentSource {
                         continue;
                     }
                     // Aggregate torrent bytes are not a playable buffer. Verify actual
-                    // consecutive startup bytes and seek/tail access before accepting.
+                    // consecutive bytes at the requested startup or seek offset.
                     // When bandwidth is slightly below the estimated media bitrate,
                     // demand a larger continuous read, not an arbitrarily high speed.
                     let (probe_start, probe_end) = requested_range
@@ -754,87 +751,34 @@ impl TorrentSource {
                             .min(startup_target_bytes as u64),
                     )
                     .unwrap_or(startup_target_bytes);
-                    let tail_probe_start = status
-                        .current_total_bytes
-                        .saturating_sub(RANGE_PROBE_BYTES as u64);
-                    let tail_probe_bytes_needed = usize::try_from(
-                        status
-                            .current_total_bytes
-                            .saturating_sub(tail_probe_start)
-                            .min(RANGE_PROBE_BYTES as u64),
-                    )
-                    .unwrap_or(RANGE_PROBE_BYTES);
+                    let range_readable: anyhow::Result<(usize, f64)> = async {
+                        let remaining = deadline
+                            .saturating_duration_since(tokio::time::Instant::now());
+                        anyhow::ensure!(
+                            !remaining.is_zero(),
+                            "readiness budget exhausted before startup range check"
+                        );
+                        let (startup_bytes, startup_read_mibps) =
+                            Self::probe_readable_range(
+                                resolved_url,
+                                probe_start,
+                                probe_bytes_needed,
+                                required_download_mibps,
+                                RANGE_PROBE_WAIT.min(remaining),
+                            )
+                            .await?;
 
-                    let range_readable: anyhow::Result<(usize, f64, usize, f64)> =
-                        async {
-                            let remaining = deadline
-                                .saturating_duration_since(tokio::time::Instant::now());
-                            anyhow::ensure!(
-                                !remaining.is_zero(),
-                                "readiness budget exhausted before startup range check"
-                            );
-                            let (startup_bytes, startup_read_mibps) =
-                                Self::probe_readable_range(
-                                    resolved_url,
-                                    probe_start,
-                                    probe_bytes_needed,
-                                    required_download_mibps,
-                                    RANGE_PROBE_WAIT.min(remaining),
-                                )
-                                .await?;
-
-                            // For a slightly slower source with a verified eight-MiB
-                            // startup buffer, do not reject playback solely because
-                            // the far end of a multi-GB file is not downloaded yet.
-                            // ffprobe decides whether this container truly needs that
-                            // optional tail metadata; the startup bytes are real.
-                            if buffering {
-                                // Record the skipped tail explicitly rather than claiming
-                                // the startup read also proved the end of the file.
-                                return Ok((startup_bytes, startup_read_mibps, 0, 0.0));
-                            }
-                            if tail_probe_start == probe_start
-                                || tail_probe_bytes_needed == 0
-                            {
-                                return Ok((
-                                    startup_bytes,
-                                    startup_read_mibps,
-                                    startup_bytes,
-                                    startup_read_mibps,
-                                ));
-                            }
-
-                            let remaining = deadline
-                                .saturating_duration_since(tokio::time::Instant::now());
-                            anyhow::ensure!(
-                                !remaining.is_zero(),
-                                "readiness budget exhausted before tail range check"
-                            );
-                            let (tail_bytes, tail_read_mibps) =
-                                Self::probe_readable_range(
-                                    resolved_url,
-                                    tail_probe_start,
-                                    tail_probe_bytes_needed,
-                                    required_download_mibps,
-                                    RANGE_PROBE_WAIT.min(remaining),
-                                )
-                                .await?;
-                            Ok((
-                                startup_bytes,
-                                startup_read_mibps,
-                                tail_bytes,
-                                tail_read_mibps,
-                            ))
-                        }
-                        .await;
+                        // Readiness belongs to the requested range. Requiring
+                        // the far end of a multi-GB sparse file here rejects
+                        // healthy startup/seek bytes and spends the probe's
+                        // entire deadline on optional container metadata.
+                        // A later EOF request proves its own bytes below.
+                        Ok((startup_bytes, startup_read_mibps))
+                    }
+                    .await;
 
                     match range_readable {
-                        Ok((
-                            startup_bytes,
-                            startup_read_mibps,
-                            tail_bytes,
-                            tail_read_mibps,
-                        )) => {
+                        Ok((startup_bytes, startup_read_mibps)) => {
                             tracing::info!(
                                 cached_bytes = status.current_cached_bytes,
                                 total_bytes = status.current_total_bytes,
@@ -848,9 +792,6 @@ impl TorrentSource {
                                 startup_bytes,
                                 startup_read_mibps,
                                 probe_start,
-                                tail_bytes,
-                                tail_read_mibps,
-                                tail_probe_start,
                                 "torrent source reached probe-ready cache"
                             );
                             return Ok(());
@@ -863,7 +804,6 @@ impl TorrentSource {
                                 live_peers = status.live_peers,
                                 required_download_mibps,
                                 probe_start,
-                                tail_probe_start,
                                 "torrent client ranges not sustainably readable yet"
                             );
                         }
@@ -878,7 +818,7 @@ impl TorrentSource {
         }
         if let Some(status) = last_status {
             anyhow::bail!(
-                "torrent cached {} of {} bytes at {:.2} MiB/s in 14 seconds, but could not prove buffered startup and tail ranges (media bitrate {:?} bit/s)",
+                "torrent cached {} of {} bytes at {:.2} MiB/s in 14 seconds, but could not prove the requested buffered range (media bitrate {:?} bit/s)",
                 status.current_cached_bytes,
                 status.current_total_bytes,
                 status.download_mibps,

@@ -27,6 +27,7 @@ fn ffprobe_args(
     allow_nonstandard_hls_extensions: bool,
     headers: Option<&str>,
     local_stream_rw_timeout: std::time::Duration,
+    sequential_matroska: bool,
 ) -> Vec<String> {
     let mut args = vec![
         "-v".into(),
@@ -53,6 +54,12 @@ fn ffprobe_args(
             .min(u64::MAX as u128)
             .to_string();
         args.extend(["-rw_timeout".into(), timeout_micros]);
+        if sequential_matroska {
+            // Matroska headers carry track metadata and duration before the
+            // clusters. Its optional EOF cues must not consume the remaining
+            // cold-start budget. MP4 still needs seeking to find a trailing moov.
+            args.extend(["-seekable".into(), "0".into()]);
+        }
     }
     if allow_nonstandard_hls_extensions {
         args.extend([
@@ -95,6 +102,7 @@ mod extension_retry_tests {
             true,
             None,
             std::time::Duration::from_secs(5),
+            false,
         );
 
         assert!(
@@ -738,6 +746,7 @@ pub fn probe_media_with(
         headers,
         timeout,
         std::time::Duration::from_secs(5),
+        false,
     )
 }
 
@@ -746,13 +755,20 @@ fn probe_media_with_local_stream_rw_timeout(
     headers: Option<&str>,
     timeout: Option<std::time::Duration>,
     local_stream_rw_timeout: std::time::Duration,
+    sequential_matroska: bool,
 ) -> Result<(api::MediaSourceInfo, MediaSegments)> {
     let shown = redact_url(url);
     debug!(url = %shown, "probing media");
     let deadline = timeout.map(|t| std::time::Instant::now() + t);
 
     let mut output = run_ffprobe(
-        &ffprobe_args(url, false, headers, local_stream_rw_timeout),
+        &ffprobe_args(
+            url,
+            false,
+            headers,
+            local_stream_rw_timeout,
+            sequential_matroska,
+        ),
         deadline,
     )?;
 
@@ -764,7 +780,13 @@ fn probe_media_with_local_stream_rw_timeout(
         ))
     {
         output = run_ffprobe(
-            &ffprobe_args(url, true, headers, local_stream_rw_timeout),
+            &ffprobe_args(
+                url,
+                true,
+                headers,
+                local_stream_rw_timeout,
+                sequential_matroska,
+            ),
             deadline,
         )?;
     }
@@ -1369,7 +1391,7 @@ pub(crate) async fn probe_stream(
         restrict_resolution,
         port,
         db,
-        move |url, attempt_timeout_secs| {
+        move |url, attempt_timeout_secs, sequential_matroska| {
             let local_stream_rw_timeout = if attempt_timeout_secs > 15 {
                 // A cold but promising swarm may need up to fourteen seconds
                 // to assemble a verified startup buffer. Do not abort the
@@ -1383,6 +1405,7 @@ pub(crate) async fn probe_stream(
                 None,
                 Some(std::time::Duration::from_secs(attempt_timeout_secs)),
                 local_stream_rw_timeout,
+                sequential_matroska,
             )
         },
     )
@@ -1714,6 +1737,7 @@ where
     F: Fn(
             String,
             u64,
+            bool,
         )
             -> anyhow::Result<(api::MediaSourceInfo, remux_sdks::remux::MediaSegments)>
         + Clone
@@ -1787,9 +1811,28 @@ where
         let stream2 = stream.clone();
         let db2 = db.clone();
         let f = probe_fn.clone();
+        let sequential_matroska = stream
+            .stream_info
+            .as_ref()
+            .is_some_and(|info| {
+                info.is_p2p()
+                    && info
+                        .filename
+                        .as_deref()
+                        .is_some_and(|name| {
+                            std::path::Path::new(name)
+                                .extension()
+                                .is_some_and(|ext| {
+                                    ext.eq_ignore_ascii_case("mkv")
+                                        || ext.eq_ignore_ascii_case("webm")
+                                })
+                        })
+            });
         let probe_result = tokio::time::timeout(
             std::time::Duration::from_secs(effective_timeout),
-            tokio::task::spawn_blocking(move || f(url2, effective_timeout)),
+            tokio::task::spawn_blocking(move || {
+                f(url2, effective_timeout, sequential_matroska)
+            }),
         )
         .await;
 
@@ -2175,12 +2218,16 @@ mod probe_tests {
 
     fn queued_probe(
         results: Vec<anyhow::Result<(api::MediaSourceInfo, MediaSegments)>>,
-    ) -> impl Fn(String, u64) -> anyhow::Result<(api::MediaSourceInfo, MediaSegments)>
+    ) -> impl Fn(
+        String,
+        u64,
+        bool,
+    ) -> anyhow::Result<(api::MediaSourceInfo, MediaSegments)>
     + Clone
     + Send
     + 'static {
         let q = Arc::new(Mutex::new(VecDeque::from(results)));
-        move |_url: String, _timeout_secs: u64| {
+        move |_url: String, _timeout_secs: u64, _sequential_matroska: bool| {
             q.lock()
                 .unwrap()
                 .pop_front()
