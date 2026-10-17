@@ -524,7 +524,33 @@ fn chapter_title_to_type(title: &str) -> Option<MediaSegmentType> {
     }
 }
 
-fn chapters_to_segments(chapters: &[FfprobeChapter]) -> MediaSegments {
+const MAX_PROBED_INTRO_END_TICKS: i64 = 8 * 60 * 10_000_000;
+
+fn plausible_chapter_segment(
+    kind: MediaSegmentType,
+    segment: &Segment,
+    media_duration_ticks: Option<i64>,
+) -> bool {
+    if segment.start_ticks < 0 || segment.end_ticks <= segment.start_ticks {
+        return false;
+    }
+    if kind != MediaSegmentType::Intro {
+        return true;
+    }
+
+    // Chapter titles often describe the section that follows rather than a
+    // skippable range. A chapter named "Intro" that runs into the main feature
+    // must not become a skip button. Keep this aligned with the client-side
+    // safety policy: intros end early and never span most of the media.
+    segment.end_ticks <= MAX_PROBED_INTRO_END_TICKS
+        && media_duration_ticks
+            .is_none_or(|duration| duration <= 0 || segment.end_ticks <= duration / 3)
+}
+
+fn chapters_to_segments(
+    chapters: &[FfprobeChapter],
+    media_duration_ticks: Option<i64>,
+) -> MediaSegments {
     let mut segs = MediaSegments::default();
     for ch in chapters {
         let title = ch
@@ -551,6 +577,16 @@ fn chapters_to_segments(chapters: &[FfprobeChapter]) -> MediaSegments {
             start_ticks: start,
             end_ticks: end,
         };
+        if !plausible_chapter_segment(kind, &seg, media_duration_ticks) {
+            warn!(
+                ?kind,
+                start_ticks = seg.start_ticks,
+                end_ticks = seg.end_ticks,
+                media_duration_ticks,
+                "ignoring implausible media chapter segment"
+            );
+            continue;
+        }
         match kind {
             MediaSegmentType::Intro
                 if segs
@@ -1204,7 +1240,12 @@ fn probe_media_with_local_stream_rw_timeout(
     // in probe data. The per-stream `is_default` flags above are the container
     // facts that derivation builds on.
 
-    let segments = chapters_to_segments(&probe.chapters);
+    let media_duration_ticks = probe
+        .format
+        .duration
+        .as_deref()
+        .and_then(|duration| duration.to_ticks(TickUnit::Seconds));
+    let segments = chapters_to_segments(&probe.chapters, media_duration_ticks);
 
     Ok((
         api::MediaSourceInfo {
@@ -2336,6 +2377,73 @@ where
 #[cfg(test)]
 mod probe_tests {
     use super::*;
+
+    fn chapter(start: &str, end: &str, title: &str) -> FfprobeChapter {
+        FfprobeChapter {
+            start_time: start.to_string(),
+            end_time: end.to_string(),
+            tags: HashMap::from([("title".to_string(), title.to_string())]),
+        }
+    }
+
+    #[test]
+    fn chapters_to_segments_rejects_intro_spanning_almost_entire_episode() {
+        let segments = chapters_to_segments(
+            &[
+                chapter("1.001", "996.955", "Intro"),
+                chapter("996.955", "1087.968", "Outro"),
+            ],
+            Some(1080 * 10_000_000),
+        );
+
+        assert_eq!(segments.intro, None);
+        assert_eq!(
+            segments.outro,
+            Some(Segment {
+                start_ticks: 9_969_550_000,
+                end_ticks: 10_879_680_000,
+            })
+        );
+    }
+
+    #[test]
+    fn chapters_to_segments_keeps_single_intro_when_duration_is_unknown() {
+        let segments = chapters_to_segments(&[chapter("0.0", "90.0", "Intro")], None);
+        assert_eq!(
+            segments.intro,
+            Some(Segment {
+                start_ticks: 0,
+                end_ticks: 900_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn chapters_to_segments_keeps_normal_intro() {
+        let segments = chapters_to_segments(
+            &[
+                chapter("0.0", "90.0", "Intro"),
+                chapter("90.0", "1000.0", "Main"),
+                chapter("1000.0", "1080.0", "Credits"),
+            ],
+            Some(1080 * 10_000_000),
+        );
+
+        assert_eq!(
+            segments.intro,
+            Some(Segment {
+                start_ticks: 0,
+                end_ticks: 900_000_000,
+            })
+        );
+        assert_eq!(
+            segments.outro,
+            Some(Segment {
+                start_ticks: 10_000_000_000,
+                end_ticks: 10_800_000_000,
+            })
+        );
+    }
 
     #[test]
     fn resume_range_estimate_tracks_position_and_caps_at_eof() {
