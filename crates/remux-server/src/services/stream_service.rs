@@ -27,6 +27,71 @@ pub(crate) struct ProbeResult {
 }
 
 /// What a subtitle addon needs to match subtitles to this exact release.
+fn explicit_episode_filename_date(source: &db::Media) -> Option<chrono::NaiveDate> {
+    static YMD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:^|[^0-9])((?:19|20)\d{2})[._ -](\d{1,2})[._ -](\d{1,2})(?:[^0-9]|$)",
+        )
+        .expect("valid year-first episode date regex")
+    });
+    static DMY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:^|[^0-9])(\d{1,2})[._ -](\d{1,2})[._ -]((?:19|20)\d{2})(?:[^0-9]|$)",
+        )
+        .expect("valid day-first episode date regex")
+    });
+
+    let filename = source
+        .stream_info
+        .as_ref()?
+        .filename
+        .as_deref()?;
+
+    let date =
+        |captures: regex::Captures<'_>, year: usize, month: usize, day: usize| {
+            chrono::NaiveDate::from_ymd_opt(
+                captures
+                    .get(year)?
+                    .as_str()
+                    .parse()
+                    .ok()?,
+                captures
+                    .get(month)?
+                    .as_str()
+                    .parse()
+                    .ok()?,
+                captures
+                    .get(day)?
+                    .as_str()
+                    .parse()
+                    .ok()?,
+            )
+        };
+
+    YMD.captures(filename)
+        .and_then(|captures| date(captures, 1, 2, 3))
+        .or_else(|| {
+            DMY.captures(filename)
+                .and_then(|captures| date(captures, 3, 2, 1))
+        })
+}
+
+fn episode_source_matches_air_date(
+    source: &db::Media,
+    expected: Option<chrono::NaiveDate>,
+) -> bool {
+    let (Some(expected), Some(actual)) =
+        (expected, explicit_episode_filename_date(source))
+    else {
+        return true;
+    };
+    expected
+        .signed_duration_since(actual)
+        .num_days()
+        .abs()
+        <= 1
+}
+
 fn subtitle_query_for(stream: &db::Media) -> crate::addons::SubtitleQuery {
     let info = stream
         .stream_info
@@ -364,6 +429,12 @@ impl StreamService {
         let root_kind = root
             .kind
             .clone();
+        let root_air_date = (root_kind == db::MediaKind::Episode)
+            .then(|| {
+                root.released_at
+                    .map(|date| date.date())
+            })
+            .flatten();
         let db_streams = root
             .streams(
                 &self
@@ -396,6 +467,24 @@ impl StreamService {
             self.show_ungrouped,
         )
         .await;
+        let streams: Vec<_> = streams
+            .into_iter()
+            .filter(|source| {
+                let keep = root_kind != db::MediaKind::Episode
+                    || episode_source_matches_air_date(source, root_air_date);
+                if !keep {
+                    debug!(
+                        id = %source.id,
+                        filename = ?source.stream_info.as_ref().and_then(|info| info.filename.as_deref()),
+                        expected_air_date = ?root_air_date,
+                        source_date = ?explicit_episode_filename_date(source),
+                        "dropping episode source whose explicit filename date mismatches the requested air date"
+                    );
+                }
+                keep
+            })
+            .collect();
+
         let streams = if let Some(sf) = self
             .stream_filter
             .as_ref()
@@ -1516,6 +1605,47 @@ fn media_info_from_probe(
 mod tests {
     use super::*;
     use crate::stream::{StreamDescriptor, StreamInfo};
+
+    #[test]
+    fn episode_source_air_date_guard_rejects_raw_episode_from_2025() {
+        let source = db::Media {
+            stream_info: Some(StreamInfo {
+                filename: Some(
+                    "WWE Monday Night Raw (7.07.2025) 1080p WEBDL H264.mkv".into(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let expected = chrono::NaiveDate::from_ymd_opt(1993, 3, 1);
+
+        assert!(!episode_source_matches_air_date(&source, expected));
+    }
+
+    #[test]
+    fn episode_source_air_date_guard_accepts_matching_or_nearby_dates() {
+        let source = |filename: &str| db::Media {
+            stream_info: Some(StreamInfo {
+                filename: Some(filename.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let expected = chrono::NaiveDate::from_ymd_opt(1993, 3, 1);
+
+        assert!(episode_source_matches_air_date(
+            &source("WWE.Monday.Night.Raw.1993.03.01.720p.mkv"),
+            expected
+        ));
+        assert!(episode_source_matches_air_date(
+            &source("Daily.Show.1993-03-02.1080p.mkv"),
+            expected
+        ));
+        assert!(episode_source_matches_air_date(
+            &source("Raw - 1st March 1993.mp4"),
+            expected
+        ));
+    }
 
     #[test]
     fn subtitle_query_comes_from_the_streams_filename_and_size() {
