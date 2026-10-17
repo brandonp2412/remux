@@ -10,6 +10,8 @@ SloppaTV main moved from `7cd9ddfc` to `94b98eb6`. The committed groups cover pe
 
 Checks: Remux `cargo test -p remux-server --lib --no-run` passed; targeted suites passed with exact results: probe 48, episode ordinal 3, retry-cache 1, Tatami 2. `cargo fmt --all -- --check` and `git diff --check` passed. Sloppa CI-equivalent checks before final source-fallback integration: ruff/ty/shellcheck/host tests, Play metadata and pinned mpv AAR, and `./gradlew --no-daemon test assembleDebug` passed. Changed-C++ quality check and host tests are rerunning on the final tree; their final status is added before this ledger is committed.
 
+SloppaTV final main SHA is `94b98eb6`. Remux code changes conclude at `6042bf3f`; later Remux main commits contain only this reconciliation ledger and its final audit note.
+
 ## Removed worktree directories
 
 Initial inventory: SloppaTV had 2 extra worktrees and 27 dirty main paths (including one new source header); Remux had 22 extra worktrees (11 dirty) and a clean main tree. Final inventory: zero extra worktrees in both repositories; all main changes committed.
