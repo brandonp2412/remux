@@ -3040,9 +3040,20 @@ mod probe_tests {
         let seen = requests.clone();
         let app = axum::Router::new().route(
             "/stream/{id}",
-            axum::routing::get(move || {
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
                 let seen = seen.clone();
                 async move {
+                    // Concurrent fallback prewarming intentionally does not carry
+                    // the playback-readiness header. Let that request complete
+                    // without consuming this test's simulated readiness failures.
+                    if !headers
+                        .contains_key(crate::stream::PROBE_PLAYBACK_READINESS_HEADER)
+                    {
+                        return (
+                            reqwest::StatusCode::PARTIAL_CONTENT,
+                            vec![0_u8; 1024 * 1024],
+                        );
+                    }
                     let request = seen.fetch_add(1, Ordering::SeqCst);
                     if request < 2 {
                         (reqwest::StatusCode::BAD_GATEWAY, Vec::new())
