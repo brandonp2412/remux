@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{Datelike, Utc};
 use futures::{Stream, StreamExt};
 use nutype::nutype;
 
@@ -678,12 +678,167 @@ impl StreamAddon for StremioAddon {
     async fn get_streams(
         &self,
         media: &db::Media,
-        _ctx: &AppContext,
+        ctx: &AppContext,
         id_prefixes: Option<&[String]>,
     ) -> Result<Vec<crate::stream::StreamInfo>> {
         let svc = self.service()?;
-        stremio_streams(&svc, &self.manifest_url, media, id_prefixes).await
+        let streams =
+            stremio_streams(&svc, &self.manifest_url, media, id_prefixes).await?;
+        if !streams.is_empty()
+            || media.kind != db::MediaKind::Episode
+            || media.parent_idx != Some(0)
+        {
+            return Ok(streams);
+        }
+
+        match standalone_special_movie(media, ctx).await {
+            Ok(Some(movie)) => {
+                match stremio_streams(&svc, &self.manifest_url, &movie, id_prefixes)
+                    .await
+                {
+                    Ok(fallback) if !fallback.is_empty() => {
+                        debug!(
+                            episode = %media.title,
+                            movie = %movie.title,
+                            streams = fallback.len(),
+                            "season-zero episode recovered via standalone movie identity"
+                        );
+                        return Ok(fallback);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        debug!(
+                            episode = %media.title,
+                            %error,
+                            "standalone movie stream fallback failed"
+                        );
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                debug!(
+                    episode = %media.title,
+                    %error,
+                    "standalone movie identity lookup failed"
+                );
+            }
+        }
+
+        Ok(streams)
     }
+}
+
+fn normalize_special_title(value: &str) -> String {
+    value
+        .chars()
+        .filter(|c| c.is_alphanumeric())
+        .flat_map(char::to_lowercase)
+        .collect()
+}
+
+fn standalone_movie_matches_special(
+    media: &db::Media,
+    candidate: &sdks::tmdb::MovieSearchResult,
+) -> bool {
+    if media.kind != db::MediaKind::Episode || media.parent_idx != Some(0) {
+        return false;
+    }
+    let Some(series) = media
+        .grandparent
+        .as_deref()
+    else {
+        return false;
+    };
+    let (Some(episode_date), Some(movie_date)) =
+        (media.released_at, candidate.release_date)
+    else {
+        return false;
+    };
+    if (episode_date.year() - movie_date.year()).abs() > 1 {
+        return false;
+    }
+
+    let episode_title = normalize_special_title(&media.title);
+    let movie_title = normalize_special_title(&candidate.title);
+    if episode_title.is_empty() || movie_title.is_empty() {
+        return false;
+    }
+    if movie_title == episode_title {
+        return true;
+    }
+
+    let series_title = normalize_special_title(&series.title);
+    !series_title.is_empty()
+        && movie_title.starts_with(&series_title)
+        && movie_title.ends_with(&episode_title)
+}
+
+async fn standalone_special_movie(
+    media: &db::Media,
+    ctx: &AppContext,
+) -> Result<Option<db::Media>> {
+    if media.kind != db::MediaKind::Episode || media.parent_idx != Some(0) {
+        return Ok(None);
+    }
+
+    let Some(client) = common::tmdb_client(
+        &ctx.db,
+        &ctx.config
+            .tmdb_base_url,
+    )
+    .await
+    else {
+        return Ok(None);
+    };
+
+    let search = client
+        .execute(sdks::tmdb::SearchMovieEndpoint {
+            query: media
+                .title
+                .clone(),
+            year: None,
+        })
+        .await?;
+    let Some(candidate) = search
+        .results
+        .into_iter()
+        .find(|candidate| standalone_movie_matches_special(media, candidate))
+    else {
+        return Ok(None);
+    };
+
+    let details = client
+        .execute(
+            sdks::tmdb::MovieEndpoint::new(candidate.id, None)
+                .with_cache(Duration::from_secs(86_400)),
+        )
+        .await?;
+    let imdb = details
+        .imdb_id
+        .or_else(|| {
+            details
+                .external_ids
+                .and_then(|ids| ids.imdb_id)
+        })
+        .and_then(|id| db::NonEmptyString::try_new(id).ok());
+    let Some(imdb) = imdb else {
+        return Ok(None);
+    };
+
+    Ok(Some(db::Media {
+        title: details.title,
+        kind: db::MediaKind::Movie,
+        released_at: details
+            .release_date
+            .and_then(|date| date.and_hms_opt(0, 0, 0)),
+        external_ids: db::ExternalIds {
+            imdb: Some(imdb),
+            tmdb: Some(details.id),
+            ..Default::default()
+        },
+        ..Default::default()
+    }))
 }
 
 fn stremio_type_for_kind(kind: &db::MediaKind) -> Option<&'static str> {
@@ -2096,6 +2251,68 @@ async fn stremio_streams(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn special_episode(title: &str, year: i32, season: i64) -> db::Media {
+        let series = db::Media {
+            kind: db::MediaKind::Series,
+            title: "Family Guy".to_string(),
+            ..Default::default()
+        };
+        db::Media {
+            kind: db::MediaKind::Episode,
+            title: title.to_string(),
+            parent_idx: Some(season),
+            released_at: chrono::NaiveDate::from_ymd_opt(year, 5, 21)
+                .and_then(|date| date.and_hms_opt(0, 0, 0)),
+            grandparent: Some(Arc::new(series)),
+            ..Default::default()
+        }
+    }
+
+    fn movie_hit(title: &str, year: i32) -> sdks::tmdb::MovieSearchResult {
+        sdks::tmdb::MovieSearchResult {
+            id: 65_215,
+            title: title.to_string(),
+            release_date: chrono::NaiveDate::from_ymd_opt(year, 9, 27),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn season_zero_special_matches_prefixed_standalone_movie() {
+        let episode = special_episode("Stewie Griffin: The Untold Story", 2006, 0);
+        let movie = movie_hit(
+            "Family Guy Presents: Stewie Griffin: The Untold Story",
+            2005,
+        );
+        assert!(standalone_movie_matches_special(&episode, &movie));
+    }
+
+    #[test]
+    fn standalone_movie_fallback_is_limited_to_season_zero() {
+        let episode = special_episode("Stewie Griffin: The Untold Story", 2006, 4);
+        let movie = movie_hit(
+            "Family Guy Presents: Stewie Griffin: The Untold Story",
+            2005,
+        );
+        assert!(!standalone_movie_matches_special(&episode, &movie));
+    }
+
+    #[test]
+    fn standalone_movie_fallback_rejects_wrong_title_or_year() {
+        let episode = special_episode("Stewie Griffin: The Untold Story", 2006, 0);
+        assert!(!standalone_movie_matches_special(
+            &episode,
+            &movie_hit("Family Guy Presents: Blue Harvest", 2005),
+        ));
+        assert!(!standalone_movie_matches_special(
+            &episode,
+            &movie_hit(
+                "Family Guy Presents: Stewie Griffin: The Untold Story",
+                2015,
+            ),
+        ));
+    }
 
     #[test]
     fn string_resources_inherit_manifest_types_and_id_prefixes() {
