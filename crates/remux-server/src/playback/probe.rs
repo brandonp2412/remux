@@ -1967,7 +1967,7 @@ where
         port,
     );
 
-    let all_to_try: Vec<_> = std::iter::once((primary.clone(), primary_url))
+    let all_to_try: Vec<_> = std::iter::once((primary.clone(), primary_url.clone()))
         .chain(
             candidates
                 .into_iter()
@@ -2012,6 +2012,18 @@ where
     }));
     let total_available = probe_pool.len();
     let total_attempts = all_to_try.len();
+    let primary_recovery = primary
+        .probe_data
+        .as_ref()
+        .filter(|cached| is_reusable_probe_cache(cached))
+        .and_then(|_| {
+            primary
+                .stream_info
+                .as_ref()
+                .filter(|info| info.is_p2p())
+                .and_then(|_| primary_url.clone())
+                .map(|url| (primary.clone(), url))
+        });
     let mut attempts = 0usize;
     // Torrent startup depends on piece availability and can otherwise hold
     // PlaybackInfo for the full configured 60s per candidate. Keep real P2P
@@ -2036,6 +2048,39 @@ where
             diversified_recovery,
             attempt_index == 0,
         );
+        // A cold torrent keeps downloading while alternate candidates are checked.
+        // Before spending the final fallback slot, cheaply revisit the preferred
+        // source: real-device Project Hail Mary playback had a healthy 4K swarm
+        // become range-readable only after the first alternate probe completed.
+        // This is deliberately a short second-chance check, not another full
+        // candidate timeout, and it cannot accept a source without a real 1 MiB
+        // playback-readiness range.
+        if attempt_index > 1
+            && let Some((recovery, recovery_url)) = &primary_recovery
+        {
+            let recheck_timeout = effective_timeout.min(2);
+            match verify_cached_p2p_startup_range(recovery_url, recheck_timeout).await {
+                Ok(()) => {
+                    info!(
+                        id = %recovery.id,
+                        after_attempts = attempts,
+                        recheck_timeout,
+                        "preferred torrent became playback-ready while fallbacks were probing"
+                    );
+                    let mut info = api::MediaSourceInfo::from(recovery.clone());
+                    apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
+                    return Ok((info, recovery.clone()));
+                }
+                Err(error) => {
+                    debug!(
+                        id = %recovery.id,
+                        %error,
+                        recheck_timeout,
+                        "preferred torrent still not playback-ready after fallback warmup"
+                    );
+                }
+            }
+        }
         let url = match url_opt {
             Some(u) => u,
             None => {
@@ -2176,6 +2221,36 @@ where
             }
             Err(_) => {
                 warn!(url = %url, timeout = effective_timeout, "probe timed out");
+            }
+        }
+    }
+
+    // With only one fallback there is no "next retry" at which to revisit the
+    // primary. Give a cached P2P primary one final, short readiness check after
+    // all alternates have had time to warm it in the background.
+    if attempts > 1
+        && let Some((recovery, recovery_url)) = &primary_recovery
+    {
+        let recheck_timeout = timeout_secs.min(2);
+        match verify_cached_p2p_startup_range(recovery_url, recheck_timeout).await {
+            Ok(()) => {
+                info!(
+                    id = %recovery.id,
+                    after_attempts = attempts,
+                    recheck_timeout,
+                    "preferred torrent became playback-ready after fallback exhaustion"
+                );
+                let mut info = api::MediaSourceInfo::from(recovery.clone());
+                apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
+                return Ok((info, recovery.clone()));
+            }
+            Err(error) => {
+                debug!(
+                    id = %recovery.id,
+                    %error,
+                    recheck_timeout,
+                    "preferred torrent still not playback-ready after fallback exhaustion"
+                );
             }
         }
     }
@@ -2935,6 +3010,81 @@ mod probe_tests {
                 .is_some()
         );
         assert_eq!(source.id, id);
+    }
+
+    #[tokio::test]
+    async fn cold_cached_primary_is_rechecked_after_first_fallback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = test_db().await;
+        let mut primary = p2p_media_with_filename("Movie.2160p.HEVC.primary.mkv", 100);
+        let mut fallback_a = p2p_media_with_filename("Movie.2160p.HEVC.a.mkv", 90);
+        let mut fallback_b = p2p_media_with_filename("Movie.2160p.AV1.b.mkv", 80);
+        for stream in [&mut primary, &mut fallback_a, &mut fallback_b] {
+            stream.probe_data = Some(
+                video_probe()
+                    .unwrap()
+                    .0,
+            );
+        }
+        let primary_id = primary.id;
+        let all = vec![primary.clone(), fallback_a, fallback_b];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let app = axum::Router::new().route(
+            "/stream/{id}",
+            axum::routing::get(move || {
+                let seen = seen.clone();
+                async move {
+                    let request = seen.fetch_add(1, Ordering::SeqCst);
+                    if request < 2 {
+                        (reqwest::StatusCode::BAD_GATEWAY, Vec::new())
+                    } else {
+                        (
+                            reqwest::StatusCode::PARTIAL_CONTENT,
+                            vec![0_u8; 1024 * 1024],
+                        )
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+
+        let result = probe_with_fallback(
+            primary,
+            Some(format!("http://{addr}/stream/{primary_id}")),
+            5,
+            true,
+            2,
+            &all,
+            false,
+            addr.port(),
+            &db,
+            |_url, _timeout, _bounded, _sequential| {
+                panic!("cached P2P recovery must not rerun ffprobe")
+            },
+        )
+        .await;
+        server.abort();
+
+        let (_, effective) = result.unwrap();
+        assert_eq!(effective.id, primary_id);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            3,
+            "primary fails readiness, first fallback fails, then primary is rechecked"
+        );
     }
 
     #[tokio::test]
