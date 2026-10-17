@@ -1326,6 +1326,7 @@ pub(crate) async fn probe_stream(
     max_retries: usize,
     probe_pool: &[db::Media],
     restrict_resolution: bool,
+    start_time_ticks: Option<i64>,
     port: u16,
     db: &sqlx::SqlitePool,
 ) -> axum_anyhow::ApiResult<(api::MediaSourceInfo, db::Media)> {
@@ -1394,6 +1395,7 @@ pub(crate) async fn probe_stream(
         p2p_max_retries,
         probe_pool,
         restrict_resolution,
+        start_time_ticks,
         port,
         db,
         move |url, attempt_timeout_secs, bounded_header_probe, sequential_matroska| {
@@ -1862,10 +1864,39 @@ fn torrent_matroska_probe_mode(stream: &db::Media) -> (bool, bool) {
 
 // P2P cached metadata is not evidence that a torrent is currently playable.
 // Before reusing a previously completed probe, ask the same local stream proxy
-// used by ffprobe for a real, bounded startup range. The proxy itself checks
-// consecutive torrent pieces and sustainable read speed.
-async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result<()> {
-    const PROOF_BYTES: usize = 1024 * 1024;
+// used by ffprobe for real bounded ranges. The proxy itself checks consecutive
+// torrent pieces and sustainable read speed.
+const P2P_READINESS_PROOF_BYTES: u64 = 1024 * 1024;
+
+fn resume_range_start(
+    source: &api::MediaSourceInfo,
+    start_time_ticks: Option<i64>,
+) -> Option<u64> {
+    let start = start_time_ticks?.max(0) as u64;
+    let runtime = source
+        .run_time_ticks?
+        .max(0) as u64;
+    let size = source
+        .size?
+        .max(0) as u64;
+    if start == 0 || runtime == 0 || size <= P2P_READINESS_PROOF_BYTES {
+        return None;
+    }
+
+    // A direct-play client seeking by time will usually land near this byte
+    // fraction. It is intentionally approximate (VBR/container indexes can move
+    // the exact seek), but requesting it makes rqbit prioritize the relevant
+    // pieces before PlaybackInfo says the source is ready.
+    let start = start.min(runtime.saturating_sub(1));
+    let estimated = ((size as u128 * start as u128) / runtime as u128) as u64;
+    Some(estimated.min(size - P2P_READINESS_PROOF_BYTES))
+}
+
+async fn verify_local_p2p_range(
+    url: &str,
+    timeout_secs: u64,
+    start: u64,
+) -> Result<()> {
     let parsed = url::Url::parse(url)?;
     anyhow::ensure!(
         matches!(parsed.host_str(), Some("127.0.0.1" | "::1" | "localhost"))
@@ -1874,29 +1905,27 @@ async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result
                 .starts_with("/stream/"),
         "cached torrent readiness must use the local stream proxy"
     );
+    let end = start + P2P_READINESS_PROOF_BYTES - 1;
     let response = reqwest::Client::new()
         .get(url)
-        .header(
-            reqwest::header::RANGE,
-            format!("bytes=0-{}", PROOF_BYTES - 1),
-        )
+        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
         .header(crate::stream::PROBE_PLAYBACK_READINESS_HEADER, "1")
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .send()
         .await?;
     anyhow::ensure!(
         response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
-        "cached torrent startup range was not served: {}",
+        "cached torrent readiness range {start}-{end} was not served: {}",
         response.status()
     );
     let bytes = response
         .bytes()
         .await?;
     anyhow::ensure!(
-        bytes.len() == PROOF_BYTES,
-        "cached torrent startup range was truncated ({} of {} bytes)",
+        bytes.len() == P2P_READINESS_PROOF_BYTES as usize,
+        "cached torrent readiness range {start}-{end} was truncated ({} of {} bytes)",
         bytes.len(),
-        PROOF_BYTES
+        P2P_READINESS_PROOF_BYTES
     );
     Ok(())
 }
@@ -1931,6 +1960,24 @@ impl Drop for AbortPrewarm {
     }
 }
 
+async fn verify_cached_p2p_playback_ranges(
+    url: &str,
+    timeout_secs: u64,
+    source: &api::MediaSourceInfo,
+    start_time_ticks: Option<i64>,
+) -> Result<()> {
+    verify_local_p2p_range(url, timeout_secs, 0).await?;
+    if let Some(resume_start) = resume_range_start(source, start_time_ticks) {
+        verify_local_p2p_range(url, timeout_secs, resume_start).await?;
+        debug!(
+            resume_start,
+            start_time_ticks, "verified cached torrent resume range"
+        );
+    }
+    Ok(())
+}
+}
+
 /// Probe a stream URL, retrying with the next matching candidate on failure.
 ///
 /// Returns a 500 error if all candidates fail to probe.
@@ -1942,6 +1989,7 @@ async fn probe_with_fallback<F>(
     max_retries: usize,
     probe_pool: &[db::Media],
     restrict_resolution: bool,
+    start_time_ticks: Option<i64>,
     port: u16,
     db: &sqlx::SqlitePool,
     probe_fn: F,
@@ -2059,7 +2107,15 @@ where
             && let Some((recovery, recovery_url)) = &primary_recovery
         {
             let recheck_timeout = effective_timeout.min(2);
-            match verify_cached_p2p_startup_range(recovery_url, recheck_timeout).await {
+            let recovery_info = api::MediaSourceInfo::from(recovery.clone());
+            match verify_cached_p2p_playback_ranges(
+                recovery_url,
+                recheck_timeout,
+                &recovery_info,
+                start_time_ticks,
+            )
+            .await
+            {
                 Ok(()) => {
                     info!(
                         id = %recovery.id,
@@ -2100,7 +2156,15 @@ where
                         .is_some_and(|info| info.is_p2p())
             })
         {
-            match verify_cached_p2p_startup_range(&url, effective_timeout).await {
+            let cached_info = api::MediaSourceInfo::from(stream.clone());
+            match verify_cached_p2p_playback_ranges(
+                &url,
+                effective_timeout,
+                &cached_info,
+                start_time_ticks,
+            )
+            .await
+            {
                 Ok(()) => {
                     info!(
                         id = %stream.id,
@@ -2232,7 +2296,15 @@ where
         && let Some((recovery, recovery_url)) = &primary_recovery
     {
         let recheck_timeout = timeout_secs.min(2);
-        match verify_cached_p2p_startup_range(recovery_url, recheck_timeout).await {
+        let recovery_info = api::MediaSourceInfo::from(recovery.clone());
+        match verify_cached_p2p_playback_ranges(
+            recovery_url,
+            recheck_timeout,
+            &recovery_info,
+            start_time_ticks,
+        )
+        .await
+        {
             Ok(()) => {
                 info!(
                     id = %recovery.id,
@@ -2265,6 +2337,33 @@ where
 #[cfg(test)]
 mod probe_tests {
     use super::*;
+
+    #[test]
+    fn resume_range_estimate_tracks_position_and_caps_at_eof() {
+        let source = api::MediaSourceInfo {
+            run_time_ticks: Some(1_000),
+            size: Some(100_000_000),
+            ..Default::default()
+        };
+        assert_eq!(resume_range_start(&source, Some(500)), Some(50_000_000));
+        assert_eq!(
+            resume_range_start(&source, Some(999)),
+            Some(100_000_000 - P2P_READINESS_PROOF_BYTES)
+        );
+    }
+
+    #[test]
+    fn resume_range_estimate_requires_known_nonzero_runtime_and_size() {
+        let source = api::MediaSourceInfo::default();
+        assert_eq!(resume_range_start(&source, Some(500)), None);
+        let known = api::MediaSourceInfo {
+            run_time_ticks: Some(1_000),
+            size: Some(100_000_000),
+            ..Default::default()
+        };
+        assert_eq!(resume_range_start(&known, Some(0)), None);
+        assert_eq!(resume_range_start(&known, None), None);
+    }
 
     #[test]
     fn bit_depth_from_pix_fmt_known_formats() {
@@ -2947,7 +3046,7 @@ mod probe_tests {
         )
         .await;
         assert!(
-            verify_cached_p2p_startup_range(&good_url, 3)
+            verify_local_p2p_range(&good_url, 3, 0)
                 .await
                 .is_ok()
         );
@@ -2956,7 +3055,7 @@ mod probe_tests {
         let (bad_url, bad_server) =
             startup_range_test_server(reqwest::StatusCode::OK, 1024 * 1024).await;
         assert!(
-            verify_cached_p2p_startup_range(&bad_url, 3)
+            verify_local_p2p_range(&bad_url, 3, 0)
                 .await
                 .is_err()
         );
@@ -2965,7 +3064,7 @@ mod probe_tests {
         let (short_url, short_server) =
             startup_range_test_server(reqwest::StatusCode::PARTIAL_CONTENT, 1024).await;
         assert!(
-            verify_cached_p2p_startup_range(&short_url, 3)
+            verify_local_p2p_range(&short_url, 3, 0)
                 .await
                 .is_err()
         );

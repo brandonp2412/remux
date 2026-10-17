@@ -942,6 +942,7 @@ impl StreamService {
         &self,
         ranking: Option<SourceRankingContext<'_>>,
         prefs: DefaultStreamPrefs<'_>,
+        start_time_ticks: Option<i64>,
     ) -> anyhow::Result<ProbedStreams> {
         let mut sel = self.select_streams();
         let (candidates, extraction) = self
@@ -1088,6 +1089,7 @@ impl StreamService {
                 max_retries,
                 &sel.probe_pool,
                 sel.restrict_resolution,
+                start_time_ticks,
                 port,
                 &self
                     .ctx

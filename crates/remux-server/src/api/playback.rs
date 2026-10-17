@@ -474,7 +474,7 @@ async fn items_playbackinfo_inner(
                 .load(media)
                 .await?;
             service
-                .probe_candidates(ranking, ranking_prefs)
+                .probe_candidates(ranking, ranking_prefs, q.start_time_ticks)
                 .await
         },
         async {
