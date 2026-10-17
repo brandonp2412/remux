@@ -17,6 +17,9 @@ use uuid::Uuid;
 
 use crate::AppState;
 
+pub(crate) const PROBE_PLAYBACK_READINESS_HEADER: &str =
+    "x-remux-probe-playback-readiness";
+
 /// A BitTorrent tracker announce URL with a supported scheme and host. UDP
 /// trackers may omit a path, while HTTP trackers must name an announce path.
 /// Unrelated addon `sources` entries are rejected.
@@ -696,6 +699,26 @@ impl TorrentSource {
         Ok((received, readable_mibps))
     }
 
+    fn readiness_probe_bytes(
+        total_bytes: u64,
+        probe_start: u64,
+        probe_end: u64,
+        startup_target_bytes: usize,
+        require_playback_readiness: bool,
+    ) -> usize {
+        let available = total_bytes.saturating_sub(probe_start);
+        let requested = probe_end
+            .saturating_sub(probe_start)
+            .saturating_add(1);
+        let target = startup_target_bytes as u64;
+        let required = if require_playback_readiness {
+            target
+        } else {
+            requested.min(target)
+        };
+        usize::try_from(available.min(required)).unwrap_or(startup_target_bytes)
+    }
+
     /// Size the verified contiguous startup buffer by *seconds of media*,
     /// not a universal number of megabytes. Low-bitrate 720p should not be
     /// rejected for needing 20+ seconds to read an unnecessary 4-8 MiB.
@@ -741,6 +764,7 @@ impl TorrentSource {
         resolved_url: &str,
         requested_range: Option<&str>,
         selected_file_idx: usize,
+        require_playback_readiness: bool,
     ) -> anyhow::Result<()> {
         // The final diversified PlaybackInfo recovery probe is allowed 35s.
         // Keep this inner readiness window long enough for a healthy cold swarm
@@ -804,13 +828,13 @@ impl TorrentSource {
                                 .current_total_bytes
                                 .saturating_sub(1),
                         ));
-                    let probe_bytes_needed = usize::try_from(
-                        probe_end
-                            .saturating_sub(probe_start)
-                            .saturating_add(1)
-                            .min(startup_target_bytes as u64),
-                    )
-                    .unwrap_or(startup_target_bytes);
+                    let probe_bytes_needed = Self::readiness_probe_bytes(
+                        status.current_total_bytes,
+                        probe_start,
+                        probe_end,
+                        startup_target_bytes,
+                        require_playback_readiness,
+                    );
                     let cache_key = (
                         self.info_hash
                             .clone(),
@@ -1210,6 +1234,32 @@ mod torrent_prefetch_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn internal_header_probe_requires_the_real_startup_buffer() {
+        const MIB: usize = 1024 * 1024;
+        let total = 100 * MIB as u64;
+        let bounded_end = MIB as u64 - 1;
+
+        assert_eq!(
+            TorrentSource::readiness_probe_bytes(total, 0, bounded_end, 6 * MIB, false),
+            MIB
+        );
+        assert_eq!(
+            TorrentSource::readiness_probe_bytes(total, 0, bounded_end, 6 * MIB, true),
+            6 * MIB
+        );
+        assert_eq!(
+            TorrentSource::readiness_probe_bytes(
+                3 * MIB as u64,
+                0,
+                bounded_end,
+                6 * MIB,
+                true
+            ),
+            3 * MIB
+        );
+    }
+
     #[tokio::test]
     async fn reads_ahead_without_client_polling_and_preserves_response() {
         let (sent, received) = tokio::sync::oneshot::channel();
@@ -1402,8 +1452,17 @@ impl StreamSource for TorrentSource {
                     .ok()
             });
         torrent.note_range_requested(&self.info_hash, selected_file_idx);
+        let require_playback_readiness = headers
+            .get(PROBE_PLAYBACK_READINESS_HEADER)
+            .is_some();
         if let Err(error) = self
-            .wait_until_ready(&torrent, &resolved, requested_range, selected_file_idx)
+            .wait_until_ready(
+                &torrent,
+                &resolved,
+                requested_range,
+                selected_file_idx,
+                require_playback_readiness,
+            )
             .await
         {
             // Preserve verified pieces for a cold retry. The lease's normal
