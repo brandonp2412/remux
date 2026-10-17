@@ -1,11 +1,17 @@
 use crate::ResultExt;
 use async_trait::async_trait;
-use axum::{body::Body, http::HeaderMap, response::Response};
+use axum::{
+    body::{Body, Bytes},
+    http::HeaderMap,
+    response::Response,
+};
 use axum_anyhow::ApiResult as Result;
 use futures_util::{StreamExt, TryStreamExt};
 use nutype::nutype;
+use std::sync::Arc;
 use std::{io, path::PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
 use tokio_util::io::{ReaderStream, StreamReader};
 use uuid::Uuid;
 
@@ -1060,6 +1066,212 @@ impl StreamSource for LocalSource {
     }
 }
 
+/// Pull from the torrent engine before the HTTP client asks for the next bytes.
+/// librqbit only prioritizes 32 MiB from its current read position; without
+/// this pump, browser backpressure prevents its read cursor moving forward.
+/// Permits are held until the consumer advances, enforcing a byte limit even
+/// when the upstream produces irregular chunk sizes.
+fn prefetch_response(response: Response, max_bytes: usize) -> Response {
+    if max_bytes == 0 {
+        return response;
+    }
+
+    let (parts, body) = response.into_parts();
+    let permits = Arc::new(Semaphore::new(max_bytes));
+    let (sender, mut receiver) = mpsc::unbounded_channel::<
+        std::result::Result<(Bytes, OwnedSemaphorePermit), axum::Error>,
+    >();
+    tokio::spawn(async move {
+        let mut source = body.into_data_stream();
+        loop {
+            let next = tokio::select! {
+                next = source.next() => next,
+                () = sender.closed() => return,
+            };
+            let Some(next) = next else { break };
+            match next {
+                Ok(mut bytes) => {
+                    while !bytes.is_empty() {
+                        let chunk = bytes.split_to(
+                            bytes
+                                .len()
+                                .min(max_bytes),
+                        );
+                        let count = u32::try_from(chunk.len())
+                            .expect("prefetch capped at 512 MiB");
+                        let permit = tokio::select! {
+                            result = permits.clone().acquire_many_owned(count) => {
+                                match result { Ok(permit) => permit, Err(_) => return }
+                            }
+                            () = sender.closed() => return,
+                        };
+                        if sender
+                            .send(Ok((chunk, permit)))
+                            .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error));
+                    return;
+                }
+            }
+        }
+    });
+
+    let output = async_stream::stream! {
+        while let Some(result) = receiver.recv().await {
+            match result {
+                Ok((bytes, permit)) => {
+                    yield std::result::Result::<_, axum::Error>::Ok(bytes);
+                    drop(permit);
+                }
+                Err(error) => {
+                    yield Err(error);
+                    break;
+                }
+            }
+        }
+    };
+    Response::from_parts(parts, Body::from_stream(output))
+}
+
+#[cfg(test)]
+mod torrent_prefetch_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn reads_ahead_without_client_polling_and_preserves_response() {
+        let (sent, received) = tokio::sync::oneshot::channel();
+        let mut sent = Some(sent);
+        let stream =
+            futures_util::stream::iter([b"1234".as_slice(), b"5678".as_slice()]).map(
+                move |data| {
+                    if let Some(sender) = sent.take() {
+                        let _ = sender.send(());
+                    }
+                    Ok::<_, io::Error>(Bytes::copy_from_slice(data))
+                },
+            );
+        let response = Response::builder()
+            .status(http::StatusCode::PARTIAL_CONTENT)
+            .header(http::header::CONTENT_RANGE, "bytes 5-12/20")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let response = prefetch_response(response, 8);
+        tokio::time::timeout(std::time::Duration::from_secs(1), received)
+            .await
+            .expect("prefetch should pull the source before the player reads")
+            .expect("source sender disappeared");
+        assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_RANGE],
+            "bytes 5-12/20"
+        );
+        let bytes = axum::body::to_bytes(response.into_body(), 100)
+            .await
+            .unwrap();
+        assert_eq!(bytes, "12345678");
+    }
+
+    #[tokio::test]
+    async fn dropping_client_cancels_pending_upstream_reader() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self
+                    .0
+                    .take()
+                {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let (started, observed_start) = tokio::sync::oneshot::channel();
+        let (stopped, observed_stop) = tokio::sync::oneshot::channel();
+        let source = async_stream::stream! {
+            let _guard = DropSignal(Some(stopped));
+            let _ = started.send(());
+            yield Ok::<_, io::Error>(Bytes::from_static(b"abcd"));
+            std::future::pending::<()>().await;
+        };
+        let response = prefetch_response(Response::new(Body::from_stream(source)), 8);
+        tokio::time::timeout(std::time::Duration::from_secs(1), observed_start)
+            .await
+            .unwrap()
+            .unwrap();
+        drop(response);
+        tokio::time::timeout(std::time::Duration::from_secs(1), observed_stop)
+            .await
+            .expect("cancelled client must release the torrent reader")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn forwards_upstream_failure_after_buffered_bytes() {
+        let source = futures_util::stream::iter([
+            Ok(Bytes::from_static(b"abcd")),
+            Err(io::Error::other("peer read failed")),
+        ]);
+        let response = prefetch_response(Response::new(Body::from_stream(source)), 8);
+        let mut output = response
+            .into_body()
+            .into_data_stream();
+        assert_eq!(
+            output
+                .next()
+                .await
+                .unwrap()
+                .unwrap(),
+            "abcd"
+        );
+        assert!(
+            output
+                .next()
+                .await
+                .unwrap()
+                .is_err()
+        );
+        assert!(
+            output
+                .next()
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn prefetch_is_bounded_and_drains_completely() {
+        let reads = Arc::new(AtomicUsize::new(0));
+        let observed = reads.clone();
+        let chunks = futures_util::stream::iter(0..12).map(move |_| {
+            observed.fetch_add(1, Ordering::SeqCst);
+            Ok::<_, io::Error>(Bytes::from_static(b"abcd"))
+        });
+        let response = prefetch_response(Response::new(Body::from_stream(chunks)), 8);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while reads.load(Ordering::SeqCst) < 3 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("producer should fill the buffer");
+        // Two chunks fit; the third is waiting on a permit. No unbounded pull.
+        assert_eq!(reads.load(Ordering::SeqCst), 3);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap()
+                .len(),
+            48
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 12);
+    }
+}
+
 #[async_trait]
 impl StreamSource for TorrentSource {
     async fn serve(&self, state: &AppState, headers: &HeaderMap) -> Result<Response> {
@@ -1159,7 +1371,13 @@ impl StreamSource for TorrentSource {
                 yield chunk;
             }
         };
-        Ok(Response::from_parts(parts, Body::from_stream(stream)))
+        let response = Response::from_parts(parts, Body::from_stream(stream));
+        let mib = state
+            .ctx
+            .config
+            .torrent_prefetch_mib
+            .min(512) as usize;
+        Ok(prefetch_response(response, mib * 1024 * 1024))
     }
 }
 

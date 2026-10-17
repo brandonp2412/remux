@@ -590,6 +590,10 @@ fn default_torrent_http_port() -> u16 {
     9876
 }
 
+fn default_torrent_prefetch_mib() -> u32 {
+    128
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Config {
     #[serde(default = "default_data_dir")]
@@ -609,6 +613,10 @@ pub struct Config {
     /// When absent the OS picks a free ephemeral port.
     #[serde(default = "default_torrent_http_port_opt")]
     pub torrent_http_port: Option<u16>,
+    /// Server-side read-ahead per active torrent response, in MiB. Zero disables
+    /// it; values above 512 are capped to bound memory per response.
+    #[serde(default = "default_torrent_prefetch_mib")]
+    pub torrent_prefetch_mib: u32,
     /// Log queries that exceed this threshold in milliseconds. Defaults to 10 000 ms.
     #[serde(default = "default_slow_query_threshold_ms")]
     pub slow_query_threshold_ms: u64,
@@ -782,6 +790,7 @@ impl Default for Config {
             host: default_host(),
             port: default_port(),
             torrent_http_port: default_torrent_http_port_opt(),
+            torrent_prefetch_mib: default_torrent_prefetch_mib(),
             slow_query_threshold_ms: default_slow_query_threshold_ms(),
             disable_dht: false,
             disable_startup_tasks: false,
