@@ -1396,11 +1396,26 @@ pub(crate) async fn probe_stream(
         restrict_resolution,
         port,
         db,
-        move |url, attempt_timeout_secs, sequential_matroska| {
-            // Readiness may hold headers until near the attempt deadline.
-            // The outer timeout still bounds ffprobe, including optional seeks.
+        move |url, attempt_timeout_secs, bounded_header_probe, sequential_matroska| {
+            // Prove track metadata from the first MiB before waiting for the
+            // torrent's sparse multi-MiB ranges. Some healthy 720p swarms can
+            // serve their EBML header immediately but take >30s to serve 4MiB.
+            // A failed bounded probe falls back to the original full probe;
+            // the enclosing timeout still bounds both attempts together.
             let local_stream_rw_timeout =
                 std::time::Duration::from_secs(attempt_timeout_secs);
+            if bounded_header_probe {
+                match probe_media_with_local_stream_rw_timeout(
+                    &url,
+                    Some("Range: bytes=0-1048575\r\n"),
+                    Some(local_stream_rw_timeout),
+                    local_stream_rw_timeout,
+                    true,
+                ) {
+                    Ok(metadata) => return Ok(metadata),
+                    Err(error) => tracing::debug!(%error, "bounded torrent header probe unavailable; retrying normal probe"),
+                }
+            }
             probe_media_with_local_stream_rw_timeout(
                 &url,
                 None,
@@ -1807,6 +1822,37 @@ fn probe_attempt_timeout(
     }
 }
 
+// A source with no filename (common in Torrentio) may still be Matroska.
+// Give its small EBML header one bounded range before requesting large sparse
+// pieces. An explicit MP4/MOV source must retain the ordinary seekable probe.
+fn torrent_matroska_probe_mode(stream: &db::Media) -> (bool, bool) {
+    let Some(info) = stream
+        .stream_info
+        .as_ref()
+        .filter(|info| info.is_p2p())
+    else {
+        return (false, false);
+    };
+    let name = info
+        .filename
+        .as_deref()
+        .or_else(|| match &info.descriptor {
+            crate::stream::StreamDescriptor::Torrent { file_hint, .. } => {
+                file_hint.as_deref()
+            }
+            _ => None,
+        });
+    let Some(name) = name else {
+        return (true, false); // Probe unknown containers briefly, then normally.
+    };
+    let is_matroska = std::path::Path::new(name)
+        .extension()
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("mkv") || ext.eq_ignore_ascii_case("webm")
+        });
+    (is_matroska, is_matroska)
+}
+
 // P2P cached metadata is not evidence that a torrent is currently playable.
 // Before reusing a previously completed probe, ask the same local stream proxy
 // used by ffprobe for a real, bounded startup range. The proxy itself checks
@@ -1866,6 +1912,7 @@ where
     F: Fn(
             String,
             u64,
+            bool,
             bool,
         )
             -> anyhow::Result<(api::MediaSourceInfo, remux_sdks::remux::MediaSegments)>
@@ -1968,27 +2015,17 @@ where
         let stream2 = stream.clone();
         let db2 = db.clone();
         let f = probe_fn.clone();
-        let sequential_matroska = stream
-            .stream_info
-            .as_ref()
-            .is_some_and(|info| {
-                info.is_p2p()
-                    && info
-                        .filename
-                        .as_deref()
-                        .is_some_and(|name| {
-                            std::path::Path::new(name)
-                                .extension()
-                                .is_some_and(|ext| {
-                                    ext.eq_ignore_ascii_case("mkv")
-                                        || ext.eq_ignore_ascii_case("webm")
-                                })
-                        })
-            });
+        let (bounded_header_probe, sequential_matroska) =
+            torrent_matroska_probe_mode(&stream);
         let probe_result = tokio::time::timeout(
             std::time::Duration::from_secs(effective_timeout),
             tokio::task::spawn_blocking(move || {
-                f(url2, effective_timeout, sequential_matroska)
+                f(
+                    url2,
+                    effective_timeout,
+                    bounded_header_probe,
+                    sequential_matroska,
+                )
             }),
         )
         .await;
@@ -2390,12 +2427,16 @@ mod probe_tests {
         String,
         u64,
         bool,
+        bool,
     ) -> anyhow::Result<(api::MediaSourceInfo, MediaSegments)>
     + Clone
     + Send
     + 'static {
         let q = Arc::new(Mutex::new(VecDeque::from(results)));
-        move |_url: String, _timeout_secs: u64, _sequential_matroska: bool| {
+        move |_url: String,
+              _timeout_secs: u64,
+              _bounded: bool,
+              _sequential_matroska: bool| {
             q.lock()
                 .unwrap()
                 .pop_front()
@@ -2619,6 +2660,35 @@ mod probe_tests {
     }
 
     #[test]
+    fn unknown_torrent_filename_first_tries_bounded_matroska_header() {
+        assert_eq!(torrent_matroska_probe_mode(&p2p_media()), (true, false));
+        assert_eq!(
+            torrent_matroska_probe_mode(&p2p_media_with_filename("episode.mkv", 5)),
+            (true, true)
+        );
+        assert_eq!(
+            torrent_matroska_probe_mode(&p2p_media_with_filename("episode.mp4", 5)),
+            (false, false)
+        );
+        assert_eq!(
+            torrent_matroska_probe_mode(&http_media("http://example.com/movie.mkv")),
+            (false, false)
+        );
+        let mut hinted = p2p_media();
+        if let Some(info) = hinted
+            .stream_info
+            .as_mut()
+        {
+            if let crate::stream::StreamDescriptor::Torrent { file_hint, .. } =
+                &mut info.descriptor
+            {
+                *file_hint = Some("S04E10.720p.mkv".into());
+            }
+        }
+        assert_eq!(torrent_matroska_probe_mode(&hinted), (true, true));
+    }
+
+    #[test]
     fn p2p_probe_timeout_is_capped_without_changing_http_timeout() {
         assert_eq!(probe_attempt_timeout(&p2p_media(), 60, false, true), 22);
         assert_eq!(probe_attempt_timeout(&p2p_media(), 10, false, true), 10);
@@ -2730,7 +2800,7 @@ mod probe_tests {
             false,
             3000,
             &db,
-            |_url, _timeout, _sequential| {
+            |_url, _timeout, _bounded, _sequential| {
                 panic!("ffprobe must be skipped for readable cached torrent")
             },
         )
