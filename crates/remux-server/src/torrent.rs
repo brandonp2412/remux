@@ -1220,13 +1220,15 @@ impl TorrentManager {
             .torrents
             .into_iter()
             .filter(|torrent| {
-                !leases
-                    .get(
-                        &torrent
-                            .info_hash
-                            .to_ascii_lowercase(),
-                    )
-                    .is_some_and(|lease| lease.strong_count() != 0)
+                // A dead weak lease is still inside the two-hour retry-cache
+                // lifecycle. TorrentLease::drop() will remove it through
+                // delete_if_unused() when that grace expires; maintenance must
+                // not erase its cached pieces early.
+                !leases.contains_key(
+                    &torrent
+                        .info_hash
+                        .to_ascii_lowercase(),
+                )
             })
             .filter(|torrent| {
                 !background.contains_key(
@@ -2646,6 +2648,84 @@ mod tests {
                 .torrents
                 .len(),
             1
+        );
+        manager
+            .shutdown()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_cleanup_preserves_dropped_lease_retry_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            TorrentManager::new(
+                dir.path()
+                    .join("data"),
+                dir.path()
+                    .join("cache"),
+                None,
+                true,
+                None,
+                true,
+            )
+            .await
+            .unwrap(),
+        );
+        manager
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(
+                    &b"d4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:....................ee"[..],
+                ),
+                Some(AddTorrentOptions {
+                    paused: true,
+                    disable_trackers: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let api = Api::new(
+            manager
+                .session
+                .clone(),
+            None,
+            None,
+        );
+        let hash = api
+            .api_torrent_list()
+            .torrents[0]
+            .info_hash
+            .clone();
+
+        let lease = manager
+            .acquire(&hash)
+            .await;
+        drop(lease);
+
+        assert_eq!(
+            manager
+                .delete_unused_with_files(&Default::default())
+                .await
+                .unwrap(),
+            0,
+            "maintenance must not delete pieces retained for the retry grace"
+        );
+        assert_eq!(
+            api.api_torrent_list()
+                .torrents
+                .len(),
+            1
+        );
+
+        manager
+            .delete_if_unused(&hash)
+            .await
+            .unwrap();
+        assert!(
+            api.api_torrent_list()
+                .torrents
+                .is_empty()
         );
         manager
             .shutdown()
