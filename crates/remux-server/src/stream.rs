@@ -865,9 +865,10 @@ impl TorrentSource {
                             !remaining.is_zero(),
                             "readiness budget exhausted before startup range check"
                         );
-                        let (startup_bytes, startup_read_mibps) =
-                            Self::probe_readable_range_with_progress(
-                                resolved_url,
+                        let (startup_bytes, startup_read_mibps) = torrent
+                            .probe_stream_range(
+                                &self.info_hash,
+                                selected_file_idx,
                                 probe_start,
                                 probe_bytes_needed,
                                 required_download_mibps,
