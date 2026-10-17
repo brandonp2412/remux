@@ -49,8 +49,17 @@ pub async fn new_test_server_with_config(
     // Parallel test servers must not share librqbit persistence or transcode
     // storage with each other (or with a real local server). Keep explicitly
     // configured fixture directories, and isolate the default directory.
-    let data_dir = if config.data_dir == Config::default().data_dir {
+    let defaults = Config::default();
+    let data_dir = if config.data_dir == defaults.data_dir {
         let dir = tempfile::tempdir()?;
+        // Defaults already contain resolved paths. Re-derive only those paths
+        // so test torrents and databases follow the isolated directory too.
+        if config.torrent_data_dir == defaults.torrent_data_dir {
+            config.torrent_data_dir = None;
+        }
+        if config.database_url == defaults.database_url {
+            config.database_url = None;
+        }
         config.data_dir = dir
             .path()
             .to_path_buf();
@@ -58,7 +67,7 @@ pub async fn new_test_server_with_config(
     } else {
         None
     };
-    let (app, ctx) = init_app_with_ctx(config).await?;
+    let (app, ctx) = init_app_with_ctx(config.resolve()).await?;
 
     let server = TestServer::builder()
         .save_cookies()
@@ -497,5 +506,47 @@ pub async fn seed_probe_fallback(
         fallback,
         fallback_path,
         _dir: dir,
+    }
+}
+
+#[tokio::test]
+async fn default_test_servers_isolate_torrent_and_cache_storage() {
+    let ((_, first), (_, second)) =
+        tokio::try_join!(new_test_server(), new_test_server()).unwrap();
+    assert_ne!(
+        first
+            .0
+            .config
+            .data_dir,
+        second
+            .0
+            .config
+            .data_dir
+    );
+    for guard in [&first, &second] {
+        let torrent_dir = std::path::Path::new(
+            guard
+                .0
+                .config
+                .torrent_data_dir
+                .as_deref()
+                .unwrap(),
+        );
+        assert!(
+            torrent_dir.starts_with(
+                &guard
+                    .0
+                    .config
+                    .data_dir
+            )
+        );
+        assert_eq!(
+            guard
+                .0
+                .config
+                .database_url
+                .as_deref(),
+            Some("sqlite::memory:")
+        );
     }
 }
