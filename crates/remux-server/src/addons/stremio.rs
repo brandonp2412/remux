@@ -691,6 +691,40 @@ impl StreamAddon for StremioAddon {
             return Ok(streams);
         }
 
+        match canonical_special_episode(media).await {
+            Ok(Some(canonical)) => {
+                match stremio_streams(&svc, &self.manifest_url, &canonical, id_prefixes)
+                    .await
+                {
+                    Ok(fallback) if !fallback.is_empty() => {
+                        debug!(
+                            episode = %media.title,
+                            canonical_id = ?canonical.external_ids.custom_stremio_id,
+                            streams = fallback.len(),
+                            "season-zero episode recovered via canonical Stremio episode identity"
+                        );
+                        return Ok(fallback);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        debug!(
+                            episode = %media.title,
+                            %error,
+                            "canonical Stremio episode stream fallback failed"
+                        );
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                debug!(
+                    episode = %media.title,
+                    %error,
+                    "canonical Stremio episode identity lookup failed"
+                );
+            }
+        }
+
         match standalone_special_movie(media, ctx).await {
             Ok(Some(movie)) => {
                 match stremio_streams(&svc, &self.manifest_url, &movie, id_prefixes)
@@ -727,6 +761,80 @@ impl StreamAddon for StremioAddon {
 
         Ok(streams)
     }
+}
+
+const CINEMETA_BASE_URL: &str = "https://v3-cinemeta.strem.io";
+
+fn exact_special_video_id(
+    videos: &[sdks::stremio::Episode],
+    season: i64,
+    title: &str,
+) -> Option<String> {
+    let key = episode_title_key(title);
+    if key.is_empty() {
+        return None;
+    }
+
+    let mut matches = videos
+        .iter()
+        .filter(|video| {
+            video.season == Some(season)
+                && video
+                    .get_name()
+                    .is_some_and(|name| episode_title_key(&name) == key)
+        });
+    let found = matches.next()?;
+    if matches
+        .next()
+        .is_some()
+    {
+        return None;
+    }
+    Some(
+        found
+            .id
+            .clone(),
+    )
+}
+
+async fn canonical_special_episode(media: &db::Media) -> Result<Option<db::Media>> {
+    if media.kind != db::MediaKind::Episode || media.parent_idx != Some(0) {
+        return Ok(None);
+    }
+
+    let Some(series_imdb) = media
+        .grandparent
+        .as_deref()
+        .and_then(|series| {
+            series
+                .external_ids
+                .imdb
+                .as_deref()
+        })
+    else {
+        return Ok(None);
+    };
+
+    let svc = stremio_service::StremioService::from_url(CINEMETA_BASE_URL)?;
+    let meta = svc
+        .get_meta(sdks::stremio::MediaType::Series, series_imdb.to_string())
+        .await?;
+    let Some(video_id) = meta
+        .videos
+        .as_deref()
+        .and_then(|videos| exact_special_video_id(videos, 0, &media.title))
+    else {
+        return Ok(None);
+    };
+
+    let mut canonical = media.clone();
+    canonical
+        .external_ids
+        .custom_stremio_id = Some(video_id);
+    canonical
+        .external_ids
+        .custom_stremio_type = Some("series".to_string());
+    Ok(Some(canonical))
 }
 
 fn normalize_special_title(value: &str) -> String {
@@ -2276,6 +2384,63 @@ mod tests {
             release_date: chrono::NaiveDate::from_ymd_opt(year, 9, 27),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn season_zero_special_uses_exact_canonical_stremio_title_when_numbering_differs() {
+        let videos: Vec<sdks::stremio::Episode> =
+            serde_json::from_value(serde_json::json!([
+                {
+                    "id": "tt0072562:0:590",
+                    "season": 0,
+                    "episode": 590,
+                    "name": "The David S. Pumpkins Halloween Special"
+                },
+                {
+                    "id": "tt0072562:0:591",
+                    "season": 0,
+                    "episode": 591,
+                    "name": "SNL Presents: Halloween"
+                }
+            ]))
+            .unwrap();
+
+        assert_eq!(
+            exact_special_video_id(&videos, 0, "SNL Presents: Halloween").as_deref(),
+            Some("tt0072562:0:591")
+        );
+    }
+
+    #[test]
+    fn canonical_special_title_match_rejects_ambiguous_or_wrong_titles() {
+        let videos: Vec<sdks::stremio::Episode> =
+            serde_json::from_value(serde_json::json!([
+                {
+                    "id": "tt1:0:10",
+                    "season": 0,
+                    "episode": 10,
+                    "name": "Halloween"
+                },
+                {
+                    "id": "tt1:0:11",
+                    "season": 0,
+                    "episode": 11,
+                    "name": "Halloween"
+                },
+                {
+                    "id": "tt1:1:1",
+                    "season": 1,
+                    "episode": 1,
+                    "name": "SNL Presents: Halloween"
+                }
+            ]))
+            .unwrap();
+
+        assert_eq!(exact_special_video_id(&videos, 0, "Halloween"), None);
+        assert_eq!(
+            exact_special_video_id(&videos, 0, "SNL Presents: Halloween"),
+            None
+        );
     }
 
     #[test]
