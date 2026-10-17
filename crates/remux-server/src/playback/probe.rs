@@ -1608,14 +1608,17 @@ fn select_candidates(
                 })
                 .max_by_key(|candidate| {
                     (
-                        resolution_height(candidate).unwrap_or_default(),
-                        torrent_codec_family(candidate)
-                            == Some(TorrentCodecFamily::Avc),
+                        // Recovery is about playability, not the highest lower-res badge.
+                        // Harry Potter had a stalled 800p/15-seeder fallback while 720p
+                        // candidates with 109/100 seeders were available.
                         candidate
                             .stream_info
                             .as_ref()
                             .and_then(|info| info.seeders)
                             .unwrap_or(0),
+                        torrent_codec_family(candidate)
+                            == Some(TorrentCodecFamily::Avc),
+                        resolution_height(candidate).unwrap_or_default(),
                     )
                 })
         })
@@ -2553,7 +2556,7 @@ mod probe_tests {
     }
 
     #[test]
-    fn lower_resolution_recovery_prefers_avc_within_best_tier() {
+    fn lower_resolution_recovery_prefers_seed_availability_over_height() {
         let primary = p2p_media_with_filename("Movie.2160p.AV1.mkv", 300);
         let same = p2p_media_with_filename("Movie.2160p.HEVC.mkv", 200);
         let vc1 = p2p_media_with_filename("Movie.1080p.REMUX.VC-1.mkv", 250);
@@ -2576,13 +2579,42 @@ mod probe_tests {
             result[1]
                 .0
                 .id,
-            avc_id
+            lower_avc_id
         );
         assert_ne!(
             result[1]
                 .0
                 .id,
-            lower_avc_id
+            avc_id
+        );
+    }
+
+    #[test]
+    fn harry_potter_recovery_prefers_well_seeded_720p_over_800p() {
+        let primary =
+            p2p_media_with_filename("Goblet.Of.Fire.2005.1080p.x264.mp4", 390);
+        let other_1080 =
+            p2p_media_with_filename("Goblet.Of.Fire.2005.1080p.DTS.mkv", 207);
+        let tall_800 =
+            p2p_media_with_filename("Goblet.Of.Fire.2005.1920x800.x264.mkv", 15);
+        let seeded_720 =
+            p2p_media_with_filename("Goblet.Of.Fire.2005.720p.x264.mkv", 109);
+        let other_720 =
+            p2p_media_with_filename("Goblet.Of.Fire.2005.720p.AAC.mp4", 100);
+        let result = select_candidates(
+            &primary,
+            &[other_1080, tall_800, seeded_720.clone(), other_720],
+            true,
+            2,
+            false,
+            3000,
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[1]
+                .0
+                .id,
+            seeded_720.id
         );
     }
 
