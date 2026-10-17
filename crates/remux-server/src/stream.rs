@@ -518,6 +518,18 @@ static AVAILABILITY_CLIENT: std::sync::LazyLock<reqwest::Client> =
             .expect("failed to build availability client")
     });
 
+// A successful torrent range proof remains valid for the same file and byte
+// offset while its session stays warm. Re-probing a large startup window for
+// every FFmpeg/player GET can starve the very reader it was meant to protect.
+static VERIFIED_TORRENT_RANGES: std::sync::LazyLock<
+    moka::sync::Cache<(String, usize, u64), usize>,
+> = std::sync::LazyLock::new(|| {
+    moka::sync::Cache::builder()
+        .max_capacity(4096)
+        .time_to_live(std::time::Duration::from_secs(90))
+        .build()
+});
+
 static STREAM_PROXY_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
@@ -674,8 +686,8 @@ impl TorrentSource {
         // A tiny client seek (especially the last few bytes of an MP4) can
         // never measure a meaningful MiB/s rate: HTTP request overhead alone
         // dominates. Require correct readable bytes, not an impossible
-        // throughput threshold, for ranges smaller than 64 KiB.
-        if bytes_needed >= 64 * 1024 {
+        // throughput threshold, for short metadata ranges (including an MKV tail).
+        if bytes_needed >= 256 * 1024 {
             anyhow::ensure!(
                 readable_mibps >= required_download_mibps,
                 "range at byte {start} read {received} bytes at {readable_mibps:.2} MiB/s, below required {required_download_mibps:.2} MiB/s"
@@ -799,6 +811,23 @@ impl TorrentSource {
                             .min(startup_target_bytes as u64),
                     )
                     .unwrap_or(startup_target_bytes);
+                    let cache_key = (
+                        self.info_hash
+                            .clone(),
+                        selected_file_idx,
+                        probe_start,
+                    );
+                    if VERIFIED_TORRENT_RANGES
+                        .get(&cache_key)
+                        .is_some_and(|verified_bytes| {
+                            verified_bytes >= probe_bytes_needed
+                        })
+                    {
+                        torrent.note_range_ready(&self.info_hash, selected_file_idx);
+                        tracing::debug!(info_hash = %self.info_hash, probe_start,
+                            probe_bytes_needed, "reusing verified torrent range for playback");
+                        return Ok(());
+                    }
                     torrent.note_startup_progress(
                         &self.info_hash,
                         selected_file_idx,
@@ -841,6 +870,7 @@ impl TorrentSource {
 
                     match range_readable {
                         Ok((startup_bytes, startup_read_mibps)) => {
+                            VERIFIED_TORRENT_RANGES.insert(cache_key, startup_bytes);
                             torrent
                                 .note_range_ready(&self.info_hash, selected_file_idx);
                             tracing::info!(
@@ -1487,6 +1517,35 @@ mod tests {
         is_tracker_url, mime_from_path,
     };
     use std::path::Path;
+
+    #[test]
+    fn remembered_startup_range_is_specific_to_torrent_file_and_offset() {
+        let hash = uuid::Uuid::new_v4().to_string();
+        let key = (hash.clone(), 2, 0);
+        super::VERIFIED_TORRENT_RANGES.insert(key.clone(), 4 * 1024 * 1024);
+        assert!(
+            super::VERIFIED_TORRENT_RANGES
+                .get(&key)
+                .unwrap()
+                >= 4 * 1024 * 1024
+        );
+        assert!(
+            super::VERIFIED_TORRENT_RANGES
+                .get(&key)
+                .unwrap()
+                < 5 * 1024 * 1024
+        );
+        assert!(
+            super::VERIFIED_TORRENT_RANGES
+                .get(&(hash.clone(), 3, 0))
+                .is_none()
+        );
+        assert!(
+            super::VERIFIED_TORRENT_RANGES
+                .get(&(hash, 2, 100))
+                .is_none()
+        );
+    }
 
     #[test]
     fn high_bitrate_readiness_keeps_multiple_seconds_of_media() {
