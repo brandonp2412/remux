@@ -1624,7 +1624,9 @@ fn select_candidates(
                         .as_ref()
                         .and_then(|info| info.seeders)
                         .unwrap_or(0);
-                    seeders >= 3 || same_tier_count < max_retries
+                    seeders >= 3
+                        || same_tier_count < max_retries
+                        || primary_height >= 2160
                 })
                 .max_by_key(|candidate| {
                     (
@@ -2665,6 +2667,27 @@ mod probe_tests {
             result
                 .iter()
                 .all(|(media, _)| media.id != lower_id)
+        );
+    }
+
+    #[test]
+    fn cold_4k_recovery_reserves_1080p_even_with_missing_seeder_metadata() {
+        // Project Hail Mary: multiple 4K torrents download bytes but none
+        // serves the requested startup range before the probe deadline.
+        // Reported seeder counts are only hints, not proof of unplayability.
+        let primary = p2p_media_with_filename("Movie.2160p.AV1.mkv", 100);
+        let same_a = p2p_media_with_filename("Movie.2160p.HEVC.a.mkv", 50);
+        let same_b = p2p_media_with_filename("Movie.2160p.HEVC.b.mkv", 40);
+        let lower = p2p_media_with_filename("Movie.1080p.H264.mkv", 0);
+        let lower_id = lower.id;
+        let result =
+            select_candidates(&primary, &[same_a, same_b, lower], true, 2, false, 3000);
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[1]
+                .0
+                .id,
+            lower_id
         );
     }
 
