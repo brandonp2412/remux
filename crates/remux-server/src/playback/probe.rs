@@ -1893,6 +1893,36 @@ async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result
     Ok(())
 }
 
+// Prewarm a *single* P2P fallback while the primary is being probed. This
+// allows both swarms to acquire their startup pieces within the existing
+// PlaybackInfo budget, instead of serially starting the fallback after a
+// cold primary has exhausted its deadline.
+fn is_local_p2p_prewarm_url(stream: &db::Media, url: &str) -> bool {
+    stream
+        .stream_info
+        .as_ref()
+        .is_some_and(|info| info.is_p2p())
+        && url::Url::parse(url).is_ok_and(|parsed| {
+            matches!(parsed.host_str(), Some("127.0.0.1" | "::1" | "localhost"))
+                && parsed
+                    .path()
+                    .starts_with("/stream/")
+        })
+}
+
+struct AbortPrewarm(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortPrewarm {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .0
+            .take()
+        {
+            task.abort();
+        }
+    }
+}
+
 /// Probe a stream URL, retrying with the next matching candidate on failure.
 ///
 /// Returns a 500 error if all candidates fail to probe.
@@ -1936,6 +1966,42 @@ where
                 .map(|(m, u)| (m, Some(u))),
         )
         .collect();
+    // Start the first local P2P backup immediately, rather than waiting until
+    // the primary probe times out. The bounded range read also prioritizes the
+    // backup's first pieces. Never prewarm remote URLs or non-P2P sources.
+    let backup_url = if primary
+        .stream_info
+        .as_ref()
+        .is_some_and(|info| info.is_p2p())
+    {
+        all_to_try
+            .iter()
+            .skip(1)
+            .find_map(|(stream, url)| {
+                url.as_ref()
+                    .filter(|url| is_local_p2p_prewarm_url(stream, url))
+                    .cloned()
+            })
+    } else {
+        None
+    };
+    let _prewarm = AbortPrewarm(backup_url.map(|url| {
+        tokio::spawn(async move {
+            let response = reqwest::Client::new()
+                .get(&url)
+                .header(reqwest::header::RANGE, "bytes=0-1048575")
+                .timeout(std::time::Duration::from_secs(35))
+                .send()
+                .await;
+            if let Ok(response) = response {
+                if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                    let _ = response
+                        .bytes()
+                        .await;
+                }
+            }
+        })
+    }));
     let total_available = probe_pool.len();
     let total_attempts = all_to_try.len();
     let mut attempts = 0usize;
@@ -2686,6 +2752,27 @@ mod probe_tests {
             }
         }
         assert_eq!(torrent_matroska_probe_mode(&hinted), (true, true));
+    }
+
+    #[test]
+    fn fallback_prewarm_rejects_remote_urls_and_non_torrents() {
+        let torrent = p2p_media();
+        assert!(is_local_p2p_prewarm_url(
+            &torrent,
+            "http://127.0.0.1:3100/stream/abc"
+        ));
+        assert!(!is_local_p2p_prewarm_url(
+            &torrent,
+            "https://example.org/stream/abc"
+        ));
+        assert!(!is_local_p2p_prewarm_url(
+            &torrent,
+            "http://127.0.0.1:3100/admin"
+        ));
+        assert!(!is_local_p2p_prewarm_url(
+            &http_media("https://example.org/movie.mkv"),
+            "http://127.0.0.1:3100/stream/abc"
+        ));
     }
 
     #[test]
