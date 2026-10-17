@@ -1976,7 +1976,6 @@ async fn verify_cached_p2p_playback_ranges(
     }
     Ok(())
 }
-}
 
 /// Probe a stream URL, retrying with the next matching candidate on failure.
 ///
