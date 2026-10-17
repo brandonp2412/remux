@@ -1661,6 +1661,50 @@ pub struct Media {
     pub locked_fields: Vec<MetadataField>,
 }
 
+fn subtitle_extraction_source_supported(
+    descriptor: &crate::stream::StreamDescriptor,
+) -> bool {
+    matches!(
+        descriptor,
+        crate::stream::StreamDescriptor::Local(_)
+            | crate::stream::StreamDescriptor::Opendal { .. }
+    )
+}
+
+#[cfg(test)]
+mod subtitle_extraction_source_tests {
+    use super::subtitle_extraction_source_supported;
+    use crate::stream::StreamDescriptor;
+
+    #[test]
+    fn torrent_is_ineligible_even_with_addon_opt_in() {
+        let torrent = StreamDescriptor::Torrent {
+            info_hash: "a".repeat(40),
+            file_hint: None,
+            file_idx: None,
+            trackers: vec![],
+        };
+        assert!(!subtitle_extraction_source_supported(&torrent));
+        assert!(!subtitle_extraction_source_supported(
+            &StreamDescriptor::http("https://example.org/video.mkv",)
+        ));
+        assert!(!subtitle_extraction_source_supported(
+            &StreamDescriptor::Rtsp {
+                url: "rtsp://example.org/video".into(),
+            }
+        ));
+        assert!(subtitle_extraction_source_supported(
+            &StreamDescriptor::Local("/tmp/video.mkv".into(),)
+        ));
+        assert!(subtitle_extraction_source_supported(
+            &StreamDescriptor::Opendal {
+                addon_id: uuid::Uuid::nil(),
+                path: "video.mkv".into(),
+            }
+        ));
+    }
+}
+
 impl Media {
     pub fn is_group_container(&self) -> bool {
         self.kind == MediaKind::Collection
@@ -2096,9 +2140,19 @@ impl Media {
         )
     }
 
-    /// On-demand subtitle extraction reads the whole file, so it only runs for
-    /// sources whose OpenDAL addon has opted in.
+    /// Extraction reads a complete file; reject torrents and network URLs
+    /// even if their addon opted in. Local/OpenDAL sources still require opt-in.
     pub async fn allows_subtitle_extraction(&self, db: &SqlitePool) -> bool {
+        // Torrent streams are backed by incomplete, remotely fetched files.
+        // Reading them to EOF for a subtitle can stall the player for minutes.
+        // An addon's opt-in must not override this source-level restriction.
+        if self
+            .stream_info
+            .as_ref()
+            .is_some_and(|si| !subtitle_extraction_source_supported(&si.descriptor))
+        {
+            return false;
+        }
         let Some(addon_id) = self
             .stream_info
             .as_ref()
