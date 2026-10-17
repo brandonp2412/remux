@@ -197,6 +197,30 @@ fn torrent_availability_tier(source: &db::Media) -> u8 {
     }
 }
 
+/// Uncached Blu-ray remuxes are often much too bitrate-heavy to sustain
+/// over a torrent even when their reported seed count is high. Prefer an
+/// encoded release in the same swarm-health tier before comparing seeders.
+fn torrent_playability_tier(source: &db::Media) -> u8 {
+    let Some(info) = source
+        .stream_info
+        .as_ref()
+    else {
+        return 1;
+    };
+    if !info.is_p2p() {
+        return 1;
+    }
+    let filename = info
+        .filename
+        .as_deref()
+        .unwrap_or(&source.title);
+    u8::from(
+        !filename
+            .to_ascii_lowercase()
+            .contains("remux"),
+    )
+}
+
 fn prefer_available_torrents(sources: &mut [db::Media]) {
     // Preserve priority of non-P2P or cached service sources: advertised
     // seeder counts are only comparable between torrent candidates.
@@ -220,7 +244,11 @@ fn prefer_available_torrents(sources: &mut [db::Media]) {
             .as_ref()
             .and_then(|si| si.seeders)
             .unwrap_or(-1);
-        std::cmp::Reverse((torrent_availability_tier(source), seeders))
+        std::cmp::Reverse((
+            torrent_availability_tier(source),
+            torrent_playability_tier(source),
+            seeders,
+        ))
     });
 }
 
@@ -258,6 +286,7 @@ fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
         pool.sort_by_cached_key(|stream| {
             std::cmp::Reverse((
                 torrent_availability_tier(stream),
+                torrent_playability_tier(stream),
                 stream.quality_weight(),
                 stream
                     .stream_info
@@ -1775,6 +1804,19 @@ mod tests {
         let mut mixed = vec![torrent("p2p", Some(100)), db::Media::default()];
         prefer_available_torrents(&mut mixed);
         assert_eq!(mixed[0].title, "p2p");
+
+        // A 79 GB UHD Blu-ray remux with more advertised seeders is not
+        // necessarily more playable than an encoded 4K release.
+        let mut high_bitrate = vec![
+            torrent("2160p_bluray_remux", Some(152)),
+            torrent("2160p_web", Some(100)),
+        ];
+        prefer_available_torrents(&mut high_bitrate);
+        assert_eq!(high_bitrate[0].title, "2160p_web");
+        assert_eq!(
+            quality_ordered_probe_pool(&high_bitrate)[0].title,
+            "2160p_web"
+        );
     }
 
     #[tokio::test]
