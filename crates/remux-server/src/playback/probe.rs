@@ -1397,17 +1397,22 @@ pub(crate) async fn probe_stream(
         port,
         db,
         move |url, attempt_timeout_secs, bounded_header_probe, sequential_matroska| {
-            // Prove track metadata from the first MiB before waiting for the
-            // torrent's sparse multi-MiB ranges. Some healthy 720p swarms can
-            // serve their EBML header immediately but take >30s to serve 4MiB.
-            // A failed bounded probe falls back to the original full probe;
-            // the enclosing timeout still bounds both attempts together.
+            // Keep ffprobe's Matroska read bounded to the first MiB, but ask
+            // the stream endpoint to prove its full bitrate-sized startup
+            // buffer before accepting the metadata. A readable EBML header
+            // alone is not enough: the player will immediately need more
+            // contiguous bytes. A failed bounded probe falls back to the
+            // original full probe; the enclosing timeout still bounds both.
             let local_stream_rw_timeout =
                 std::time::Duration::from_secs(attempt_timeout_secs);
             if bounded_header_probe {
+                let headers = format!(
+                    "Range: bytes=0-1048575\r\n{}: 1\r\n",
+                    crate::stream::PROBE_PLAYBACK_READINESS_HEADER
+                );
                 match probe_media_with_local_stream_rw_timeout(
                     &url,
-                    Some("Range: bytes=0-1048575\r\n"),
+                    Some(&headers),
                     Some(local_stream_rw_timeout),
                     local_stream_rw_timeout,
                     true,
