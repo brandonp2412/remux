@@ -684,10 +684,43 @@ impl StreamAddon for StremioAddon {
         let svc = self.service()?;
         let streams =
             stremio_streams(&svc, &self.manifest_url, media, id_prefixes).await?;
-        if !streams.is_empty()
-            || media.kind != db::MediaKind::Episode
-            || media.parent_idx != Some(0)
-        {
+        if !streams.is_empty() || media.kind != db::MediaKind::Episode {
+            return Ok(streams);
+        }
+
+        if let Some(relative_episode) = season_relative_episode(media, ctx).await? {
+            match stremio_streams(
+                &svc,
+                &self.manifest_url,
+                &relative_episode,
+                id_prefixes,
+            )
+            .await
+            {
+                Ok(fallback) if !fallback.is_empty() => {
+                    debug!(
+                        episode = %media.title,
+                        stored_episode = ?media.idx,
+                        relative_episode = ?relative_episode.idx,
+                        streams = fallback.len(),
+                        "episode recovered via season-relative Stremio index"
+                    );
+                    return Ok(fallback);
+                }
+                Ok(_) => {}
+                Err(error) => {
+                    debug!(
+                        episode = %media.title,
+                        stored_episode = ?media.idx,
+                        relative_episode = ?relative_episode.idx,
+                        %error,
+                        "season-relative episode stream fallback failed"
+                    );
+                }
+            }
+        }
+
+        if media.parent_idx != Some(0) {
             return Ok(streams);
         }
 
@@ -835,6 +868,68 @@ async fn canonical_special_episode(media: &db::Media) -> Result<Option<db::Media
         .external_ids
         .custom_stremio_type = Some("series".to_string());
     Ok(Some(canonical))
+}
+
+fn season_relative_index(
+    current_idx: i64,
+    sibling_indices: impl IntoIterator<Item = i64>,
+) -> Option<i64> {
+    let mut indices: Vec<i64> = sibling_indices
+        .into_iter()
+        .filter(|idx| *idx > 0 && *idx <= current_idx)
+        .collect();
+    indices.sort_unstable();
+    indices.dedup();
+
+    let first = *indices.first()?;
+    if *indices.last()? != current_idx {
+        return None;
+    }
+
+    let expected_len = current_idx
+        .checked_sub(first)?
+        .checked_add(1)?;
+    if expected_len <= 0 || usize::try_from(expected_len).ok()? != indices.len() {
+        return None;
+    }
+
+    let relative = expected_len;
+    (relative != current_idx).then_some(relative)
+}
+
+async fn season_relative_episode(
+    media: &db::Media,
+    ctx: &AppContext,
+) -> Result<Option<db::Media>> {
+    if media.kind != db::MediaKind::Episode || media.parent_idx == Some(0) {
+        return Ok(None);
+    }
+    let (Some(parent_id), Some(current_idx)) = (media.parent_id, media.idx) else {
+        return Ok(None);
+    };
+
+    let siblings = db::Media::get_by_filter(
+        &ctx.db,
+        &db::MediaFilter {
+            kind: Some(vec![db::MediaKind::Episode]),
+            parent_id: Some(parent_id),
+            ..Default::default()
+        },
+    )
+    .await?
+    .records;
+    let Some(relative_idx) = season_relative_index(
+        current_idx,
+        siblings
+            .iter()
+            .filter_map(|episode| episode.idx),
+    ) else {
+        return Ok(None);
+    };
+
+    let mut relative = media.clone();
+    relative.idx = Some(relative_idx);
+    Ok(Some(relative))
 }
 
 fn normalize_special_title(value: &str) -> String {
@@ -2359,6 +2454,24 @@ async fn stremio_streams(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn season_relative_index_recovers_absolute_episode_numbering() {
+        assert_eq!(season_relative_index(348, 321..=348), Some(28),);
+    }
+
+    #[test]
+    fn season_relative_index_leaves_normal_numbering_unchanged() {
+        assert_eq!(season_relative_index(28, 1..=28), None);
+    }
+
+    #[test]
+    fn season_relative_index_rejects_gapped_season_data() {
+        assert_eq!(
+            season_relative_index(348, (321..=348).filter(|idx| *idx != 330)),
+            None,
+        );
+    }
 
     fn special_episode(title: &str, year: i32, season: i64) -> db::Media {
         let series = db::Media {
