@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{io::SeekFrom, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use librqbit::{
@@ -9,6 +9,7 @@ use librqbit::{
     http_api::HttpApi,
 };
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{debug, info, warn};
 
 // Keep cached pieces briefly reusable after playback, but stop requesting
@@ -327,6 +328,79 @@ impl TorrentManager {
             background_downloads_path,
             background_limits: BackgroundLimits::default(),
         })
+    }
+
+    pub(crate) async fn probe_stream_range(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        start: u64,
+        bytes_needed: usize,
+        required_download_mibps: f64,
+        wait: Duration,
+        mut on_progress: impl FnMut(usize),
+    ) -> Result<(usize, f64)> {
+        let hash = librqbit::Magnet::parse(&format!("magnet:?xt=urn:btih:{info_hash}"))
+            .context("invalid torrent info hash")?
+            .as_id20()
+            .context("torrent info hash is not a v1 hash")?;
+        let handle = self
+            .session
+            .get(TorrentIdOrHash::Hash(hash))
+            .context("torrent is not managed")?;
+        let mut stream = handle
+            .stream(file_idx)
+            .context("failed to open native torrent file stream")?;
+        if start > 0 {
+            stream
+                .seek(SeekFrom::Start(start))
+                .await
+                .context("failed to seek native torrent file stream")?;
+        }
+
+        let started_at = tokio::time::Instant::now();
+        let received = tokio::time::timeout(wait, async {
+            let mut received = 0usize;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            while received < bytes_needed {
+                let remaining = bytes_needed - received;
+                let read_len = remaining.min(buffer.len());
+                let read = stream
+                    .read(&mut buffer[..read_len])
+                    .await
+                    .context("failed reading native torrent file stream")?;
+                if read == 0 {
+                    break;
+                }
+                received = received.saturating_add(read);
+                on_progress(received);
+            }
+            anyhow::ensure!(
+                received >= bytes_needed,
+                "native torrent range at byte {start} produced only {received} of {bytes_needed} required bytes"
+            );
+            Ok::<usize, anyhow::Error>(received)
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "native torrent range at byte {start} timed out after {:.2}s",
+                wait.as_secs_f64()
+            )
+        })??;
+
+        let elapsed_secs = started_at
+            .elapsed()
+            .as_secs_f64()
+            .max(0.001);
+        let readable_mibps = received as f64 / 1024.0 / 1024.0 / elapsed_secs;
+        if bytes_needed >= 256 * 1024 {
+            anyhow::ensure!(
+                readable_mibps >= required_download_mibps,
+                "native torrent range at byte {start} read {received} bytes at {readable_mibps:.2} MiB/s, below required {required_download_mibps:.2} MiB/s"
+            );
+        }
+        Ok((received, readable_mibps))
     }
 
     pub(crate) fn note_range_requested(&self, info_hash: &str, file_idx: usize) {
