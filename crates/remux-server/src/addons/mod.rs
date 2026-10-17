@@ -3312,6 +3312,47 @@ fn match_probe_version<'a>(
 }
 
 impl AddonService {
+    async fn enrich_stream_lookup_external_ids(
+        media: &mut db::Media,
+        ctx: &AppContext,
+    ) {
+        if !matches!(media.kind, db::MediaKind::Movie | db::MediaKind::Series)
+            || media
+                .external_ids
+                .imdb
+                .is_some()
+            || media
+                .external_ids
+                .tmdb
+                .is_none()
+        {
+            return;
+        }
+
+        let before = media
+            .external_ids
+            .clone();
+        MediaResolveService::resolve_external_ids(media, ctx, false).await;
+        if media.external_ids == before {
+            return;
+        }
+
+        match db::Media::widen_external_ids(&ctx.db, &media.id, &media.external_ids)
+            .await
+        {
+            Ok(Some(stored)) => media.external_ids = stored,
+            Ok(None) => {}
+            Err(error) => {
+                warn!(
+                    media_id = %media.id,
+                    title = %media.title,
+                    %error,
+                    "failed to persist stream lookup external ids"
+                );
+            }
+        }
+    }
+
     #[tracing::instrument(skip_all, fields(title = %media.title, kind = %media.kind))]
     pub async fn refresh_streams(
         &self,
@@ -3356,6 +3397,13 @@ impl AddonService {
             .grandparent(&ctx.db)
             .await
             .ok();
+
+        // Search/import paths can yield a TMDB-only Movie/Series row before its
+        // metadata refresh runs. Stream addons such as Torrentio advertise
+        // only IMDb/Kitsu id prefixes, so resolving the missing IMDb id here
+        // prevents a valid item from being rejected as "no resolvable ID".
+        // Persist the widened ids so subsequent playback skips this lookup.
+        Self::enrich_stream_lookup_external_ids(media, ctx).await;
 
         let instant = Instant::now();
         let probe_versions_fut = async {
@@ -3720,6 +3768,89 @@ pub fn make_media_id(addon_id: Uuid, local_id: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn stream_lookup_enriches_and_persists_imdb_for_tmdb_only_movie() {
+        let tmdb = httpmock::MockServer::start();
+        let lookup = tmdb.mock(|when, then| {
+            when.path("/movie/1056198")
+                .query_param("append_to_response", "external_ids");
+            then.status(200)
+                .json_body(serde_json::json!({
+                    "id": 1056198,
+                    "title": "Oprah and Quinta Brunson Abbott Elementary",
+                    "overview": null,
+                    "release_date": "2022-11-26",
+                    "runtime": 41,
+                    "vote_average": 6.5,
+                    "vote_count": 1,
+                    "adult": false,
+                    "status": null,
+                    "poster_path": null,
+                    "backdrop_path": null,
+                    "imdb_id": "tt9991056",
+                    "original_language": "en",
+                    "genres": null,
+                    "production_companies": null,
+                    "production_countries": null,
+                    "external_ids": null,
+                    "credits": null,
+                    "images": null,
+                    "release_dates": null,
+                    "popularity": null
+                }));
+        });
+
+        let (_server, guard) =
+            crate::integration_test::new_test_server_with_config(crate::Config {
+                database_url: Some("sqlite::memory:".into()),
+                torrent_http_port: None,
+                disable_dht: true,
+                tmdb_base_url: tmdb.base_url(),
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let ctx = &guard.0;
+        let id = uuid::Uuid::new_v4();
+        let mut media = db::Media {
+            id,
+            title: "Oprah and Quinta Brunson Abbott Elementary".into(),
+            kind: db::MediaKind::Movie,
+            external_ids: db::ExternalIds {
+                tmdb: Some(1056198),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        media
+            .save(&ctx.db)
+            .await
+            .unwrap();
+
+        AddonService::enrich_stream_lookup_external_ids(&mut media, ctx).await;
+
+        assert_eq!(
+            media
+                .external_ids
+                .imdb
+                .as_deref()
+                .map(|id| id.as_str()),
+            Some("tt9991056")
+        );
+        assert_eq!(
+            db::Media::get_by_id(&ctx.db, &id)
+                .await
+                .unwrap()
+                .unwrap()
+                .external_ids
+                .imdb
+                .as_deref()
+                .map(|id| id.as_str()),
+            Some("tt9991056")
+        );
+        lookup.assert();
+    }
 
     fn torrent_stream(hash: &str, file_hint: &str, file_idx: usize) -> db::Media {
         db::Media {
