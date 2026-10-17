@@ -44,6 +44,9 @@ struct TorrentObservedProgress {
     range_requests: u64,
     range_ready: u64,
     range_bytes_served: u64,
+    startup_required_bytes: Option<u64>,
+    startup_readable_bytes: u64,
+    startup_ready: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +147,11 @@ pub struct TorrentPrefetchStatus {
     pub next_total_bytes: Option<u64>,
     pub download_mibps: f64,
     pub live_peers: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_required_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_readable_bytes: Option<u64>,
+    pub startup_ready: bool,
 }
 
 pub struct TorrentManager {
@@ -327,10 +335,13 @@ impl TorrentManager {
             .probe_progress
             .lock()
         {
-            progress
+            let entry = progress
                 .entry(key)
-                .or_default()
-                .range_requests += 1;
+                .or_default();
+            entry.range_requests += 1;
+            entry.startup_required_bytes = None;
+            entry.startup_readable_bytes = 0;
+            entry.startup_ready = false;
         }
     }
 
@@ -340,10 +351,30 @@ impl TorrentManager {
             .probe_progress
             .lock()
         {
-            progress
+            let entry = progress
                 .entry(key)
-                .or_default()
-                .range_ready += 1;
+                .or_default();
+            entry.range_ready += 1;
+            entry.startup_ready = true;
+        }
+    }
+
+    pub(crate) fn note_startup_progress(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        required: u64,
+        readable: u64,
+    ) {
+        if let Ok(mut progress) = self
+            .probe_progress
+            .lock()
+        {
+            let entry = progress
+                .entry((normalized_info_hash(info_hash), file_idx))
+                .or_default();
+            entry.startup_required_bytes = Some(required);
+            entry.startup_readable_bytes = readable.min(required);
         }
     }
 
@@ -700,6 +731,15 @@ impl TorrentManager {
         let live = stats
             .live
             .as_ref();
+        let startup = self
+            .probe_progress
+            .lock()
+            .ok()
+            .and_then(|progress| {
+                progress
+                    .get(&(normalized_info_hash(info_hash), index))
+                    .cloned()
+            });
         Some(TorrentPrefetchStatus {
             current_cached_bytes: stats
                 .file_progress
@@ -726,6 +766,15 @@ impl TorrentManager {
                     .peer_stats
                     .live as u64
             }),
+            startup_required_bytes: startup
+                .as_ref()
+                .and_then(|p| p.startup_required_bytes),
+            startup_readable_bytes: startup
+                .as_ref()
+                .map(|p| p.startup_readable_bytes),
+            startup_ready: startup
+                .as_ref()
+                .is_some_and(|p| p.startup_ready),
         })
     }
 
@@ -2249,6 +2298,45 @@ fn parse_file_idx_param(magnet: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_readiness_telemetry_is_additive_and_distinct_from_file_cache() {
+        let status = TorrentPrefetchStatus {
+            current_cached_bytes: 80_000_000,
+            current_total_bytes: 100_000_000,
+            next_cached_bytes: None,
+            next_total_bytes: None,
+            download_mibps: 2.0,
+            live_peers: 3,
+            startup_required_bytes: Some(8_000_000),
+            startup_readable_bytes: Some(2_000_000),
+            startup_ready: false,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["currentCachedBytes"], 80_000_000);
+        assert_eq!(json["startupRequiredBytes"], 8_000_000);
+        assert_eq!(json["startupReadableBytes"], 2_000_000);
+        assert_eq!(json["startupReady"], false);
+        assert!(
+            json.get("nextCachedBytes")
+                .is_some()
+        );
+
+        let unknown = TorrentPrefetchStatus {
+            startup_required_bytes: None,
+            startup_readable_bytes: None,
+            ..status
+        };
+        let json = serde_json::to_value(unknown).unwrap();
+        assert!(
+            json.get("startupRequiredBytes")
+                .is_none()
+        );
+        assert!(
+            json.get("startupReadableBytes")
+                .is_none()
+        );
+    }
 
     #[test]
     fn recent_playback_is_retained_for_retries() {

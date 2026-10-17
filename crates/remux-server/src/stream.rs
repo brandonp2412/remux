@@ -609,6 +609,25 @@ impl TorrentSource {
         required_download_mibps: f64,
         wait: std::time::Duration,
     ) -> anyhow::Result<(usize, f64)> {
+        Self::probe_readable_range_with_progress(
+            resolved_url,
+            start,
+            bytes_needed,
+            required_download_mibps,
+            wait,
+            |_| {},
+        )
+        .await
+    }
+
+    async fn probe_readable_range_with_progress(
+        resolved_url: &str,
+        start: u64,
+        bytes_needed: usize,
+        required_download_mibps: f64,
+        wait: std::time::Duration,
+        mut on_progress: impl FnMut(usize),
+    ) -> anyhow::Result<(usize, f64)> {
         let started_at = tokio::time::Instant::now();
         let received = tokio::time::timeout(wait, async {
             let mut request = STREAM_PROXY_CLIENT.get(resolved_url);
@@ -632,6 +651,7 @@ impl TorrentSource {
                     break;
                 };
                 received = received.saturating_add(chunk?.len());
+                on_progress(received.min(bytes_needed));
             }
             anyhow::ensure!(
                 received >= bytes_needed,
@@ -708,6 +728,7 @@ impl TorrentSource {
         torrent: &crate::torrent::TorrentManager,
         resolved_url: &str,
         requested_range: Option<&str>,
+        selected_file_idx: usize,
     ) -> anyhow::Result<()> {
         // The final diversified PlaybackInfo recovery probe is allowed 35s.
         // Keep this inner readiness window long enough for a healthy cold swarm
@@ -778,6 +799,12 @@ impl TorrentSource {
                             .min(startup_target_bytes as u64),
                     )
                     .unwrap_or(startup_target_bytes);
+                    torrent.note_startup_progress(
+                        &self.info_hash,
+                        selected_file_idx,
+                        probe_bytes_needed as u64,
+                        0,
+                    );
                     let range_readable: anyhow::Result<(usize, f64)> = async {
                         let remaining = deadline
                             .saturating_duration_since(tokio::time::Instant::now());
@@ -786,12 +813,20 @@ impl TorrentSource {
                             "readiness budget exhausted before startup range check"
                         );
                         let (startup_bytes, startup_read_mibps) =
-                            Self::probe_readable_range(
+                            Self::probe_readable_range_with_progress(
                                 resolved_url,
                                 probe_start,
                                 probe_bytes_needed,
                                 required_download_mibps,
                                 remaining,
+                                |readable| {
+                                    torrent.note_startup_progress(
+                                        &self.info_hash,
+                                        selected_file_idx,
+                                        probe_bytes_needed as u64,
+                                        readable as u64,
+                                    )
+                                },
                             )
                             .await?;
 
@@ -806,6 +841,8 @@ impl TorrentSource {
 
                     match range_readable {
                         Ok((startup_bytes, startup_read_mibps)) => {
+                            torrent
+                                .note_range_ready(&self.info_hash, selected_file_idx);
                             tracing::info!(
                                 cached_bytes = status.current_cached_bytes,
                                 total_bytes = status.current_total_bytes,
@@ -1336,7 +1373,7 @@ impl StreamSource for TorrentSource {
             });
         torrent.note_range_requested(&self.info_hash, selected_file_idx);
         if let Err(error) = self
-            .wait_until_ready(&torrent, &resolved, requested_range)
+            .wait_until_ready(&torrent, &resolved, requested_range, selected_file_idx)
             .await
         {
             // Preserve verified pieces for a cold retry. The lease's normal
