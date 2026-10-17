@@ -2007,15 +2007,21 @@ async fn verify_cached_p2p_playback_ranges(
     source: &api::MediaSourceInfo,
     start_time_ticks: Option<i64>,
 ) -> Result<()> {
-    verify_local_p2p_range(url, timeout_secs, 0).await?;
-    if let Some(resume_start) = resume_range_start(source, start_time_ticks) {
-        verify_local_p2p_range(url, timeout_secs, resume_start).await?;
-        debug!(
-            resume_start,
-            start_time_ticks, "verified cached torrent resume range"
-        );
-    }
-    Ok(())
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+        verify_local_p2p_range(url, timeout_secs, 0).await?;
+        if let Some(resume_start) = resume_range_start(source, start_time_ticks) {
+            verify_local_p2p_range(url, timeout_secs, resume_start).await?;
+            debug!(
+                resume_start,
+                start_time_ticks, "verified cached torrent resume range"
+            );
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("cached torrent readiness proof exceeded {timeout_secs}s")
+    })?
 }
 
 /// Probe a stream URL, retrying with the next matching candidate on failure.
@@ -2377,6 +2383,74 @@ where
 #[cfg(test)]
 mod probe_tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn readiness_range_server(
+        statuses: Vec<u16>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for status in statuses {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 2048];
+                loop {
+                    let read = socket
+                        .read(&mut chunk)
+                        .await
+                        .unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request
+                        .windows(4)
+                        .any(|window| window == b"\r\n\r\n")
+                    {
+                        break;
+                    }
+                }
+                requests.push(String::from_utf8_lossy(&request).to_ascii_lowercase());
+                let body = if status == 206 {
+                    vec![b'x'; P2P_READINESS_PROOF_BYTES as usize]
+                } else {
+                    Vec::new()
+                };
+                let reason = if status == 206 {
+                    "Partial Content"
+                } else {
+                    "Unavailable"
+                };
+                let headers = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket
+                    .write_all(headers.as_bytes())
+                    .await
+                    .unwrap();
+                socket
+                    .write_all(&body)
+                    .await
+                    .unwrap();
+                socket
+                    .shutdown()
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+        (format!("http://{addr}/stream/test"), task)
+    }
 
     fn chapter(start: &str, end: &str, title: &str) -> FfprobeChapter {
         FfprobeChapter {
@@ -2443,6 +2517,55 @@ mod probe_tests {
                 end_ticks: 10_800_000_000,
             })
         );
+    }
+
+    #[tokio::test]
+    async fn cached_readiness_proves_startup_and_estimated_resume_ranges() {
+        let (url, server) = readiness_range_server(vec![206, 206]).await;
+        let source = api::MediaSourceInfo {
+            run_time_ticks: Some(1_000),
+            size: Some(100_000_000),
+            ..Default::default()
+        };
+        verify_cached_p2p_playback_ranges(&url, 3, &source, Some(500))
+            .await
+            .unwrap();
+        let requests = server
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].contains("range: bytes=0-1048575"));
+        assert!(requests[1].contains("range: bytes=50000000-51048575"));
+        assert!(
+            requests
+                .iter()
+                .all(|request| {
+                    request.contains("x-remux-probe-playback-readiness: 1")
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_readiness_rejects_unavailable_resume_range() {
+        let (url, server) = readiness_range_server(vec![206, 503]).await;
+        let source = api::MediaSourceInfo {
+            run_time_ticks: Some(1_000),
+            size: Some(100_000_000),
+            ..Default::default()
+        };
+        let error = verify_cached_p2p_playback_ranges(&url, 3, &source, Some(500))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("was not served")
+        );
+        let requests = server
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1].contains("range: bytes=50000000-51048575"));
     }
 
     #[test]
@@ -3201,6 +3324,7 @@ mod probe_tests {
             0,
             &[primary],
             false,
+            None,
             3000,
             &db,
             |_url, _timeout, _bounded, _sequential| {
@@ -3286,6 +3410,7 @@ mod probe_tests {
             2,
             &all,
             false,
+            None,
             addr.port(),
             &db,
             |_url, _timeout, _bounded, _sequential| {
@@ -3318,6 +3443,7 @@ mod probe_tests {
             0,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![video_probe()]),
@@ -3345,6 +3471,7 @@ mod probe_tests {
             0,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![video_probe()]),
@@ -3375,6 +3502,7 @@ mod probe_tests {
             5,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![Err(anyhow!("primary failed")), video_probe()]),
@@ -3401,6 +3529,7 @@ mod probe_tests {
             5,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![Err(anyhow!("fail")), Err(anyhow!("fail"))]),
@@ -3441,6 +3570,7 @@ mod probe_tests {
             5,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![short_probe, video_probe()]),
@@ -3466,6 +3596,7 @@ mod probe_tests {
             0,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![]),
@@ -3493,6 +3624,7 @@ mod probe_tests {
             1, // one fallback candidate even when resolution is unrestricted
             &sources,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![Err(anyhow!("fail")), Err(anyhow!("fail"))]),
@@ -3526,6 +3658,7 @@ mod probe_tests {
             5,
             &probe_pool,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![
