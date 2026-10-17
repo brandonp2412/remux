@@ -1878,6 +1878,7 @@ async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result
             reqwest::header::RANGE,
             format!("bytes=0-{}", PROOF_BYTES - 1),
         )
+        .header(crate::stream::PROBE_PLAYBACK_READINESS_HEADER, "1")
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .send()
         .await?;
@@ -2737,7 +2738,13 @@ mod probe_tests {
             .unwrap();
         let app = axum::Router::new().route(
             "/stream/test",
-            axum::routing::get(move || async move { (status, vec![0_u8; body_size]) }),
+            axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+                if !headers.contains_key(crate::stream::PROBE_PLAYBACK_READINESS_HEADER)
+                {
+                    return (reqwest::StatusCode::BAD_REQUEST, Vec::new());
+                }
+                (status, vec![0_u8; body_size])
+            }),
         );
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
