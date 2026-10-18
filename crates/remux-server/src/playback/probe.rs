@@ -1357,6 +1357,40 @@ fn can_fallback_to_stale_probe_cache(cached: &api::MediaSourceInfo) -> bool {
                 .is_some())
 }
 
+/// Run the bounded Matroska-header probe and its normal fallback within one
+/// shared wall-clock budget. A failed first ffprobe must not get a second full
+/// timeout while the caller's outer readiness deadline is already expiring.
+fn probe_with_shared_header_deadline<T>(
+    timeout: std::time::Duration,
+    mut probe: impl FnMut(bool, std::time::Duration) -> Result<T>,
+) -> Result<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+
+    let bounded_budget = remaining();
+    if bounded_budget.is_zero() {
+        return Err(anyhow!(
+            "probe deadline expired before bounded header probe"
+        ));
+    }
+    match probe(true, bounded_budget) {
+        Ok(result) => Ok(result),
+        Err(bounded_error) => {
+            let normal_budget = remaining();
+            if normal_budget.is_zero() {
+                return Err(bounded_error.context(
+                    "bounded header probe exhausted the shared probe deadline",
+                ));
+            }
+            probe(false, normal_budget).map_err(|normal_error| {
+                anyhow!(
+                    "bounded header probe failed ({bounded_error:#}); normal probe failed: {normal_error:#}"
+                )
+            })
+        }
+    }
+}
+
 /// Resolve probe data for a single source: cache hit → skip → live probe with fallback.
 pub(crate) async fn probe_stream(
     stream: &db::Media,
@@ -1440,35 +1474,44 @@ pub(crate) async fn probe_stream(
         port,
         db,
         move |url, attempt_timeout_secs, bounded_header_probe, sequential_matroska| {
-            // Keep ffprobe's Matroska read bounded to the first MiB, but ask
-            // the stream endpoint to prove its full bitrate-sized startup
-            // buffer before accepting the metadata. A readable EBML header
-            // alone is not enough: the player will immediately need more
-            // contiguous bytes. A failed bounded probe falls back to the
-            // original full probe; the enclosing timeout still bounds both.
-            let local_stream_rw_timeout =
-                std::time::Duration::from_secs(attempt_timeout_secs);
+            let attempt_budget = std::time::Duration::from_secs(attempt_timeout_secs);
             if bounded_header_probe {
-                let headers = format!(
-                    "Range: bytes=0-1048575\r\n{}: 1\r\n",
-                    crate::stream::PROBE_PLAYBACK_READINESS_HEADER
+                return probe_with_shared_header_deadline(
+                    attempt_budget,
+                    |bounded, remaining| {
+                        if bounded {
+                            // A usable EBML header alone is insufficient; the live stream endpoint
+                            // must also prove the startup buffer. Keep that request within the same
+                            // overall deadline as the normal ffprobe fallback.
+                            let headers = format!(
+                                "Range: bytes=0-1048575\r\n{}: 1\r\n",
+                                crate::stream::PROBE_PLAYBACK_READINESS_HEADER
+                            );
+                            probe_media_with_local_stream_rw_timeout(
+                                &url,
+                                Some(&headers),
+                                Some(remaining),
+                                remaining,
+                                true,
+                            )
+                        } else {
+                            probe_media_with_local_stream_rw_timeout(
+                                &url,
+                                None,
+                                Some(remaining),
+                                remaining,
+                                sequential_matroska,
+                            )
+                        }
+                    },
                 );
-                match probe_media_with_local_stream_rw_timeout(
-                    &url,
-                    Some(&headers),
-                    Some(local_stream_rw_timeout),
-                    local_stream_rw_timeout,
-                    true,
-                ) {
-                    Ok(metadata) => return Ok(metadata),
-                    Err(error) => tracing::debug!(%error, "bounded torrent header probe unavailable; retrying normal probe"),
-                }
             }
+
             probe_media_with_local_stream_rw_timeout(
                 &url,
                 None,
-                Some(std::time::Duration::from_secs(attempt_timeout_secs)),
-                local_stream_rw_timeout,
+                Some(attempt_budget),
+                attempt_budget,
                 sequential_matroska,
             )
         },
@@ -3104,6 +3147,61 @@ mod probe_tests {
             .await
             .unwrap();
         db
+    }
+
+    #[test]
+    fn bounded_header_retry_uses_only_the_shared_deadline_remainder() {
+        use std::{sync::Mutex, thread, time::Duration};
+
+        let calls = Mutex::new(Vec::new());
+        let result = probe_with_shared_header_deadline(
+            Duration::from_millis(300),
+            |bounded, budget| {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((bounded, budget));
+                if bounded {
+                    thread::sleep(Duration::from_millis(220));
+                    Err(anyhow!("header readiness timed out"))
+                } else {
+                    assert!(budget < Duration::from_millis(120));
+                    thread::sleep(Duration::from_millis(40));
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(result.is_ok());
+        let calls = calls
+            .into_inner()
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].0);
+        assert!(!calls[1].0);
+        assert!(calls[1].1 < calls[0].1);
+    }
+
+    #[test]
+    fn exhausted_bounded_header_probe_skips_normal_retry() {
+        use std::{cell::Cell, thread, time::Duration};
+
+        let normal_called = Cell::new(false);
+        let result = probe_with_shared_header_deadline(
+            Duration::from_millis(40),
+            |bounded, _| {
+                if bounded {
+                    thread::sleep(Duration::from_millis(70));
+                    Err(anyhow!("header readiness timed out"))
+                } else {
+                    normal_called.set(true);
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!normal_called.get());
     }
 
     #[test]
