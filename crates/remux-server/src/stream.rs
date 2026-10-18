@@ -621,10 +621,16 @@ impl TorrentSource {
             let response = request.send().await?;
             anyhow::ensure!(
                 response.status() == http::StatusCode::PARTIAL_CONTENT
-                    || start == 0 && response.status().is_success(),
+                    || start == 0 && response.status() == http::StatusCode::OK,
                 "range at byte {start} returned HTTP {}",
                 response.status()
             );
+            if response.status() == http::StatusCode::PARTIAL_CONTENT {
+                anyhow::ensure!(
+                    upstream_range_matches_start(response.headers(), start),
+                    "range at byte {start} returned an inconsistent Content-Range"
+                );
+            }
             let mut stream = response.bytes_stream();
             let mut received = 0usize;
             while received < bytes_needed {
@@ -901,6 +907,20 @@ impl HttpSource {
         let upstream_headers = upstream
             .headers()
             .clone();
+        if let Some((start, _)) = requested_range {
+            if upstream_status == http::StatusCode::PARTIAL_CONTENT
+                && !upstream_range_matches_start(&upstream_headers, start)
+            {
+                return Err(torrent_source_buffering(anyhow::anyhow!(
+                    "upstream returned incorrect Content-Range for requested byte {start}"
+                )));
+            }
+            if start > 0 && upstream_status == http::StatusCode::OK {
+                return Err(torrent_source_buffering(anyhow::anyhow!(
+                    "upstream ignored requested seek offset {start}"
+                )));
+            }
+        }
         let total_length = upstream_headers
             .get(http::header::CONTENT_RANGE)
             .and_then(|value| {
@@ -981,6 +1001,37 @@ impl HttpSource {
     }
 }
 
+/// Partial responses must start at the requested byte; accepting another
+/// offset silently corrupts decoder input and makes seek checks false passes.
+fn upstream_range_matches_start(headers: &HeaderMap, start: u64) -> bool {
+    let Some(value) = headers
+        .get(http::header::CONTENT_RANGE)
+        .and_then(|value| {
+            value
+                .to_str()
+                .ok()
+        })
+        .and_then(|value| value.strip_prefix("bytes "))
+    else {
+        return false;
+    };
+    let Some((span, total)) = value.split_once('/') else {
+        return false;
+    };
+    let Some((first, last)) = span.split_once('-') else {
+        return false;
+    };
+    let (Ok(first), Ok(last)) = (first.parse::<u64>(), last.parse::<u64>()) else {
+        return false;
+    };
+    first == start
+        && last >= first
+        && (total == "*"
+            || total
+                .parse::<u64>()
+                .is_ok_and(|n| last < n))
+}
+
 fn parse_open_or_finite_range(range: &str) -> Option<(u64, Option<u64>)> {
     let bytes = range.strip_prefix("bytes=")?;
     let (start, end) = bytes.split_once('-')?;
@@ -990,12 +1041,14 @@ fn parse_open_or_finite_range(range: &str) -> Option<(u64, Option<u64>)> {
     let start = start
         .parse()
         .ok()?;
-    let end = (!end.is_empty())
-        .then(|| {
-            end.parse()
-                .ok()
-        })
-        .flatten();
+    let end = if end.is_empty() {
+        None
+    } else {
+        Some(
+            end.parse::<u64>()
+                .ok()?,
+        )
+    };
     end.is_none_or(|end| end >= start)
         .then_some((start, end))
 }
@@ -1459,7 +1512,8 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 mod tests {
     use super::{
         HttpSource, STREAM_PROXY_CLIENT, StreamDescriptor, TorrentSource, TrackerUrl,
-        is_tracker_url, mime_from_path, parse_range,
+        is_tracker_url, mime_from_path, parse_open_or_finite_range, parse_range,
+        upstream_range_matches_start,
     };
     use std::path::Path;
 
@@ -1485,6 +1539,7 @@ mod tests {
             when.method(httpmock::Method::GET)
                 .path("/cached");
             then.status(206)
+                .header("Content-Range", &format!("bytes 0-{}/{}", bytes - 1, bytes))
                 .body(vec![0u8; bytes]);
         });
         let result = TorrentSource::probe_readable_range(
@@ -1509,6 +1564,7 @@ mod tests {
                 .path("/seek")
                 .header("Range", "bytes=3306-");
             then.status(206)
+                .header("Content-Range", "bytes 3306-68841/68842")
                 .body(vec![0u8; bytes]);
         });
         TorrentSource::probe_readable_range(
@@ -1765,6 +1821,174 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.len(), 2048);
+    }
+
+    #[test]
+    fn malformed_finite_http_range_is_not_normalized_as_open() {
+        assert_eq!(
+            parse_open_or_finite_range("bytes=1024-"),
+            Some((1024, None))
+        );
+        assert_eq!(
+            parse_open_or_finite_range("bytes=1024-2048"),
+            Some((1024, Some(2048)))
+        );
+        for range in ["bytes=1024-abc", "bytes=1024-2048-4096", "bytes=1024-2,3"] {
+            assert_eq!(parse_open_or_finite_range(range), None, "{range}");
+        }
+    }
+
+    #[test]
+    fn upstream_partial_range_must_match_exact_start_and_valid_span() {
+        let mut headers = http::HeaderMap::new();
+        for invalid in [
+            "bytes 10-20/100",
+            "bytes 8-7/100",
+            "bytes 8-100/100",
+            "bytes */100",
+            "bytes 8-20/nope",
+        ] {
+            headers.insert(
+                http::header::CONTENT_RANGE,
+                invalid
+                    .parse()
+                    .unwrap(),
+            );
+            assert!(!upstream_range_matches_start(&headers, 8), "{invalid}");
+        }
+        headers.insert(
+            http::header::CONTENT_RANGE,
+            "bytes 8-20/100"
+                .parse()
+                .unwrap(),
+        );
+        assert!(upstream_range_matches_start(&headers, 8));
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_rejects_mismatched_seek_response() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/wrong.mkv")
+                .header("Range", "bytes=1024-");
+            then.status(206)
+                .header("Content-Range", "bytes 0-2047/2048")
+                .body(vec![b'x'; 2048]);
+        });
+        let source = HttpSource {
+            url: format!("{}/wrong.mkv", server.base_url()),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            "bytes=1024-1535"
+                .parse()
+                .unwrap(),
+        );
+        let error = source
+            .serve_inner(&headers, true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_preserves_valid_seek_bytes_and_headers() {
+        let server = httpmock::MockServer::start();
+        let seek = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/seek-valid.mkv")
+                .header("Range", "bytes=1024-");
+            then.status(206)
+                .header("Content-Range", "bytes 1024-3071/3072")
+                .body(vec![b'z'; 2048]);
+        });
+        let source = HttpSource {
+            url: format!("{}/seek-valid.mkv", server.base_url()),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            "bytes=1024-1279"
+                .parse()
+                .unwrap(),
+        );
+        let response = source
+            .serve_inner(&headers, true)
+            .await
+            .unwrap();
+        seek.assert();
+        assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_RANGE],
+            "bytes 1024-1279/3072"
+        );
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "256");
+        let body = axum::body::to_bytes(response.into_body(), 512)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), &[b'z'; 256]);
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_rejects_ignored_seek_response() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/ignored.mkv")
+                .header("Range", "bytes=1024-");
+            then.status(200)
+                .body(vec![b'x'; 2048]);
+        });
+        let source = HttpSource {
+            url: format!("{}/ignored.mkv", server.base_url()),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            "bytes=1024-1535"
+                .parse()
+                .unwrap(),
+        );
+        assert_eq!(
+            source
+                .serve_inner(&headers, true)
+                .await
+                .unwrap_err()
+                .status(),
+            http::StatusCode::SERVICE_UNAVAILABLE
+        );
+    }
+
+    #[tokio::test]
+    async fn seek_readiness_rejects_wrong_partial_offset() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/wrongseek")
+                .header("Range", "bytes=3306-");
+            then.status(206)
+                .header("Content-Range", "bytes 0-65535/65536")
+                .body(vec![b'x'; 65536]);
+        });
+        assert!(
+            TorrentSource::probe_readable_range(
+                &format!("{}/wrongseek", server.base_url()),
+                3306,
+                65536,
+                0.01,
+                std::time::Duration::from_secs(3),
+            )
+            .await
+            .is_err()
+        );
     }
 
     #[tokio::test]
