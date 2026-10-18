@@ -30,8 +30,10 @@ impl std::fmt::Display for P2pReadinessPending {
 impl std::error::Error for P2pReadinessPending {}
 
 fn progressing_source(status: &crate::torrent::TorrentPrefetchStatus) -> bool {
-    !status.startup_ready
-        && status.current_total_bytes > 0
+    // A ready header is not proof that the requested resume range is readable.
+    // We only reach this check after every real playback probe failed.
+    status.current_total_bytes > 0
+        && status.current_cached_bytes < status.current_total_bytes
         && status.current_cached_bytes >= 1024 * 1024
         && status.live_peers > 0
         && status.download_mibps >= 0.05
@@ -2568,8 +2570,10 @@ mod readiness_tests {
         let mut s = status();
         assert!(progressing_source(&s));
         s.startup_ready = true;
-        assert!(!progressing_source(&s));
-        s.startup_ready = false;
+        assert!(progressing_source(&s)); // header was ready, resume range may not be
+        s.current_cached_bytes = s.current_total_bytes;
+        assert!(!progressing_source(&s)); // fully cached failure is a real error
+        s.current_cached_bytes = 8 * 1024 * 1024;
         s.live_peers = 0;
         assert!(!progressing_source(&s));
         s.live_peers = 2;
