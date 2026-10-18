@@ -1372,6 +1372,20 @@ fn torrent_source_buffering(error: anyhow::Error) -> axum_anyhow::ApiError {
         .build()
 }
 
+/// librqbit only supports open-ended `bytes=N-` reads. Normalize suffix
+/// requests using the selected file's length before probing or proxying them,
+/// so players can read trailing MP4/MKV metadata on cold seeks.
+fn normalize_torrent_suffix_range(
+    range: &str,
+    file_size: u64,
+) -> anyhow::Result<Option<String>> {
+    if !range.starts_with("bytes=-") {
+        return Ok(None);
+    }
+    let (start, end) = parse_range(range, file_size)?;
+    Ok(Some(format!("bytes={start}-{end}")))
+}
+
 #[async_trait]
 impl StreamSource for TorrentSource {
     async fn serve(&self, state: &AppState, headers: &HeaderMap) -> Result<Response> {
@@ -1427,7 +1441,41 @@ impl StreamSource for TorrentSource {
                 .context_bad_request("failed to resolve torrent");
             }
         };
-        let requested_range = headers
+        let mut effective_headers = headers.clone();
+        if let Some(range) = headers
+            .get(http::header::RANGE)
+            .and_then(|value| {
+                value
+                    .to_str()
+                    .ok()
+            })
+            .filter(|range| range.starts_with("bytes=-"))
+        {
+            let file_size = torrent
+                .prefetch_status(
+                    &self.info_hash,
+                    Some(selected_file_idx),
+                    self.file_hint
+                        .as_deref(),
+                )
+                .map(|status| status.current_total_bytes)
+                .unwrap_or_default();
+            if file_size == 0 {
+                return Err(torrent_source_buffering(anyhow::anyhow!(
+                    "selected torrent file size is not available for suffix range"
+                )));
+            }
+            let normalized = normalize_torrent_suffix_range(range, file_size)
+                .context_bad_request("invalid torrent suffix Range header")?
+                .expect("suffix range was provided");
+            effective_headers.insert(
+                http::header::RANGE,
+                normalized
+                    .parse()
+                    .expect("numeric byte range fits HTTP header"),
+            );
+        }
+        let requested_range = effective_headers
             .get(http::header::RANGE)
             .and_then(|value| {
                 value
@@ -1461,7 +1509,7 @@ impl StreamSource for TorrentSource {
             request_headers: Default::default(),
             response_headers: Default::default(),
         }
-        .serve_inner(headers, true)
+        .serve_inner(&effective_headers, true)
         .await?;
         let (parts, body) = response.into_parts();
         let stream = async_stream::stream! {
@@ -1550,8 +1598,8 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 mod tests {
     use super::{
         HttpSource, STREAM_PROXY_CLIENT, StreamDescriptor, TorrentSource, TrackerUrl,
-        is_tracker_url, mime_from_path, parse_open_or_finite_range, parse_range,
-        upstream_range_matches_start,
+        is_tracker_url, mime_from_path, normalize_torrent_suffix_range,
+        parse_open_or_finite_range, parse_range, upstream_range_matches_start,
     };
     use std::path::Path;
 
@@ -1674,6 +1722,67 @@ mod tests {
                 .detail()
                 .contains("retry")
         );
+    }
+
+    #[test]
+    fn torrent_suffix_range_normalizes_to_selected_file_offsets() {
+        assert_eq!(
+            normalize_torrent_suffix_range("bytes=-128", 1024).unwrap(),
+            Some("bytes=896-1023".to_string())
+        );
+        assert_eq!(
+            normalize_torrent_suffix_range("bytes=-2048", 1024).unwrap(),
+            Some("bytes=0-1023".to_string())
+        );
+        assert!(normalize_torrent_suffix_range("bytes=-0", 1024).is_err());
+        assert!(normalize_torrent_suffix_range("bytes=-128", 0).is_err());
+        assert_eq!(
+            normalize_torrent_suffix_range("bytes=896-1023", 1024).unwrap(),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn torrent_suffix_seek_returns_only_requested_tail_bytes() {
+        let server = httpmock::MockServer::start();
+        let requested = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/suffix.mkv")
+                .header("Range", "bytes=896-");
+            then.status(206)
+                .header("Content-Range", "bytes 896-1023/1024")
+                .body(vec![b's'; 128]);
+        });
+        let source = HttpSource {
+            url: format!("{}/suffix.mkv", server.base_url()),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        let converted = normalize_torrent_suffix_range("bytes=-128", 1024)
+            .unwrap()
+            .unwrap();
+        headers.insert(
+            http::header::RANGE,
+            converted
+                .parse()
+                .unwrap(),
+        );
+        let response = source
+            .serve_inner(&headers, true)
+            .await
+            .unwrap();
+        requested.assert();
+        assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_RANGE],
+            "bytes 896-1023/1024"
+        );
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "128");
+        let body = axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), &[b's'; 128]);
     }
 
     #[test]
