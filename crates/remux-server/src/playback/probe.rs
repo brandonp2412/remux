@@ -2049,10 +2049,39 @@ async fn verify_local_p2p_range(
     Ok(())
 }
 
+// For a resumed episode, warm the backup's estimated playback offset as well
+// as its container header. The previously header-only warmup wasted the
+// primary's probe window on bytes a resumed player would not consume.
+fn fallback_prewarm_ranges(
+    stream: &db::Media,
+    start_time_ticks: Option<i64>,
+) -> Vec<(u64, u64)> {
+    let mut ranges = vec![(0, P2P_READINESS_PROOF_BYTES - 1)];
+    let mut source = api::MediaSourceInfo::from(stream.clone());
+    source.size = source
+        .size
+        .or_else(|| {
+            stream
+                .stream_info
+                .as_ref()
+                .and_then(|info| info.size)
+        });
+    source.run_time_ticks = source
+        .run_time_ticks
+        .or_else(|| {
+            stream
+                .runtime
+                .and_then(|seconds| seconds.checked_mul(10_000_000))
+        });
+    if let Some(start) = resume_range_start(&source, start_time_ticks) {
+        ranges.push((start, start + P2P_READINESS_PROOF_BYTES - 1));
+    }
+    ranges
+}
+
 // Prewarm a *single* P2P fallback while the primary is being probed. This
-// allows both swarms to acquire their startup pieces within the existing
-// PlaybackInfo budget, instead of serially starting the fallback after a
-// cold primary has exhausted its deadline.
+// allows both swarms to acquire their startup and resume pieces within the
+// existing PlaybackInfo budget.
 fn is_local_p2p_prewarm_url(stream: &db::Media, url: &str) -> bool {
     stream
         .stream_info
@@ -2301,10 +2330,10 @@ where
                 .map(|(m, u)| (m, Some(u))),
         )
         .collect();
-    // Start the first local P2P backup immediately, rather than waiting until
-    // the primary probe times out. The bounded range read also prioritizes the
-    // backup's first pieces. Never prewarm remote URLs or non-P2P sources.
-    let backup_url = if primary
+    // Start one local P2P backup immediately. Warm its header and, when the
+    // source size/runtime are known, its resume range in parallel; neither may
+    // block the other. Never prewarm remote URLs or non-P2P sources.
+    let backup = if primary
         .stream_info
         .as_ref()
         .is_some_and(|info| info.is_p2p())
@@ -2315,26 +2344,44 @@ where
             .find_map(|(stream, url)| {
                 url.as_ref()
                     .filter(|url| is_local_p2p_prewarm_url(stream, url))
-                    .cloned()
+                    .map(|url| {
+                        (
+                            url.clone(),
+                            fallback_prewarm_ranges(stream, start_time_ticks),
+                        )
+                    })
             })
     } else {
         None
     };
-    let _prewarm = AbortPrewarm(backup_url.map(|url| {
+    let _prewarm = AbortPrewarm(backup.map(|(url, ranges)| {
         tokio::spawn(async move {
-            let response = reqwest::Client::new()
-                .get(&url)
-                .header(reqwest::header::RANGE, "bytes=0-1048575")
-                .timeout(std::time::Duration::from_secs(35))
-                .send()
-                .await;
-            if let Ok(response) = response {
-                if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-                    let _ = response
-                        .bytes()
+            let client = reqwest::Client::new();
+            let mut tasks = tokio::task::JoinSet::new();
+            for (start, end) in ranges {
+                let client = client.clone();
+                let url = url.clone();
+                tasks.spawn(async move {
+                    let response = client
+                        .get(&url)
+                        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+                        .timeout(std::time::Duration::from_secs(35))
+                        .send()
                         .await;
-                }
+                    if let Ok(response) = response {
+                        if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                            let _ = response
+                                .bytes()
+                                .await;
+                        }
+                    }
+                });
             }
+            while tasks
+                .join_next()
+                .await
+                .is_some()
+            {}
         })
     }));
     let total_available = probe_pool.len();
@@ -3564,6 +3611,34 @@ mod probe_tests {
             &http_media("https://example.org/movie.mkv"),
             "http://127.0.0.1:3100/stream/abc"
         ));
+    }
+
+    #[test]
+    fn fallback_prewarm_targets_resume_and_header_when_size_is_known() {
+        let mut torrent = p2p_media();
+        torrent.runtime = Some(660);
+        torrent
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(660_000_000);
+        assert_eq!(
+            fallback_prewarm_ranges(&torrent, Some(330 * 10_000_000)),
+            vec![(0, 1_048_575), (330_000_000, 331_048_575)]
+        );
+        assert_eq!(
+            fallback_prewarm_ranges(&torrent, Some(0)),
+            vec![(0, 1_048_575)]
+        );
+        torrent
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = None;
+        assert_eq!(
+            fallback_prewarm_ranges(&torrent, Some(330 * 10_000_000)),
+            vec![(0, 1_048_575)]
+        );
     }
 
     #[test]
