@@ -33,7 +33,12 @@ a seek worked. Two distinct film scenes were inspected, with no autonomous
 buffering or further fallback. Torrent hash: be7584dc197928b8dae4fe8bee66247b119e09d5.
 
 The source is viable and the exact episode is marked `resolved_verified`.
-An unrelated Gumball cold resume on the same candidate is in progress.
+An unrelated Gumball cold resume on the same candidate failed after 73.561 seconds.
+A warmed retry selected in 22.461 seconds and started HEVC telemetry in 23.534
+seconds, but interrupted for approximately 26 seconds before recovery. Two
+distinct decoded scenes, advancing position 326.993 -> 342.592 seconds and active
+HDMI audio were inspected. This proves source viability, not a cold-start fix.
+The cold resume/range readiness entry stays open.
 
 ## Ledger classifications so far
 
@@ -67,3 +72,11 @@ Screenshots/logcat/audio/session snapshots are on Glass in
 `physical-soak/ledger-20261018T1742`; corresponding server journals are on Nox.
 Screenshots and decoder/audio telemetry establish device-decoded playback only;
 no independent physical-panel/speaker observation is claimed.
+
+## Final checkpoint and scheduler handoff
+
+17 fresh device attempts: 4 decoded passes (including recovered/warm runs) and
+13 failures (11 source-unavailable, 2 startup failures). Manual isolated playback
+is stopped before the scheduler resumes. The replacement job prompt is tracked
+in `prompta-ledger-continuation-20261018.txt`; cadence remains 2700 seconds.
+Production was not changed. Candidate services/tunnel remain for continuation.
