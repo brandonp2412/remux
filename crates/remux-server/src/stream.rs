@@ -909,7 +909,11 @@ impl HttpSource {
             .clone();
         if let Some((start, _)) = requested_range {
             if upstream_status == http::StatusCode::PARTIAL_CONTENT
-                && !upstream_range_matches_start(&upstream_headers, start)
+                && !upstream_range_covers(
+                    &upstream_headers,
+                    start,
+                    requested_range.and_then(|(_, end)| end),
+                )
             {
                 return Err(torrent_source_buffering(anyhow::anyhow!(
                     "upstream returned incorrect Content-Range for requested byte {start}"
@@ -1004,6 +1008,16 @@ impl HttpSource {
 /// Partial responses must start at the requested byte; accepting another
 /// offset silently corrupts decoder input and makes seek checks false passes.
 fn upstream_range_matches_start(headers: &HeaderMap, start: u64) -> bool {
+    upstream_range_covers(headers, start, None)
+}
+
+/// A proxied finite range must not claim bytes the upstream 206 did not supply.
+/// Range ends beyond the file length may be clamped to the actual EOF.
+fn upstream_range_covers(
+    headers: &HeaderMap,
+    start: u64,
+    requested_end: Option<u64>,
+) -> bool {
     let Some(value) = headers
         .get(http::header::CONTENT_RANGE)
         .and_then(|value| {
@@ -1024,12 +1038,15 @@ fn upstream_range_matches_start(headers: &HeaderMap, start: u64) -> bool {
     let (Ok(first), Ok(last)) = (first.parse::<u64>(), last.parse::<u64>()) else {
         return false;
     };
+    let known_total = total
+        .parse::<u64>()
+        .ok();
+    let covered_end = requested_end
+        .map(|end| known_total.map_or(end, |length| end.min(length.saturating_sub(1))));
     first == start
         && last >= first
-        && (total == "*"
-            || total
-                .parse::<u64>()
-                .is_ok_and(|n| last < n))
+        && covered_end.is_none_or(|end| last >= end)
+        && (total == "*" || known_total.is_some_and(|length| last < length))
 }
 
 fn parse_open_or_finite_range(range: &str) -> Option<(u64, Option<u64>)> {
@@ -1893,6 +1910,78 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_rejects_partial_response_shorter_than_requested_range() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/short-range.mkv")
+                .header("Range", "bytes=1024-");
+            then.status(206)
+                .header("Content-Range", "bytes 1024-1100/3072")
+                .body(vec![b'x'; 77]);
+        });
+        let source = HttpSource {
+            url: format!("{}/short-range.mkv", server.base_url()),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            "bytes=1024-1279"
+                .parse()
+                .unwrap(),
+        );
+        let error = source
+            .serve_inner(&headers, true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_clamps_requested_range_to_real_eof() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/eof-range.mkv")
+                .header("Range", "bytes=1024-");
+            then.status(206)
+                .header("Content-Range", "bytes 1024-3071/3072")
+                .body(vec![b'z'; 2048]);
+        });
+        let source = HttpSource {
+            url: format!("{}/eof-range.mkv", server.base_url()),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            "bytes=1024-4095"
+                .parse()
+                .unwrap(),
+        );
+        let response = source
+            .serve_inner(&headers, true)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_RANGE],
+            "bytes 1024-3071/3072"
+        );
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "2048");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap()
+                .len(),
+            2048
+        );
     }
 
     #[tokio::test]
