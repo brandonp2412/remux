@@ -1759,10 +1759,45 @@ fn select_candidates(
         })
         .collect();
 
+    // With two P2P retries and one reserved lower-resolution rescue, there
+    // is only one same-tier slot. Waiting for a second same-tier retry to
+    // diversify means it never happens. After a non-AVC primary fails, spend
+    // that slot on a seeded encoded AVC release when one is available.
+    // Keep the normal order when the primary is AVC or no such release exists.
+    let avc_first = pri_p2p
+        && torrent_codec_family(primary)
+            .is_some_and(|codec| codec != TorrentCodecFamily::Avc);
+    let first_same_tier = avc_first
+        .then(|| {
+            same_tier
+                .iter()
+                .copied()
+                .find(|candidate| {
+                    torrent_codec_family(candidate) == Some(TorrentCodecFamily::Avc)
+                        && candidate
+                            .stream_info
+                            .as_ref()
+                            .is_some_and(|info| {
+                                info.seeders
+                                    .unwrap_or(0)
+                                    >= 3
+                                    && !info
+                                        .filename
+                                        .as_deref()
+                                        .unwrap_or(&candidate.title)
+                                        .to_ascii_lowercase()
+                                        .contains("remux")
+                            })
+                })
+        })
+        .flatten()
+        .or_else(|| {
+            same_tier
+                .first()
+                .copied()
+        });
     if same_tier_budget > 0
-        && let Some(first) = same_tier
-            .first()
-            .copied()
+        && let Some(first) = first_same_tier
     {
         selected.push(first);
         if let Some(family) = torrent_codec_family(first)
@@ -3343,6 +3378,57 @@ mod probe_tests {
             result
                 .iter()
                 .all(|(media, _)| media.id != lower_id)
+        );
+    }
+
+    #[test]
+    fn two_retry_budget_diversifies_before_reserved_lower_resolution_rescue() {
+        let primary =
+            p2p_media_with_filename("The.Mentalist.S01E01.1080p.x265.mkv", 263);
+        let same_codec = p2p_media_with_filename(
+            "The.Mentalist.S01E01.1080p.x265-KONTRAST.mkv",
+            130,
+        );
+        let avc =
+            p2p_media_with_filename("The.Mentalist.S01E01.1080p.H.264-HHWEB.mkv", 57);
+        let lower = p2p_media_with_filename("The.Mentalist.S01E01.720p.x264.mkv", 233);
+        let pool = vec![same_codec.clone(), avc.clone(), lower.clone()];
+        let result = select_candidates(&primary, &pool, true, 2, false, 3000);
+        assert_eq!(
+            result
+                .iter()
+                .map(|(source, _)| source.id)
+                .collect::<Vec<_>>(),
+            vec![avc.id, lower.id]
+        );
+        let avc_primary =
+            p2p_media_with_filename("The.Mentalist.S01E01.1080p.x264.mkv", 263);
+        let result = select_candidates(&avc_primary, &pool, true, 2, false, 3000);
+        assert_eq!(
+            result[0]
+                .0
+                .id,
+            same_codec.id
+        );
+        let mut dead_avc = avc;
+        dead_avc
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .seeders = Some(0);
+        let result = select_candidates(
+            &primary,
+            &[same_codec.clone(), dead_avc, lower],
+            true,
+            2,
+            false,
+            3000,
+        );
+        assert_eq!(
+            result[0]
+                .0
+                .id,
+            same_codec.id
         );
     }
 
