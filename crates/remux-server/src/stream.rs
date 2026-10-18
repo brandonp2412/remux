@@ -1342,7 +1342,12 @@ impl StreamSource for TorrentSource {
             // Preserve verified pieces for a cold retry. The lease's normal
             // reconnect grace pauses an unused swarm without destroying data.
             drop(lease);
-            return Err(error).context_bad_request("torrent source is not ready");
+            return Err(axum_anyhow::ApiError::builder()
+                .status(http::StatusCode::SERVICE_UNAVAILABLE)
+                .title("P2P Source Buffering")
+                .detail("torrent source is not ready; retry after buffering")
+                .error(error)
+                .build());
         }
         if let Err(error) = torrent
             .enable_next_episode_prefetch(&self.info_hash, selected_file_idx)
@@ -1382,6 +1387,7 @@ impl StreamSource for TorrentSource {
 }
 
 pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
+    anyhow::ensure!(file_size > 0, "empty file has no satisfiable byte ranges");
     let bytes = range
         .strip_prefix("bytes=")
         .ok_or_else(|| anyhow::anyhow!("expected bytes= prefix"))?;
@@ -1391,10 +1397,12 @@ pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
 
     if start_str.is_empty() {
         let suffix: u64 = end_str.parse()?;
+        anyhow::ensure!(suffix > 0, "range suffix must be positive");
         return Ok((file_size.saturating_sub(suffix), file_size - 1));
     }
 
     let start: u64 = start_str.parse()?;
+    anyhow::ensure!(start < file_size, "range start is beyond end of file");
     let end: u64 = if end_str.is_empty() {
         file_size - 1
     } else {
@@ -1402,7 +1410,7 @@ pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
             .parse::<u64>()?
             .min(file_size - 1)
     };
-
+    anyhow::ensure!(start <= end, "range end precedes start");
     Ok((start, end))
 }
 
@@ -1447,7 +1455,7 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 mod tests {
     use super::{
         HttpSource, STREAM_PROXY_CLIENT, StreamDescriptor, TorrentSource, TrackerUrl,
-        is_tracker_url, mime_from_path,
+        is_tracker_url, mime_from_path, parse_range,
     };
     use std::path::Path;
 
@@ -1554,6 +1562,34 @@ mod tests {
                 .as_deref(),
             Some("720p")
         );
+    }
+
+    #[test]
+    fn parse_range_rejects_invalid_or_unsatisfiable_requests() {
+        for range in ["bytes=0-", "bytes=-1", "bytes=0-0"] {
+            assert!(parse_range(range, 0).is_err(), "{range} on empty file");
+        }
+        for range in [
+            "bytes=100-",
+            "bytes=100-150",
+            "bytes=7-6",
+            "bytes=-0",
+            "bytes=-",
+            "bytes=0-1,2-3",
+            "bytes=0-1-2",
+            "bytes=abc-",
+        ] {
+            assert!(parse_range(range, 100).is_err(), "{range}");
+        }
+    }
+
+    #[test]
+    fn parse_range_preserves_satisfiable_open_finite_and_suffix_requests() {
+        assert_eq!(parse_range("bytes=0-", 100).unwrap(), (0, 99));
+        assert_eq!(parse_range("bytes=5-10", 100).unwrap(), (5, 10));
+        assert_eq!(parse_range("bytes=90-150", 100).unwrap(), (90, 99));
+        assert_eq!(parse_range("bytes=-25", 100).unwrap(), (75, 99));
+        assert_eq!(parse_range("bytes=-150", 100).unwrap(), (0, 99));
     }
 
     #[test]
