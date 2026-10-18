@@ -866,6 +866,58 @@ impl TorrentSource {
     }
 }
 
+/// Keep torrent-specific header failures retryable. Generic HTTP streams have
+/// their own upstream availability semantics and should not inherit this cap.
+async fn send_proxy_request(
+    request: reqwest::RequestBuilder,
+    torrent: bool,
+    header_deadline: std::time::Duration,
+) -> Result<reqwest::Response> {
+    if !torrent {
+        return request
+            .send()
+            .await
+            .context_bad_request("upstream request failed");
+    }
+    tokio::time::timeout(header_deadline, request.send())
+        .await
+        .map_err(|_| {
+            torrent_source_buffering(anyhow::anyhow!(
+                "torrent proxy did not return response headers within {:.1}s",
+                header_deadline.as_secs_f64()
+            ))
+        })?
+        .map_err(|error| torrent_source_buffering(error.into()))
+}
+
+/// A stalled reader should fail its HTTP response stream instead of keeping
+/// the player on a permanent spinner. Each received chunk resets the deadline,
+/// so slow but progressing P2P downloads keep playing.
+fn guard_torrent_body(response: Response, inactivity: std::time::Duration) -> Response {
+    let (parts, body) = response.into_parts();
+    let stream = async_stream::stream! {
+        let mut source = body.into_data_stream();
+        loop {
+            match tokio::time::timeout(inactivity, source.next()).await {
+                Ok(Some(Ok(bytes))) => yield Ok::<Bytes, io::Error>(bytes),
+                Ok(Some(Err(error))) => {
+                    yield Err(io::Error::other(error));
+                    break;
+                }
+                Ok(None) => break,
+                Err(_) => {
+                    yield Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "torrent body made no progress within the inactivity deadline",
+                    ));
+                    break;
+                }
+            }
+        }
+    };
+    Response::from_parts(parts, Body::from_stream(stream))
+}
+
 impl HttpSource {
     async fn serve_inner(
         &self,
@@ -898,10 +950,15 @@ impl HttpSource {
             req = req.header(k.as_str(), v.as_str());
         }
 
-        let upstream = req
-            .send()
-            .await
-            .context_bad_request("upstream request failed")?;
+        // A verified startup range can still hang when the torrent engine
+        // opens a second reader for the actual player request. Do not let a
+        // headerless reconnect hold playback and source fallback indefinitely.
+        let upstream = send_proxy_request(
+            req,
+            bound_finite_ranges,
+            std::time::Duration::from_secs(12),
+        )
+        .await?;
 
         let upstream_status = upstream.status();
         let upstream_headers = upstream
@@ -1230,6 +1287,161 @@ fn prefetch_response(response: Response, max_bytes: usize) -> Response {
 }
 
 #[cfg(test)]
+mod torrent_stall_guard_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn torrent_header_timeout_is_retryable() {
+        let server = httpmock::MockServer::start();
+        let stalled = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/slow");
+            then.status(206)
+                .delay(std::time::Duration::from_millis(400));
+        });
+        let error = send_proxy_request(
+            STREAM_PROXY_CLIENT.get(format!("{}/slow", server.base_url())),
+            true,
+            std::time::Duration::from_millis(120),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        stalled.assert();
+    }
+
+    #[tokio::test]
+    async fn ordinary_http_is_not_subject_to_torrent_header_deadline() {
+        let server = httpmock::MockServer::start();
+        let delayed = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/ordinary");
+            then.status(200)
+                .delay(std::time::Duration::from_millis(100))
+                .body("ok");
+        });
+        let response = send_proxy_request(
+            STREAM_PROXY_CLIENT.get(format!("{}/ordinary", server.base_url())),
+            false,
+            std::time::Duration::from_millis(10),
+        )
+        .await
+        .unwrap();
+        assert_eq!(response.status(), http::StatusCode::OK);
+        delayed.assert();
+    }
+
+    #[tokio::test]
+    async fn stalled_torrent_body_fails_instead_of_hanging() {
+        let stream = async_stream::stream! {
+            yield Ok::<_, io::Error>(Bytes::from_static(b"ready"));
+            std::future::pending::<()>().await;
+        };
+        let response = guard_torrent_body(
+            Response::new(Body::from_stream(stream)),
+            std::time::Duration::from_millis(100),
+        );
+        let mut output = response
+            .into_body()
+            .into_data_stream();
+        assert_eq!(
+            output
+                .next()
+                .await
+                .unwrap()
+                .unwrap(),
+            "ready"
+        );
+        let stalled =
+            tokio::time::timeout(std::time::Duration::from_secs(1), output.next())
+                .await
+                .expect("stalled torrent body must have a deadline")
+                .expect("stalled torrent body must report an error");
+        assert!(stalled.is_err());
+        assert!(
+            output
+                .next()
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn stalled_prefetched_reader_is_released_for_source_fallback() {
+        struct DropSignal(Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for DropSignal {
+            fn drop(&mut self) {
+                if let Some(sender) = self
+                    .0
+                    .take()
+                {
+                    let _ = sender.send(());
+                }
+            }
+        }
+        let (released, observed_release) = tokio::sync::oneshot::channel();
+        let source = async_stream::stream! {
+            let _lease = DropSignal(Some(released));
+            yield Ok::<_, io::Error>(Bytes::from_static(b"ready"));
+            std::future::pending::<()>().await;
+        };
+        let guarded = guard_torrent_body(
+            Response::new(Body::from_stream(source)),
+            std::time::Duration::from_millis(100),
+        );
+        let output = prefetch_response(guarded, 8);
+        let mut chunks = output
+            .into_body()
+            .into_data_stream();
+        assert_eq!(
+            chunks
+                .next()
+                .await
+                .unwrap()
+                .unwrap(),
+            "ready"
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), chunks.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .is_err()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(1), observed_release)
+            .await
+            .expect("stall must release the upstream torrent lease")
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn progressing_torrent_body_resets_deadline_and_preserves_headers() {
+        let stream = async_stream::stream! {
+            for text in ["first", "second", "third"] {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                yield Ok::<_, io::Error>(Bytes::copy_from_slice(text.as_bytes()));
+            }
+        };
+        let response = Response::builder()
+            .status(http::StatusCode::PARTIAL_CONTENT)
+            .header(http::header::CONTENT_RANGE, "bytes 0-15/16")
+            .body(Body::from_stream(stream))
+            .unwrap();
+        let guarded =
+            guard_torrent_body(response, std::time::Duration::from_millis(45));
+        assert_eq!(guarded.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            guarded.headers()[http::header::CONTENT_RANGE],
+            "bytes 0-15/16"
+        );
+        let bytes = axum::body::to_bytes(guarded.into_body(), 100)
+            .await
+            .unwrap();
+        assert_eq!(bytes, "firstsecondthird");
+    }
+}
+
+#[cfg(test)]
 mod torrent_prefetch_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1519,7 +1731,10 @@ impl StreamSource for TorrentSource {
                 yield chunk;
             }
         };
-        let response = Response::from_parts(parts, Body::from_stream(stream));
+        let response = guard_torrent_body(
+            Response::from_parts(parts, Body::from_stream(stream)),
+            std::time::Duration::from_secs(45),
+        );
         let mib = state
             .ctx
             .config
