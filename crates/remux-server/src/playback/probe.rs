@@ -1844,9 +1844,35 @@ async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result
     Ok(())
 }
 
+/// Explicit P2P readiness failures and timeouts are retriable; malformed
+/// sources and ordinary probe/codec failures are not.
+fn is_retryable_p2p_probe_error(error: &anyhow::Error) -> bool {
+    if error
+        .chain()
+        .any(|cause| {
+            cause
+                .downcast_ref::<reqwest::Error>()
+                .is_some_and(|http_error| {
+                    http_error.is_timeout()
+                        || http_error.status()
+                            == Some(reqwest::StatusCode::SERVICE_UNAVAILABLE)
+                })
+        })
+    {
+        return true;
+    }
+    let message = error.to_string();
+    message.contains("503 Service Unavailable")
+        || message.contains("status=503")
+        || message.contains("deadline has elapsed")
+        || message.contains("timed out")
+        || message.contains("timeout")
+}
+
 /// Probe a stream URL, retrying with the next matching candidate on failure.
 ///
-/// Returns a 500 error if all candidates fail to probe.
+/// Returns 503 for exclusively transient P2P failures; definitive probe
+/// failures continue to return 500.
 async fn probe_with_fallback<F>(
     primary: db::Media,
     primary_url: Option<String>,
@@ -1889,6 +1915,10 @@ where
     let total_available = probe_pool.len();
     let total_attempts = all_to_try.len();
     let mut attempts = 0usize;
+    // A timed-out P2P source may still have viable peers and downloading pieces.
+    // Only report retryable buffering when *every* attempted source is P2P and
+    // none produced a definitive invalid-media or transport failure.
+    let mut pending_p2p_only = true;
     // Torrent startup depends on piece availability and can otherwise hold
     // PlaybackInfo for the full configured 60s per candidate. Keep real P2P
     // probing tightly bounded, with a slightly larger budget only for the final
@@ -1920,6 +1950,11 @@ where
             }
         };
         attempts += 1;
+        let is_p2p = stream
+            .stream_info
+            .as_ref()
+            .is_some_and(|info| info.is_p2p());
+        pending_p2p_only &= is_p2p;
         if let Some(cached) = stream
             .probe_data
             .as_ref()
@@ -1944,6 +1979,7 @@ where
                 }
                 Err(error) => {
                     warn!(id = %stream.id, %error, "cached torrent startup range was not ready");
+                    pending_p2p_only &= is_retryable_p2p_probe_error(&error);
                     continue;
                 }
             }
@@ -2055,9 +2091,11 @@ where
                 return Ok((probed, stream));
             }
             Ok(Ok(Err(e))) => {
+                pending_p2p_only &= is_retryable_p2p_probe_error(&e);
                 warn!(url = %url, error = %e, "probe failed");
             }
             Ok(Err(e)) => {
+                pending_p2p_only = false;
                 warn!(url = %url, error = %e, "probe task panicked");
             }
             Err(_) => {
@@ -2066,11 +2104,22 @@ where
         }
     }
 
-    Err(anyhow!(
+    let error = anyhow!(
         "all probe attempts failed for '{}' (tried {attempts} of {total_available} streams)",
         primary.full_title()
-    ))
-    .context_internal("stream probe failed — no usable streams found")
+    );
+    if attempts > 0 && pending_p2p_only {
+        // HTTP 500 incorrectly ends playback for a cold torrent that is still
+        // acquiring its sparse startup/resume pieces. This is retryable, not
+        // evidence that its peers or its media are permanently unusable.
+        return Err(axum_anyhow::ApiError::builder()
+            .status(http::StatusCode::SERVICE_UNAVAILABLE)
+            .title("P2P Source Buffering")
+            .detail("torrent startup range is still buffering; retry playback")
+            .error(error)
+            .build());
+    }
+    Err(error).context_internal("stream probe failed — no usable streams found")
 }
 
 #[cfg(test)]
@@ -2584,6 +2633,94 @@ mod probe_tests {
                 .id,
             lower_avc_id
         );
+    }
+
+    #[test]
+    fn p2p_transient_failures_are_retryable_not_permanent_source_failures() {
+        for message in [
+            "cached torrent startup range was not served: 503 Service Unavailable",
+            "torrent readiness timeout",
+            "deadline has elapsed",
+        ] {
+            assert!(
+                is_retryable_p2p_probe_error(&anyhow!("{message}")),
+                "{message}"
+            );
+        }
+        for message in ["invalid media format", "404 Not Found", "unsupported codec"] {
+            assert!(
+                !is_retryable_p2p_probe_error(&anyhow!("{message}")),
+                "{message}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn all_p2p_timeout_errors_return_retryable_buffering() {
+        let db = test_db().await;
+        let primary = p2p_media_with_filename("Show.S01E01.1080p.H264.mkv", 10);
+        let error = probe_with_fallback(
+            primary.clone(),
+            Some("http://127.0.0.1:3104/stream/probe-test".into()),
+            5,
+            false,
+            0,
+            &[primary],
+            false,
+            3104,
+            &db,
+            queued_probe(vec![Err(anyhow!("torrent readiness timeout"))]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.title(), "P2P Source Buffering");
+    }
+
+    #[tokio::test]
+    async fn invalid_p2p_source_retains_permanent_probe_failure_status() {
+        let db = test_db().await;
+        let primary = p2p_media_with_filename("Show.S01E01.1080p.H264.mkv", 10);
+        let error = probe_with_fallback(
+            primary.clone(),
+            Some("http://127.0.0.1:3104/stream/probe-test".into()),
+            5,
+            false,
+            0,
+            &[primary],
+            false,
+            3104,
+            &db,
+            queued_probe(vec![Err(anyhow!("invalid media format"))]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[tokio::test]
+    async fn invalid_p2p_fallback_prevents_false_buffering_verdict() {
+        let db = test_db().await;
+        let primary = p2p_media_with_filename("Show.S01E01.1080p.H264.mkv", 10);
+        let fallback = p2p_media_with_filename("Show.S01E01.720p.H264.mkv", 5);
+        let error = probe_with_fallback(
+            primary.clone(),
+            Some("http://127.0.0.1:3104/stream/probe-test".into()),
+            5,
+            true,
+            1,
+            &[primary, fallback],
+            false,
+            3104,
+            &db,
+            queued_probe(vec![
+                Err(anyhow!("torrent readiness timeout")),
+                Err(anyhow!("invalid media format")),
+            ]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
