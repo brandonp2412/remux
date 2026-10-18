@@ -1272,6 +1272,15 @@ mod torrent_prefetch_tests {
     }
 }
 
+fn torrent_source_buffering(error: anyhow::Error) -> axum_anyhow::ApiError {
+    axum_anyhow::ApiError::builder()
+        .status(http::StatusCode::SERVICE_UNAVAILABLE)
+        .title("P2P Source Buffering")
+        .detail("torrent source is not ready; retry after buffering")
+        .error(error)
+        .build()
+}
+
 #[async_trait]
 impl StreamSource for TorrentSource {
     async fn serve(&self, state: &AppState, headers: &HeaderMap) -> Result<Response> {
@@ -1342,12 +1351,7 @@ impl StreamSource for TorrentSource {
             // Preserve verified pieces for a cold retry. The lease's normal
             // reconnect grace pauses an unused swarm without destroying data.
             drop(lease);
-            return Err(axum_anyhow::ApiError::builder()
-                .status(http::StatusCode::SERVICE_UNAVAILABLE)
-                .title("P2P Source Buffering")
-                .detail("torrent source is not ready; retry after buffering")
-                .error(error)
-                .build());
+            return Err(torrent_source_buffering(error));
         }
         if let Err(error) = torrent
             .enable_next_episode_prefetch(&self.info_hash, selected_file_idx)
@@ -1561,6 +1565,20 @@ mod tests {
             info.resolution_tag()
                 .as_deref(),
             Some("720p")
+        );
+    }
+
+    #[test]
+    fn unfinished_torrent_read_is_retryable_not_invalid_client_input() {
+        let error = super::torrent_source_buffering(anyhow::anyhow!(
+            "requested pieces unavailable"
+        ));
+        assert_eq!(error.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(error.title(), "P2P Source Buffering");
+        assert!(
+            error
+                .detail()
+                .contains("retry")
         );
     }
 
