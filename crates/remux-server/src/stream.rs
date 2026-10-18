@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::{io, path::PathBuf};
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio::sync::{OwnedSemaphorePermit, Semaphore, mpsc};
-use tokio_util::io::{ReaderStream, StreamReader};
+use tokio_util::io::ReaderStream;
 use uuid::Uuid;
 
 use crate::AppState;
@@ -918,6 +918,44 @@ fn guard_torrent_body(response: Response, inactivity: std::time::Duration) -> Re
     Response::from_parts(parts, Body::from_stream(stream))
 }
 
+/// A finite torrent seek must either deliver every advertised byte or report a
+/// body error. `AsyncReadExt::take` silently treats premature upstream EOF as
+/// success, leaving players stalled behind a false 206 Content-Length.
+fn bounded_torrent_range_body<S>(source: S, length: u64) -> Body
+where
+    S: futures_util::Stream<Item = std::result::Result<Bytes, io::Error>>
+        + Send
+        + 'static,
+{
+    let stream = async_stream::stream! {
+        let mut source = Box::pin(source);
+        let mut remaining = length;
+        while remaining > 0 {
+            match source.next().await {
+                Some(Ok(bytes)) if !bytes.is_empty() => {
+                    let count = bytes.len().min(usize::try_from(remaining).unwrap_or(usize::MAX));
+                    remaining -= count as u64;
+                    yield Ok::<Bytes, io::Error>(bytes.slice(..count));
+                }
+                Some(Ok(_)) => {}
+                Some(Err(error)) => {
+                    yield Err(error);
+                    return;
+                }
+                None => {
+                    tracing::warn!(missing_bytes = remaining, "upstream torrent range ended before requested bytes arrived");
+                    yield Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        format!("upstream torrent range ended with {remaining} bytes missing"),
+                    ));
+                    return;
+                }
+            }
+        }
+    };
+    Body::from_stream(stream)
+}
+
 impl HttpSource {
     async fn serve_inner(
         &self,
@@ -1013,7 +1051,7 @@ impl HttpSource {
             .bytes_stream()
             .map_err(io::Error::other);
         let body = if let Some((_, _, length)) = bounded_range {
-            Body::from_stream(ReaderStream::new(StreamReader::new(stream).take(length)))
+            bounded_torrent_range_body(stream, length)
         } else {
             Body::from_stream(stream)
         };
@@ -1543,6 +1581,79 @@ mod torrent_prefetch_tests {
                 .next()
                 .await
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn short_torrent_range_is_an_error_not_a_successful_206() {
+        let source = futures_util::stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"abc")),
+            Ok(Bytes::new()),
+        ]);
+        let mut output = bounded_torrent_range_body(source, 5).into_data_stream();
+        assert_eq!(
+            output
+                .next()
+                .await
+                .unwrap()
+                .unwrap(),
+            "abc"
+        );
+        let error = output
+            .next()
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("2 bytes missing")
+        );
+        assert!(
+            output
+                .next()
+                .await
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn finite_torrent_range_stops_at_requested_size() {
+        let source = futures_util::stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"abc")),
+            Ok(Bytes::from_static(b"defgh")),
+        ]);
+        let body = bounded_torrent_range_body(source, 5);
+        assert_eq!(
+            axum::body::to_bytes(body, 10)
+                .await
+                .unwrap()
+                .as_ref(),
+            b"abcde"
+        );
+    }
+
+    #[tokio::test]
+    async fn torrent_range_body_preserves_upstream_errors() {
+        let source = futures_util::stream::iter([
+            Ok::<_, io::Error>(Bytes::from_static(b"ab")),
+            Err(io::Error::new(io::ErrorKind::ConnectionReset, "peer left")),
+        ]);
+        let mut output = bounded_torrent_range_body(source, 5).into_data_stream();
+        assert_eq!(
+            output
+                .next()
+                .await
+                .unwrap()
+                .unwrap(),
+            "ab"
+        );
+        assert!(
+            output
+                .next()
+                .await
+                .unwrap()
+                .is_err()
         );
     }
 
