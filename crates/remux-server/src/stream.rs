@@ -1043,10 +1043,31 @@ fn upstream_range_covers(
         .ok();
     let covered_end = requested_end
         .map(|end| known_total.map_or(end, |length| end.min(length.saturating_sub(1))));
+    // HTTP 206 Content-Length describes the payload span, not the entire
+    // file. Reject contradictory metadata before we promise playable bytes
+    // downstream; a truncated seek otherwise fails only inside the decoder.
+    let span_length = last
+        .checked_sub(first)
+        .and_then(|length| length.checked_add(1));
+    let declared_length_matches = headers
+        .get(http::header::CONTENT_LENGTH)
+        .map_or(true, |header| {
+            header
+                .to_str()
+                .ok()
+                .and_then(|value| {
+                    value
+                        .parse::<u64>()
+                        .ok()
+                })
+                .zip(span_length)
+                .is_some_and(|(declared, span)| declared == span)
+        });
     first == start
         && last >= first
         && covered_end.is_none_or(|end| last >= end)
         && (total == "*" || known_total.is_some_and(|length| last < length))
+        && declared_length_matches
 }
 
 fn parse_open_or_finite_range(range: &str) -> Option<(u64, Option<u64>)> {
@@ -1940,6 +1961,66 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_rejects_inconsistent_partial_content_length() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/lying-range.mkv")
+                .header("Range", "bytes=1024-");
+            then.status(206)
+                // Declares 256 bytes in Content-Range, but advertises only
+                // 128 bytes in Content-Length. Never relay this as a valid seek.
+                .header("Content-Range", "bytes 1024-1279/3072")
+                .header("Content-Length", "128")
+                .body(vec![b'x'; 128]);
+        });
+        let source = HttpSource {
+            url: format!("{}/lying-range.mkv", server.base_url()),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            "bytes=1024-1279"
+                .parse()
+                .unwrap(),
+        );
+        let error = source
+            .serve_inner(&headers, true)
+            .await
+            .unwrap_err();
+        assert_eq!(error.status(), http::StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[test]
+    fn upstream_range_rejects_mismatched_length_and_accepts_chunked_partial() {
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::CONTENT_RANGE,
+            "bytes 1024-2047/4096"
+                .parse()
+                .unwrap(),
+        );
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            "1023"
+                .parse()
+                .unwrap(),
+        );
+        assert!(!super::upstream_range_covers(&headers, 1024, Some(2047)));
+        headers.insert(
+            http::header::CONTENT_LENGTH,
+            "1024"
+                .parse()
+                .unwrap(),
+        );
+        assert!(super::upstream_range_covers(&headers, 1024, Some(2047)));
+        headers.remove(http::header::CONTENT_LENGTH);
+        assert!(super::upstream_range_covers(&headers, 1024, Some(2047)));
     }
 
     #[tokio::test]
