@@ -11,6 +11,32 @@ use remux_sdks::{
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+#[derive(Debug)]
+pub(crate) struct P2pReadinessPending {
+    pub cached_bytes: u64,
+    pub total_bytes: u64,
+    pub download_mibps: f64,
+    pub live_peers: u64,
+}
+
+impl std::fmt::Display for P2pReadinessPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "P2P source is downloading but its playback range is not ready"
+        )
+    }
+}
+impl std::error::Error for P2pReadinessPending {}
+
+fn progressing_source(status: &crate::torrent::TorrentPrefetchStatus) -> bool {
+    !status.startup_ready
+        && status.current_total_bytes > 0
+        && status.current_cached_bytes >= 1024 * 1024
+        && status.live_peers > 0
+        && status.download_mibps >= 0.05
+}
+
 /// Result of probing a single stream candidate.
 pub(crate) struct ProbeResult {
     /// Probed source info with id/name/path/remux already stamped.
@@ -1102,8 +1128,68 @@ impl StreamService {
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
-            let (mut source, effective_stream) =
-                probed.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let (mut source, effective_stream) = match probed {
+                Ok(result) => result,
+                Err(error) => {
+                    // This is not a playable source yet. A verified, growing
+                    // selected-file download deserves Wait/Retry, not HTTP 500.
+                    // Missing peers, stale metadata and stalled downloads must
+                    // retain the ordinary failure path.
+                    if let Some(torrent) = self
+                        .ctx
+                        .torrent
+                        .read()
+                        .await
+                        .clone()
+                    {
+                        let pending = sel
+                            .probe_pool
+                            .iter()
+                            .filter_map(|candidate| {
+                                let info = candidate
+                                    .stream_info
+                                    .as_ref()?;
+                                let crate::stream::StreamDescriptor::Torrent {
+                                    info_hash,
+                                    file_hint,
+                                    file_idx,
+                                    ..
+                                } = &info.descriptor
+                                else {
+                                    return None;
+                                };
+                                torrent
+                                    .prefetch_status(
+                                        info_hash,
+                                        *file_idx,
+                                        file_hint.as_deref(),
+                                    )
+                                    .filter(progressing_source)
+                            })
+                            .max_by(|a, b| {
+                                a.download_mibps
+                                    .total_cmp(&b.download_mibps)
+                            });
+                        if let Some(status) = pending {
+                            warn!(
+                                cached_bytes = status.current_cached_bytes,
+                                total_bytes = status.current_total_bytes,
+                                download_mibps = status.download_mibps,
+                                live_peers = status.live_peers,
+                                "source still downloading after exhausted playback probes"
+                            );
+                            return Err(anyhow::Error::new(P2pReadinessPending {
+                                cached_bytes: status.current_cached_bytes,
+                                total_bytes: status.current_total_bytes,
+                                download_mibps: status.download_mibps,
+                                live_peers: status.live_peers,
+                            })
+                            .context(format!("playback probes exhausted: {error:?}")));
+                        }
+                    }
+                    return Err(anyhow::anyhow!("{error:?}"));
+                }
+            };
             // The probe failed over to another release, whose subtitles are
             // for a different file than the ones just fetched.
             if effective_stream.id != stream.id
@@ -2456,5 +2542,41 @@ mod tests {
             StreamService::selected_stream_for(ctx, "psid-group-request", group_a),
             Some(alive.id)
         );
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    fn status() -> crate::torrent::TorrentPrefetchStatus {
+        crate::torrent::TorrentPrefetchStatus {
+            current_cached_bytes: 8 * 1024 * 1024,
+            current_total_bytes: 100 * 1024 * 1024,
+            next_cached_bytes: None,
+            next_total_bytes: None,
+            download_mibps: 1.25,
+            live_peers: 2,
+            startup_required_bytes: Some(12 * 1024 * 1024),
+            startup_readable_bytes: Some(4 * 1024 * 1024),
+            startup_ready: false,
+        }
+    }
+
+    #[test]
+    fn only_measured_live_progress_is_retryable() {
+        let mut s = status();
+        assert!(progressing_source(&s));
+        s.startup_ready = true;
+        assert!(!progressing_source(&s));
+        s.startup_ready = false;
+        s.live_peers = 0;
+        assert!(!progressing_source(&s));
+        s.live_peers = 2;
+        s.download_mibps = 0.0;
+        assert!(!progressing_source(&s));
+        s.download_mibps = 1.0;
+        s.current_cached_bytes = 0;
+        assert!(!progressing_source(&s));
     }
 }

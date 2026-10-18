@@ -494,7 +494,32 @@ async fn items_playbackinfo_inner(
             }
         }
     );
-    let probed = probed?;
+    let probed = match probed {
+        Ok(probed) => probed,
+        Err(error) => {
+            if let Some(pending) = error
+                .downcast_ref::<crate::services::stream_service::P2pReadinessPending>(
+            ) {
+                warn!(
+                    cached_bytes = pending.cached_bytes,
+                    total_bytes = pending.total_bytes,
+                    download_mibps = pending.download_mibps,
+                    live_peers = pending.live_peers,
+                    "playback pending while source downloads"
+                );
+                return Ok((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(http::header::RETRY_AFTER, "10")],
+                    Json(json!({
+                        "ErrorCode": "P2P_SOURCE_BUFFERING",
+                        "Message": "Source is downloading slowly. Wait, then retry playback.",
+                        "RetryAfterSeconds": 10
+                    })),
+                ).into_response());
+            }
+            return Err(error.into());
+        }
+    };
     let item_runtime_seconds = subtitle_media
         .as_ref()
         .and_then(|item| item.runtime);
@@ -1055,7 +1080,7 @@ async fn items_playbackinfo_inner(
     };
 
     trace!(?info, "items_playbackinfo_result");
-    Ok(Json(info))
+    Ok(Json(info).into_response())
 }
 
 static NO_STREAMS_VIDEO: &[u8] = include_bytes!("../../assets/no-streams.mp4");
