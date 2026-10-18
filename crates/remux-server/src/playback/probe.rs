@@ -2115,13 +2115,19 @@ async fn verify_cached_p2p_playback_ranges(
     start_time_ticks: Option<i64>,
 ) -> Result<()> {
     tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
-        verify_local_p2p_range(url, timeout_secs, 0).await?;
+        // Both ranges are necessary, but independent. Request them concurrently:
+        // serial reads can exhaust the single probe budget on a cold resume.
         if let Some(resume_start) = resume_range_start(source, start_time_ticks) {
-            verify_local_p2p_range(url, timeout_secs, resume_start).await?;
+            tokio::try_join!(
+                verify_local_p2p_range(url, timeout_secs, 0),
+                verify_local_p2p_range(url, timeout_secs, resume_start),
+            )?;
             debug!(
                 resume_start,
                 start_time_ticks, "verified cached torrent resume range"
             );
+        } else {
+            verify_local_p2p_range(url, timeout_secs, 0).await?;
         }
         Ok::<(), anyhow::Error>(())
     })
@@ -2685,7 +2691,7 @@ mod probe_tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     async fn readiness_range_server(
-        statuses: Vec<u16>,
+        statuses: Vec<(u64, u16)>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2695,7 +2701,7 @@ mod probe_tests {
             .unwrap();
         let task = tokio::spawn(async move {
             let mut requests = Vec::new();
-            for status in statuses {
+            for _ in 0..statuses.len() {
                 let (mut socket, _) = listener
                     .accept()
                     .await
@@ -2718,7 +2724,15 @@ mod probe_tests {
                         break;
                     }
                 }
-                requests.push(String::from_utf8_lossy(&request).to_ascii_lowercase());
+                let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                let status = statuses
+                    .iter()
+                    .find(|(start, _)| {
+                        request.contains(&format!("range: bytes={start}-"))
+                    })
+                    .map(|(_, status)| *status)
+                    .unwrap_or(400);
+                requests.push(request);
                 let body = if status == 206 {
                     vec![b'x'; P2P_READINESS_PROOF_BYTES as usize]
                 } else {
@@ -2820,7 +2834,8 @@ mod probe_tests {
 
     #[tokio::test]
     async fn cached_readiness_proves_startup_and_estimated_resume_ranges() {
-        let (url, server) = readiness_range_server(vec![206, 206]).await;
+        let (url, server) =
+            readiness_range_server(vec![(0, 206), (50_000_000, 206)]).await;
         let source = api::MediaSourceInfo {
             run_time_ticks: Some(1_000),
             size: Some(100_000_000),
@@ -2833,8 +2848,16 @@ mod probe_tests {
             .await
             .unwrap();
         assert_eq!(requests.len(), 2);
-        assert!(requests[0].contains("range: bytes=0-1048575"));
-        assert!(requests[1].contains("range: bytes=50000000-51048575"));
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.contains("range: bytes=0-1048575"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.contains("range: bytes=50000000-51048575"))
+        );
         assert!(
             requests
                 .iter()
@@ -2845,8 +2868,101 @@ mod probe_tests {
     }
 
     #[tokio::test]
+    async fn cached_readiness_requests_header_and_resume_without_serial_delay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!(
+            "http://{}/stream/test",
+            listener
+                .local_addr()
+                .unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0_u8; 4096];
+                    let count = socket
+                        .read(&mut buf)
+                        .await
+                        .unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buf[..count]);
+                    if request
+                        .windows(4)
+                        .any(|part| part == b"\r\n\r\n")
+                    {
+                        break;
+                    }
+                }
+                sockets.push((socket, String::from_utf8_lossy(&request).into_owned()));
+            }
+            // Neither range is served until both requests have been made.
+            for (socket, _) in &mut sockets {
+                let body = vec![b'x'; P2P_READINESS_PROOF_BYTES as usize];
+                let headers = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    body.len()
+                );
+                socket
+                    .write_all(headers.as_bytes())
+                    .await
+                    .unwrap();
+                socket
+                    .write_all(&body)
+                    .await
+                    .unwrap();
+                socket
+                    .shutdown()
+                    .await
+                    .unwrap();
+            }
+            sockets
+                .into_iter()
+                .map(|(_, req)| req)
+                .collect::<Vec<_>>()
+        });
+        let source = api::MediaSourceInfo {
+            run_time_ticks: Some(1_000),
+            size: Some(100_000_000),
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            verify_cached_p2p_playback_ranges(&url, 2, &source, Some(500)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let requests = server
+            .await
+            .unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r
+                    .to_ascii_lowercase()
+                    .contains("range: bytes=0-1048575"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r
+                    .to_ascii_lowercase()
+                    .contains("range: bytes=50000000-51048575"))
+        );
+    }
+
+    #[tokio::test]
     async fn cached_readiness_rejects_unavailable_resume_range() {
-        let (url, server) = readiness_range_server(vec![206, 503]).await;
+        let (url, server) =
+            readiness_range_server(vec![(0, 206), (50_000_000, 503)]).await;
         let source = api::MediaSourceInfo {
             run_time_ticks: Some(1_000),
             size: Some(100_000_000),
@@ -2864,7 +2980,11 @@ mod probe_tests {
             .await
             .unwrap();
         assert_eq!(requests.len(), 2);
-        assert!(requests[1].contains("range: bytes=50000000-51048575"));
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.contains("range: bytes=50000000-51048575"))
+        );
     }
 
     #[test]
