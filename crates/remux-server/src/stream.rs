@@ -990,12 +990,14 @@ fn parse_open_or_finite_range(range: &str) -> Option<(u64, Option<u64>)> {
     let start = start
         .parse()
         .ok()?;
-    let end = (!end.is_empty())
-        .then(|| {
+    let end = if end.is_empty() {
+        None
+    } else {
+        Some(
             end.parse()
-                .ok()
-        })
-        .flatten();
+                .ok()?,
+        )
+    };
     end.is_none_or(|end| end >= start)
         .then_some((start, end))
 }
@@ -1389,18 +1391,22 @@ pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
         .split_once('-')
         .ok_or_else(|| anyhow::anyhow!("malformed range"))?;
 
+    anyhow::ensure!(file_size > 0, "empty file has no satisfiable byte range");
+    let last = file_size - 1;
     if start_str.is_empty() {
         let suffix: u64 = end_str.parse()?;
-        return Ok((file_size.saturating_sub(suffix), file_size - 1));
+        anyhow::ensure!(suffix > 0, "suffix range must request at least one byte");
+        return Ok((file_size.saturating_sub(suffix), last));
     }
 
     let start: u64 = start_str.parse()?;
-    let end: u64 = if end_str.is_empty() {
-        file_size - 1
+    anyhow::ensure!(start < file_size, "range starts beyond end of file");
+    let end = if end_str.is_empty() {
+        last
     } else {
-        end_str
-            .parse::<u64>()?
-            .min(file_size - 1)
+        let requested_end = end_str.parse::<u64>()?;
+        anyhow::ensure!(requested_end >= start, "range end precedes start");
+        requested_end.min(last)
     };
 
     Ok((start, end))
@@ -1450,6 +1456,47 @@ mod tests {
         is_tracker_url, mime_from_path,
     };
     use std::path::Path;
+
+    #[test]
+    fn stream_range_parser_rejects_empty_and_invalid_ranges() {
+        for (value, size) in [
+            ("bytes=0-", 0),
+            ("bytes=-1", 0),
+            ("bytes=-0", 10),
+            ("bytes=10-", 10),
+            ("bytes=11-12", 10),
+            ("bytes=8-3", 10),
+            ("bytes=999-", 10),
+        ] {
+            assert!(
+                super::parse_range(value, size).is_err(),
+                "{value} with file size {size} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn stream_proxy_does_not_treat_invalid_end_as_open_ended() {
+        assert_eq!(
+            super::parse_open_or_finite_range("bytes=5-"),
+            Some((5, None))
+        );
+        assert_eq!(
+            super::parse_open_or_finite_range("bytes=5-9"),
+            Some((5, Some(9)))
+        );
+        for bad in ["bytes=5-bogus", "bytes=5-3", "bytes=5-9,12-18"] {
+            assert_eq!(super::parse_open_or_finite_range(bad), None);
+        }
+    }
+
+    #[test]
+    fn stream_range_parser_preserves_valid_start_end_and_suffix() {
+        assert_eq!(super::parse_range("bytes=0-", 10).unwrap(), (0, 9));
+        assert_eq!(super::parse_range("bytes=3-50", 10).unwrap(), (3, 9));
+        assert_eq!(super::parse_range("bytes=-4", 10).unwrap(), (6, 9));
+        assert_eq!(super::parse_range("bytes=-50", 10).unwrap(), (0, 9));
+    }
 
     #[test]
     fn high_bitrate_readiness_keeps_multiple_seconds_of_media() {
