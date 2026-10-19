@@ -2276,8 +2276,17 @@ async fn stremio_streams(
             .await
         {
             Ok(s) => {
-                streams_opt = Some(s);
-                break;
+                // Providers may return HTTP 200 with no playable streams for
+                // an unrecognized captured ID. Keep trying the remaining
+                // permitted identities rather than hiding a working alias.
+                if s.iter()
+                    .any(|stream| stream.is_valid())
+                {
+                    streams_opt = Some(s);
+                    break;
+                }
+                // Preserve a successful empty result if later IDs are missing.
+                streams_opt = Some(Vec::new());
             }
             Err(e) if is_404(&e) => {
                 last_err = Some(e);
@@ -2925,6 +2934,118 @@ mod tests {
         assert_eq!(streams[0].service_cached, Some(true));
         captured.assert();
         reconstructed.assert_hits(0);
+    }
+
+    async fn assert_stream_id_fallback_after_unusable_response(
+        first: serde_json::Value,
+    ) {
+        let server = httpmock::MockServer::start();
+        let captured = server.mock(|when, then| {
+            when.path("/stream/anime/fk-ep-1.json");
+            then.status(200)
+                .json_body(first);
+        });
+        let reconstructed = server.mock(|when, then| {
+            when.path("/stream/anime/fk:27:1:1.json");
+            then.status(200)
+                .json_body(serde_json::json!({"streams": [{
+                    "url": "https://example.com/recovered.mp4"
+                }]}));
+        });
+        let svc =
+            stremio_service::StremioService::from_url(&server.base_url()).unwrap();
+        let manifest_url = StremioManifestUrl::try_new(server.base_url()).unwrap();
+        let mut media = episode_media(db::ExternalIds {
+            custom_stremio_id: Some("fk-ep-1".into()),
+            custom_stremio_type: Some("anime".into()),
+            ..Default::default()
+        });
+        media.grandparent = Some(Arc::new(db::Media {
+            kind: db::MediaKind::Series,
+            external_ids: db::ExternalIds {
+                custom_stremio_id: Some("fk:27".into()),
+                custom_stremio_type: Some("anime".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        let streams = stremio_streams(&svc, &manifest_url, &media, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            streams.len(),
+            1,
+            "an empty or invalid earlier ID must not hide a playable later ID"
+        );
+        captured.assert();
+        reconstructed.assert();
+    }
+
+    #[tokio::test]
+    async fn stremio_streams_empty_captured_id_tries_reconstructed_id() {
+        assert_stream_id_fallback_after_unusable_response(
+            serde_json::json!({"streams": []}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stremio_streams_invalid_captured_streams_try_reconstructed_id() {
+        assert_stream_id_fallback_after_unusable_response(
+            serde_json::json!({"streams": [{"name": "No playable address"}]}),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn stremio_streams_empty_then_missing_preserves_empty_success() {
+        let server = httpmock::MockServer::start();
+        let captured = server.mock(|when, then| {
+            when.path("/stream/anime/fk-ep-1.json");
+            then.status(200)
+                .json_body(serde_json::json!({"streams": []}));
+        });
+        let reconstructed = server.mock(|when, then| {
+            when.path("/stream/anime/fk:27:1:1.json");
+            then.status(404);
+        });
+        let svc =
+            stremio_service::StremioService::from_url(&server.base_url()).unwrap();
+        let manifest_url = StremioManifestUrl::try_new(server.base_url()).unwrap();
+        let mut media = episode_media(db::ExternalIds {
+            custom_stremio_id: Some("fk-ep-1".into()),
+            custom_stremio_type: Some("anime".into()),
+            ..Default::default()
+        });
+        media.grandparent = Some(Arc::new(db::Media {
+            kind: db::MediaKind::Series,
+            external_ids: db::ExternalIds {
+                custom_stremio_id: Some("fk:27".into()),
+                custom_stremio_type: Some("anime".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        }));
+        // Start with a fresh lookup so caching cannot mask a forbidden ID
+        // request. The only allowed identity is the captured one.
+        let prefixes = vec!["fk-".to_string()];
+        assert!(
+            stremio_streams(&svc, &manifest_url, &media, Some(&prefixes))
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        captured.assert();
+        reconstructed.assert_hits(0);
+        // An allowed empty response followed by a missing alias remains a
+        // normal empty catalogue response, not a server error.
+        assert!(
+            stremio_streams(&svc, &manifest_url, &media, None)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        reconstructed.assert();
     }
 
     #[tokio::test]
