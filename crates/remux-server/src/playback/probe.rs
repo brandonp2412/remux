@@ -1832,6 +1832,35 @@ async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result
         "cached torrent startup range was not served: {}",
         response.status()
     );
+    let range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| {
+            value
+                .to_str()
+                .ok()
+        })
+        .and_then(|value| value.strip_prefix("bytes "))
+        .and_then(|value| value.split_once('/'))
+        .and_then(|(span, total)| {
+            let (start, end) = span.split_once('-')?;
+            Some((
+                start
+                    .parse::<u64>()
+                    .ok()?,
+                end.parse::<u64>()
+                    .ok()?,
+                total
+                    .parse::<u64>()
+                    .ok()?,
+            ))
+        });
+    anyhow::ensure!(
+        range.is_some_and(|(start, end, total)| {
+            start == 0 && end == (PROOF_BYTES as u64 - 1) && total > end
+        }),
+        "cached torrent startup response has invalid Content-Range"
+    );
     let bytes = response
         .bytes()
         .await?;
@@ -2621,6 +2650,7 @@ mod probe_tests {
     async fn startup_range_test_server(
         status: reqwest::StatusCode,
         body_size: usize,
+        content_range: Option<&'static str>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2630,7 +2660,19 @@ mod probe_tests {
             .unwrap();
         let app = axum::Router::new().route(
             "/stream/test",
-            axum::routing::get(move || async move { (status, vec![0_u8; body_size]) }),
+            axum::routing::get(move || async move {
+                use axum::response::IntoResponse;
+                let mut response = (status, vec![0_u8; body_size]).into_response();
+                if let Some(value) = content_range {
+                    response
+                        .headers_mut()
+                        .insert(
+                            axum::http::header::CONTENT_RANGE,
+                            axum::http::HeaderValue::from_static(value),
+                        );
+                }
+                response
+            }),
         );
         let task = tokio::spawn(async move {
             axum::serve(listener, app)
@@ -2645,6 +2687,7 @@ mod probe_tests {
         let (good_url, good_server) = startup_range_test_server(
             reqwest::StatusCode::PARTIAL_CONTENT,
             1024 * 1024,
+            Some("bytes 0-1048575/2097152"),
         )
         .await;
         assert!(
@@ -2654,8 +2697,12 @@ mod probe_tests {
         );
         good_server.abort();
 
-        let (bad_url, bad_server) =
-            startup_range_test_server(reqwest::StatusCode::OK, 1024 * 1024).await;
+        let (bad_url, bad_server) = startup_range_test_server(
+            reqwest::StatusCode::OK,
+            1024 * 1024,
+            Some("bytes 0-1048575/2097152"),
+        )
+        .await;
         assert!(
             verify_cached_p2p_startup_range(&bad_url, 3)
                 .await
@@ -2663,14 +2710,40 @@ mod probe_tests {
         );
         bad_server.abort();
 
-        let (short_url, short_server) =
-            startup_range_test_server(reqwest::StatusCode::PARTIAL_CONTENT, 1024).await;
+        let (short_url, short_server) = startup_range_test_server(
+            reqwest::StatusCode::PARTIAL_CONTENT,
+            1024,
+            Some("bytes 0-1023/2097152"),
+        )
+        .await;
         assert!(
             verify_cached_p2p_startup_range(&short_url, 3)
                 .await
                 .is_err()
         );
         short_server.abort();
+
+        for content_range in [
+            None,
+            Some("bytes 1024-1049599/2097152"),
+            Some("bytes 0-1048574/2097152"),
+            Some("bytes 0-1048575/1048575"),
+            Some("bytes nope-1048575/2097152"),
+        ] {
+            let (url, server) = startup_range_test_server(
+                reqwest::StatusCode::PARTIAL_CONTENT,
+                1024 * 1024,
+                content_range,
+            )
+            .await;
+            assert!(
+                verify_cached_p2p_startup_range(&url, 3)
+                    .await
+                    .is_err(),
+                "invalid Content-Range {content_range:?} must not establish cached torrent readiness"
+            );
+            server.abort();
+        }
     }
 
     #[tokio::test]
@@ -2686,6 +2759,7 @@ mod probe_tests {
         let (url, server) = startup_range_test_server(
             reqwest::StatusCode::PARTIAL_CONTENT,
             1024 * 1024,
+            Some("bytes 0-1048575/2097152"),
         )
         .await;
         let result = probe_with_fallback(
