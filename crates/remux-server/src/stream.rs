@@ -1382,6 +1382,7 @@ impl StreamSource for TorrentSource {
 }
 
 pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
+    anyhow::ensure!(file_size > 0, "cannot range-read an empty file");
     let bytes = range
         .strip_prefix("bytes=")
         .ok_or_else(|| anyhow::anyhow!("expected bytes= prefix"))?;
@@ -1391,10 +1392,12 @@ pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
 
     if start_str.is_empty() {
         let suffix: u64 = end_str.parse()?;
+        anyhow::ensure!(suffix > 0, "zero-length suffix range");
         return Ok((file_size.saturating_sub(suffix), file_size - 1));
     }
 
     let start: u64 = start_str.parse()?;
+    anyhow::ensure!(start < file_size, "range starts beyond end of file");
     let end: u64 = if end_str.is_empty() {
         file_size - 1
     } else {
@@ -1402,7 +1405,7 @@ pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
             .parse::<u64>()?
             .min(file_size - 1)
     };
-
+    anyhow::ensure!(start <= end, "range ends before it starts");
     Ok((start, end))
 }
 
@@ -1450,6 +1453,34 @@ mod tests {
         is_tracker_url, mime_from_path,
     };
     use std::path::Path;
+
+    #[test]
+    fn parse_range_rejects_unsatisfiable_seek_and_empty_files() {
+        for range in ["bytes=0-", "bytes=-1", "bytes=0-0"] {
+            assert!(super::parse_range(range, 0).is_err(), "{range}");
+        }
+        for range in [
+            "bytes=10-",
+            "bytes=10-11",
+            "bytes=5-4",
+            "bytes=-0",
+            "bytes=",
+            "bytes=1-2-3",
+            "bytes=1-2,4-5",
+            "items=0-1",
+        ] {
+            assert!(super::parse_range(range, 10).is_err(), "{range}");
+        }
+    }
+
+    #[test]
+    fn parse_range_clamps_valid_prefix_and_suffix_without_underflow() {
+        assert_eq!(super::parse_range("bytes=0-", 10).unwrap(), (0, 9));
+        assert_eq!(super::parse_range("bytes=2-100", 10).unwrap(), (2, 9));
+        assert_eq!(super::parse_range("bytes=-3", 10).unwrap(), (7, 9));
+        assert_eq!(super::parse_range("bytes=-100", 10).unwrap(), (0, 9));
+        assert_eq!(super::parse_range("bytes=9-9", 10).unwrap(), (9, 9));
+    }
 
     #[test]
     fn high_bitrate_readiness_keeps_multiple_seconds_of_media() {
