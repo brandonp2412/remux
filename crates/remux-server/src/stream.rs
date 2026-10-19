@@ -683,9 +683,9 @@ impl TorrentSource {
         {
             // Verify at least 80% of real-time throughput in the requested read.
             // Current swarm throughput can be zero when these bytes are cached.
-            // The tiny floor only rejects effectively dead peers; it must
-            // not exceed the required speed of low-bitrate video.
-            let minimum_sustainable = (playback_mibps * 0.8).max(0.06);
+            // Do not impose a fixed throughput floor: at low bitrates it can
+            // exceed the media rate and reject otherwise playable sources.
+            let minimum_sustainable = playback_mibps * 0.8;
             let needs_buffer = download_mibps < playback_mibps * 1.1;
             let seconds_to_buffer = if needs_buffer { 6.0 } else { 4.0 };
             // Keep a real multi-second media buffer for high-bitrate remuxes.
@@ -694,7 +694,7 @@ impl TorrentSource {
             let max_bytes = 128 * MIB;
             let startup_bytes = (playback_mibps * seconds_to_buffer * MIB as f64)
                 .ceil()
-                .clamp(MIB as f64, max_bytes as f64)
+                .clamp((MIB / 4) as f64, max_bytes as f64)
                 as usize;
             return Some((startup_bytes, minimum_sustainable, needs_buffer));
         }
@@ -1450,6 +1450,20 @@ mod tests {
         is_tracker_url, mime_from_path,
     };
     use std::path::Path;
+
+    #[test]
+    fn low_bitrate_readiness_does_not_require_faster_than_real_time() {
+        const MIB: usize = 1024 * 1024;
+        // 400 kbit/s video needs around 300 kB for a 6s startup buffer,
+        // not a fixed 1 MiB (~21 seconds) or a 0.06 MiB/s download.
+        let (bytes, minimum_mibps, buffering) =
+            TorrentSource::readiness_plan(Some(400_000), 0.04).unwrap();
+        assert!(buffering);
+        assert_eq!(bytes, 300_000);
+        let playback_mibps = 400_000.0 / 8.0 / MIB as f64;
+        assert!((minimum_mibps - playback_mibps * 0.8).abs() < 1e-10);
+        assert!(minimum_mibps < playback_mibps);
+    }
 
     #[test]
     fn high_bitrate_readiness_keeps_multiple_seconds_of_media() {
