@@ -625,6 +625,29 @@ impl TorrentSource {
                 "range at byte {start} returned HTTP {}",
                 response.status()
             );
+            // A 206 with the wrong Content-Range is not proof that the
+            // requested seek/startup offset is readable. Misrouted range
+            // responses otherwise falsely qualify stalled/sparse torrents.
+            if response.status() == http::StatusCode::PARTIAL_CONTENT {
+                let range = response
+                    .headers()
+                    .get(http::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| anyhow::anyhow!("range at byte {start} returned 206 without Content-Range"))?;
+                let (bounds, total) = range
+                    .strip_prefix("bytes ")
+                    .and_then(|value| value.split_once('/'))
+                    .ok_or_else(|| anyhow::anyhow!("malformed Content-Range: {range}"))?;
+                let (first, last) = bounds
+                    .split_once('-')
+                    .ok_or_else(|| anyhow::anyhow!("malformed Content-Range: {range}"))?;
+                let first: u64 = first.parse()?;
+                let last: u64 = last.parse()?;
+                anyhow::ensure!(
+                    first == start && last >= first && (total == "*" || total.parse::<u64>()? > last),
+                    "range at byte {start} returned mismatched Content-Range: {range}"
+                );
+            }
             let mut stream = response.bytes_stream();
             let mut received = 0usize;
             while received < bytes_needed {
@@ -1473,6 +1496,7 @@ mod tests {
             when.method(httpmock::Method::GET)
                 .path("/cached");
             then.status(206)
+                .header("Content-Range", format!("bytes 0-{}/{bytes}", bytes - 1))
                 .body(vec![0u8; bytes]);
         });
         let result = TorrentSource::probe_readable_range(
@@ -1497,6 +1521,10 @@ mod tests {
                 .path("/seek")
                 .header("Range", "bytes=3306-");
             then.status(206)
+                .header(
+                    "Content-Range",
+                    format!("bytes 3306-{}/{}", 3306 + bytes - 1, 3306 + bytes),
+                )
                 .body(vec![0u8; bytes]);
         });
         TorrentSource::probe_readable_range(
@@ -1635,6 +1663,58 @@ mod tests {
     #[test]
     fn stream_proxy_client_builds_without_panic() {
         let _ = &*STREAM_PROXY_CLIENT;
+    }
+
+    #[tokio::test]
+    async fn torrent_readiness_rejects_mismatched_seek_range() {
+        let server = httpmock::MockServer::start();
+        let payload = vec![b'x'; 4096];
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/seek.mkv")
+                .header("Range", "bytes=4096-");
+            then.status(206)
+                .header("Content-Range", "bytes 0-4095/16384")
+                .body(payload);
+        });
+        let result = TorrentSource::probe_readable_range(
+            &format!("{}/seek.mkv", server.base_url()),
+            4096,
+            1024,
+            0.0,
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("mismatched Content-Range")
+        );
+    }
+
+    #[tokio::test]
+    async fn torrent_readiness_accepts_matching_seek_range() {
+        let server = httpmock::MockServer::start();
+        let payload = vec![b'x'; 4096];
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/seek.mkv")
+                .header("Range", "bytes=4096-");
+            then.status(206)
+                .header("Content-Range", "bytes 4096-8191/16384")
+                .body(payload);
+        });
+        let (bytes, _) = TorrentSource::probe_readable_range(
+            &format!("{}/seek.mkv", server.base_url()),
+            4096,
+            1024,
+            0.0,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert!(bytes >= 1024);
     }
 
     #[tokio::test]
