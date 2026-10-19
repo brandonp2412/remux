@@ -1647,6 +1647,7 @@ mod tests {
         assert_eq!(super::parse_range("bytes=-3", 10).unwrap(), (7, 9));
         assert_eq!(super::parse_range("bytes=-100", 10).unwrap(), (0, 9));
         assert_eq!(super::parse_range("bytes=9-9", 10).unwrap(), (9, 9));
+    }
 
     #[test]
     fn low_bitrate_readiness_does_not_require_faster_than_real_time() {
