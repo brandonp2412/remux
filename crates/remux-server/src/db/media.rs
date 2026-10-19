@@ -1668,6 +1668,7 @@ fn subtitle_extraction_source_supported(
         descriptor,
         crate::stream::StreamDescriptor::Local(_)
             | crate::stream::StreamDescriptor::Opendal { .. }
+            | crate::stream::StreamDescriptor::Torrent { .. }
     )
 }
 
@@ -1677,14 +1678,14 @@ mod subtitle_extraction_source_tests {
     use crate::stream::StreamDescriptor;
 
     #[test]
-    fn torrent_is_ineligible_even_with_addon_opt_in() {
+    fn torrent_is_eligible_for_bounded_on_demand_extraction() {
         let torrent = StreamDescriptor::Torrent {
             info_hash: "a".repeat(40),
             file_hint: None,
             file_idx: None,
             trackers: vec![],
         };
-        assert!(!subtitle_extraction_source_supported(&torrent));
+        assert!(subtitle_extraction_source_supported(&torrent));
         assert!(!subtitle_extraction_source_supported(
             &StreamDescriptor::http("https://example.org/video.mkv",)
         ));
@@ -2140,12 +2141,11 @@ impl Media {
         )
     }
 
-    /// Extraction reads a complete file; reject torrents and network URLs
-    /// even if their addon opted in. Local/OpenDAL sources still require opt-in.
+    /// Torrent extraction is bounded and on demand at the subtitle endpoint.
+    /// HTTP/RTSP sources remain unsupported; every source requires addon opt-in.
     pub async fn allows_subtitle_extraction(&self, db: &SqlitePool) -> bool {
-        // Torrent streams are backed by incomplete, remotely fetched files.
-        // Reading them to EOF for a subtitle can stall the player for minutes.
-        // An addon's opt-in must not override this source-level restriction.
+        // HTTP and RTSP inputs cannot be bounded by torrent-specific handling.
+        // Eligible torrents are never automatically extracted at playback start.
         if self
             .stream_info
             .as_ref()
