@@ -155,6 +155,65 @@ mod internal_host_tests {
     }
 }
 
+#[cfg(test)]
+mod http_liveness_tests {
+    use super::StreamDescriptor;
+
+    #[tokio::test]
+    async fn cached_probe_rejects_http_200_error_documents_and_empty_bodies() {
+        let server = httpmock::MockServer::start();
+        for (path, content_type, body) in [
+            ("/login", "text/html; charset=utf-8", "<html>Sign in</html>"),
+            (
+                "/expired",
+                "application/problem+json",
+                r#"{"error":"expired"}"#,
+            ),
+            ("/json", "application/json", r#"{"error":"not found"}"#),
+            ("/empty", "video/mp4", ""),
+        ] {
+            server.mock(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(path)
+                    .header("Range", "bytes=0-0");
+                then.status(200)
+                    .header("Content-Type", content_type)
+                    .body(body);
+            });
+            assert!(
+                !StreamDescriptor::http(format!("{}{}", server.base_url(), path))
+                    .is_alive()
+                    .await,
+                "cached probe should reject {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_probe_keeps_real_ranged_video_and_unknown_media_types() {
+        let server = httpmock::MockServer::start();
+        for (path, content_type) in [
+            ("/video", "video/mp4"),
+            ("/stream", "application/octet-stream"),
+        ] {
+            server.mock(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(path)
+                    .header("Range", "bytes=0-0");
+                then.status(206)
+                    .header("Content-Type", content_type)
+                    .body(vec![0u8]);
+            });
+            assert!(
+                StreamDescriptor::http(format!("{}{}", server.base_url(), path))
+                    .is_alive()
+                    .await,
+                "cached probe should accept {path}"
+            );
+        }
+    }
+}
+
 fn deserialize_tracker_urls<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<TrackerUrl>, D::Error>
@@ -302,9 +361,32 @@ impl StreamDescriptor {
             .await
         {
             Ok(r) => {
-                r.status()
-                    .as_u16()
-                    < 400
+                if !r
+                    .status()
+                    .is_success()
+                    || r.content_length() == Some(0)
+                {
+                    return false;
+                }
+                // HTTP 200 is not evidence of video: expired CDN links can
+                // return an HTML login page or a JSON error document.
+                let content_type = r
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| {
+                        value
+                            .to_str()
+                            .ok()
+                    })
+                    .unwrap_or("")
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                !(content_type == "text/html"
+                    || content_type == "application/json"
+                    || content_type.ends_with("+json"))
             }
             Err(_) => false,
         }
