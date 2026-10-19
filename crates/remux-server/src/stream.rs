@@ -901,6 +901,42 @@ impl HttpSource {
         let upstream_headers = upstream
             .headers()
             .clone();
+        // For torrent reads the proxy must not accept a body from the wrong
+        // offset: it is opaque media bytes, not a seekable container response.
+        let upstream_range_end = if let Some((start, _)) = requested_range {
+            if upstream_status == http::StatusCode::PARTIAL_CONTENT {
+                let content_range = upstream_headers
+                    .get(http::header::CONTENT_RANGE)
+                    .and_then(|header| {
+                        header
+                            .to_str()
+                            .ok()
+                    })
+                    .and_then(parse_content_range)
+                    .ok_or_else(|| {
+                        anyhow::anyhow!("upstream 206 has no valid Content-Range")
+                    })
+                    .context_bad_request("invalid upstream byte range")?;
+                if content_range.0 != start {
+                    return Err(anyhow::anyhow!(
+                        "upstream range starts at {}, expected {start}",
+                        content_range.0
+                    )
+                    .into());
+                }
+                Some(content_range.1)
+            } else {
+                if start > 0 && upstream_status == http::StatusCode::OK {
+                    return Err(anyhow::anyhow!(
+                        "upstream ignored nonzero seek range starting at {start}"
+                    )
+                    .into());
+                }
+                None
+            }
+        } else {
+            None
+        };
         let total_length = upstream_headers
             .get(http::header::CONTENT_RANGE)
             .and_then(|value| {
@@ -920,8 +956,8 @@ impl HttpSource {
             })
             .map(|(start, end)| {
                 let requested_end = end.expect("filtered to finite range");
-                let end = total_length
-                    .map(|total| requested_end.min(total.saturating_sub(1)))
+                let end = upstream_range_end
+                    .map(|last| requested_end.min(last))
                     .unwrap_or(requested_end);
                 let length = end
                     .saturating_sub(start)
@@ -979,6 +1015,32 @@ impl HttpSource {
 
         Ok(resp)
     }
+}
+
+// A 206 from a P2P HTTP reader must describe the actual served bytes.
+fn parse_content_range(value: &str) -> Option<(u64, u64)> {
+    let (range, total) = value
+        .strip_prefix("bytes ")?
+        .split_once('/')?;
+    let (start, end) = range.split_once('-')?;
+    let start: u64 = start
+        .parse()
+        .ok()?;
+    let end: u64 = end
+        .parse()
+        .ok()?;
+    if end < start {
+        return None;
+    }
+    if total != "*"
+        && total
+            .parse::<u64>()
+            .ok()?
+            <= end
+    {
+        return None;
+    }
+    Some((start, end))
 }
 
 fn parse_open_or_finite_range(range: &str) -> Option<(u64, Option<u64>)> {
@@ -1676,6 +1738,112 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_rejects_invalid_upstream_seek_range() {
+        for content_range in [
+            Some("bytes 0-255/1024"),
+            Some("bytes 128-255/200"),
+            Some("not a byte range"),
+            None,
+        ] {
+            let server = httpmock::MockServer::start();
+            server.mock(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/seek")
+                    .header("Range", "bytes=128-");
+                let mut then = then.status(206);
+                if let Some(range) = content_range {
+                    then = then.header("Content-Range", range);
+                }
+                then.body(vec![b'x'; 128]);
+            });
+            let source = HttpSource {
+                url: format!("{}/seek", server.base_url()),
+                request_headers: Default::default(),
+                response_headers: Default::default(),
+            };
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::RANGE,
+                http::HeaderValue::from_static("bytes=128-255"),
+            );
+            assert!(
+                source
+                    .serve_inner(&headers, true)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_rejects_upstream_ignoring_nonzero_seek() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/seek")
+                .header("Range", "bytes=128-");
+            then.status(200)
+                .body(vec![b'x'; 1024]);
+        });
+        let source = HttpSource {
+            url: format!("{}/seek", server.base_url()),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=128-255"),
+        );
+        assert!(
+            source
+                .serve_inner(&headers, true)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_bounds_finite_range_to_upstream_last_byte() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/seek")
+                .header("Range", "bytes=128-");
+            then.status(206)
+                .header("Content-Range", "bytes 128-191/1024")
+                .body(vec![b'x'; 64]);
+        });
+        let source = HttpSource {
+            url: format!("{}/seek", server.base_url()),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=128-255"),
+        );
+        let response = source
+            .serve_inner(&headers, true)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_RANGE],
+            "bytes 128-191/1024"
+        );
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "64");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .len(),
+            64
+        );
     }
 
     #[tokio::test]
