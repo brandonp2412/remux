@@ -931,6 +931,15 @@ impl HttpSource {
                     )
                     .into());
                 }
+                if !valid_partial_content_length(
+                    content_range,
+                    upstream_headers.get(http::header::CONTENT_LENGTH),
+                ) {
+                    return Err(anyhow::anyhow!(
+                        "upstream Content-Length contradicts its Content-Range"
+                    )
+                    .into());
+                }
                 Some(content_range.1)
             } else {
                 if start > 0 && upstream_status == http::StatusCode::OK {
@@ -1048,6 +1057,29 @@ fn parse_content_range(value: &str) -> Option<(u64, u64)> {
         return None;
     }
     Some((start, end))
+}
+
+fn valid_partial_content_length(
+    (start, end): (u64, u64),
+    content_length: Option<&http::HeaderValue>,
+) -> bool {
+    let Some(range_length) = end
+        .checked_sub(start)
+        .and_then(|span| span.checked_add(1))
+    else {
+        return false;
+    };
+    content_length.is_none_or(|length| {
+        length
+            .to_str()
+            .ok()
+            .and_then(|value| {
+                value
+                    .parse::<u64>()
+                    .ok()
+            })
+            == Some(range_length)
+    })
 }
 
 fn parse_open_or_finite_range(range: &str) -> Option<(u64, Option<u64>)> {
@@ -1516,7 +1548,7 @@ fn extract_query_param(url: &str, param: &str) -> Option<String> {
 mod tests {
     use super::{
         HttpSource, STREAM_PROXY_CLIENT, StreamDescriptor, TorrentSource, TrackerUrl,
-        is_tracker_url, mime_from_path,
+        is_tracker_url, mime_from_path, valid_partial_content_length,
     };
     use std::path::Path;
 
@@ -1745,6 +1777,23 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.len(), 1024);
+    }
+
+    #[test]
+    fn torrent_proxy_checks_partial_length_against_advertised_range() {
+        let range = (128, 191);
+        assert!(valid_partial_content_length(range, None));
+        assert!(valid_partial_content_length(
+            range,
+            Some(&http::HeaderValue::from_static("64"))
+        ));
+        for length in ["0", "63", "65", "invalid"] {
+            assert!(!valid_partial_content_length(
+                range,
+                Some(&http::HeaderValue::from_str(length).unwrap())
+            ));
+        }
+        assert!(!valid_partial_content_length((0, u64::MAX), None));
     }
 
     #[tokio::test]
