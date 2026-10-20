@@ -1832,6 +1832,33 @@ async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result
         "cached torrent startup range was not served: {}",
         response.status()
     );
+    // Even a byte-complete 206 can be an upstream proxy's padded error page.
+    // Missing or binary media content types are acceptable; known text/JSON/XML
+    // response types cannot establish a usable torrent startup range.
+    if let Some(content_type) = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| {
+            value
+                .to_str()
+                .ok()
+        })
+    {
+        let kind = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        anyhow::ensure!(
+            !kind.starts_with("text/")
+                && kind != "application/json"
+                && !kind.ends_with("+json")
+                && kind != "application/xml"
+                && !kind.ends_with("+xml"),
+            "cached torrent startup range returned an error-document Content-Type: {content_type}"
+        );
+    }
     let range = response
         .headers()
         .get(reqwest::header::CONTENT_RANGE)
@@ -2651,6 +2678,7 @@ mod probe_tests {
         status: reqwest::StatusCode,
         body_size: usize,
         content_range: Option<&'static str>,
+        content_type: Option<&'static str>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -2671,6 +2699,14 @@ mod probe_tests {
                             axum::http::HeaderValue::from_static(value),
                         );
                 }
+                if let Some(value) = content_type {
+                    response
+                        .headers_mut()
+                        .insert(
+                            axum::http::header::CONTENT_TYPE,
+                            axum::http::HeaderValue::from_static(value),
+                        );
+                }
                 response
             }),
         );
@@ -2688,6 +2724,7 @@ mod probe_tests {
             reqwest::StatusCode::PARTIAL_CONTENT,
             1024 * 1024,
             Some("bytes 0-1048575/2097152"),
+            None,
         )
         .await;
         assert!(
@@ -2701,6 +2738,7 @@ mod probe_tests {
             reqwest::StatusCode::OK,
             1024 * 1024,
             Some("bytes 0-1048575/2097152"),
+            None,
         )
         .await;
         assert!(
@@ -2714,6 +2752,7 @@ mod probe_tests {
             reqwest::StatusCode::PARTIAL_CONTENT,
             1024,
             Some("bytes 0-1023/2097152"),
+            None,
         )
         .await;
         assert!(
@@ -2734,6 +2773,7 @@ mod probe_tests {
                 reqwest::StatusCode::PARTIAL_CONTENT,
                 1024 * 1024,
                 content_range,
+                None,
             )
             .await;
             assert!(
@@ -2744,6 +2784,43 @@ mod probe_tests {
             );
             server.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn cached_torrent_must_not_accept_padded_error_document() {
+        for content_type in [
+            "text/html; charset=utf-8",
+            "application/problem+json",
+            "application/json",
+        ] {
+            let (url, server) = startup_range_test_server(
+                reqwest::StatusCode::PARTIAL_CONTENT,
+                1024 * 1024,
+                Some("bytes 0-1048575/2097152"),
+                Some(content_type),
+            )
+            .await;
+            assert!(
+                verify_cached_p2p_startup_range(&url, 3)
+                    .await
+                    .is_err(),
+                "HTTP error document {content_type} must not prove torrent readiness"
+            );
+            server.abort();
+        }
+        let (url, server) = startup_range_test_server(
+            reqwest::StatusCode::PARTIAL_CONTENT,
+            1024 * 1024,
+            Some("bytes 0-1048575/2097152"),
+            Some("video/mp4"),
+        )
+        .await;
+        assert!(
+            verify_cached_p2p_startup_range(&url, 3)
+                .await
+                .is_ok()
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -2760,6 +2837,7 @@ mod probe_tests {
             reqwest::StatusCode::PARTIAL_CONTENT,
             1024 * 1024,
             Some("bytes 0-1048575/2097152"),
+            None,
         )
         .await;
         let result = probe_with_fallback(
