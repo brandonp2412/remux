@@ -2553,6 +2553,7 @@ mod readiness_tests {
 
     fn status() -> crate::torrent::TorrentPrefetchStatus {
         crate::torrent::TorrentPrefetchStatus {
+            session_torrent_id: 7,
             current_cached_bytes: 8 * 1024 * 1024,
             current_total_bytes: 100 * 1024 * 1024,
             next_cached_bytes: None,
