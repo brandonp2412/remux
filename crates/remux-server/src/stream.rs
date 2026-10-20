@@ -17,6 +17,9 @@ use uuid::Uuid;
 
 use crate::AppState;
 
+pub(crate) const PROBE_PLAYBACK_READINESS_HEADER: &str =
+    "x-remux-probe-playback-readiness";
+
 /// A BitTorrent tracker announce URL with a supported scheme and host. UDP
 /// trackers may omit a path, while HTTP trackers must name an announce path.
 /// Unrelated addon `sources` entries are rejected.
@@ -518,6 +521,18 @@ static AVAILABILITY_CLIENT: std::sync::LazyLock<reqwest::Client> =
             .expect("failed to build availability client")
     });
 
+// A successful torrent range proof remains valid for the same file and byte
+// offset while its session stays warm. Re-probing a large startup window for
+// every FFmpeg/player GET can starve the very reader it was meant to protect.
+static VERIFIED_TORRENT_RANGES: std::sync::LazyLock<
+    moka::sync::Cache<(String, usize, u64), usize>,
+> = std::sync::LazyLock::new(|| {
+    moka::sync::Cache::builder()
+        .max_capacity(4096)
+        .time_to_live(std::time::Duration::from_secs(90))
+        .build()
+});
+
 static STREAM_PROXY_CLIENT: std::sync::LazyLock<reqwest::Client> =
     std::sync::LazyLock::new(|| {
         reqwest::Client::builder()
@@ -609,6 +624,25 @@ impl TorrentSource {
         required_download_mibps: f64,
         wait: std::time::Duration,
     ) -> anyhow::Result<(usize, f64)> {
+        Self::probe_readable_range_with_progress(
+            resolved_url,
+            start,
+            bytes_needed,
+            required_download_mibps,
+            wait,
+            |_| {},
+        )
+        .await
+    }
+
+    async fn probe_readable_range_with_progress(
+        resolved_url: &str,
+        start: u64,
+        bytes_needed: usize,
+        required_download_mibps: f64,
+        wait: std::time::Duration,
+        mut on_progress: impl FnMut(usize),
+    ) -> anyhow::Result<(usize, f64)> {
         let started_at = tokio::time::Instant::now();
         let received = tokio::time::timeout(wait, async {
             let mut request = STREAM_PROXY_CLIENT.get(resolved_url);
@@ -632,6 +666,7 @@ impl TorrentSource {
                     break;
                 };
                 received = received.saturating_add(chunk?.len());
+                on_progress(received.min(bytes_needed));
             }
             anyhow::ensure!(
                 received >= bytes_needed,
@@ -654,14 +689,34 @@ impl TorrentSource {
         // A tiny client seek (especially the last few bytes of an MP4) can
         // never measure a meaningful MiB/s rate: HTTP request overhead alone
         // dominates. Require correct readable bytes, not an impossible
-        // throughput threshold, for ranges smaller than 64 KiB.
-        if bytes_needed >= 64 * 1024 {
+        // throughput threshold, for short metadata ranges (including an MKV tail).
+        if bytes_needed >= 256 * 1024 {
             anyhow::ensure!(
                 readable_mibps >= required_download_mibps,
                 "range at byte {start} read {received} bytes at {readable_mibps:.2} MiB/s, below required {required_download_mibps:.2} MiB/s"
             );
         }
         Ok((received, readable_mibps))
+    }
+
+    fn readiness_probe_bytes(
+        total_bytes: u64,
+        probe_start: u64,
+        probe_end: u64,
+        startup_target_bytes: usize,
+        require_playback_readiness: bool,
+    ) -> usize {
+        let available = total_bytes.saturating_sub(probe_start);
+        let requested = probe_end
+            .saturating_sub(probe_start)
+            .saturating_add(1);
+        let target = startup_target_bytes as u64;
+        let required = if require_playback_readiness {
+            target
+        } else {
+            requested.min(target)
+        };
+        usize::try_from(available.min(required)).unwrap_or(startup_target_bytes)
     }
 
     /// Size the verified contiguous startup buffer by *seconds of media*,
@@ -708,6 +763,8 @@ impl TorrentSource {
         torrent: &crate::torrent::TorrentManager,
         resolved_url: &str,
         requested_range: Option<&str>,
+        selected_file_idx: usize,
+        require_playback_readiness: bool,
     ) -> anyhow::Result<()> {
         // The final diversified PlaybackInfo recovery probe is allowed 35s.
         // Keep this inner readiness window long enough for a healthy cold swarm
@@ -771,13 +828,36 @@ impl TorrentSource {
                                 .current_total_bytes
                                 .saturating_sub(1),
                         ));
-                    let probe_bytes_needed = usize::try_from(
-                        probe_end
-                            .saturating_sub(probe_start)
-                            .saturating_add(1)
-                            .min(startup_target_bytes as u64),
-                    )
-                    .unwrap_or(startup_target_bytes);
+                    let probe_bytes_needed = Self::readiness_probe_bytes(
+                        status.current_total_bytes,
+                        probe_start,
+                        probe_end,
+                        startup_target_bytes,
+                        require_playback_readiness,
+                    );
+                    let cache_key = (
+                        self.info_hash
+                            .clone(),
+                        selected_file_idx,
+                        probe_start,
+                    );
+                    if VERIFIED_TORRENT_RANGES
+                        .get(&cache_key)
+                        .is_some_and(|verified_bytes| {
+                            verified_bytes >= probe_bytes_needed
+                        })
+                    {
+                        torrent.note_range_ready(&self.info_hash, selected_file_idx);
+                        tracing::debug!(info_hash = %self.info_hash, probe_start,
+                            probe_bytes_needed, "reusing verified torrent range for playback");
+                        return Ok(());
+                    }
+                    torrent.note_startup_progress(
+                        &self.info_hash,
+                        selected_file_idx,
+                        probe_bytes_needed as u64,
+                        0,
+                    );
                     let range_readable: anyhow::Result<(usize, f64)> = async {
                         let remaining = deadline
                             .saturating_duration_since(tokio::time::Instant::now());
@@ -785,13 +865,22 @@ impl TorrentSource {
                             !remaining.is_zero(),
                             "readiness budget exhausted before startup range check"
                         );
-                        let (startup_bytes, startup_read_mibps) =
-                            Self::probe_readable_range(
-                                resolved_url,
+                        let (startup_bytes, startup_read_mibps) = torrent
+                            .probe_stream_range(
+                                &self.info_hash,
+                                selected_file_idx,
                                 probe_start,
                                 probe_bytes_needed,
                                 required_download_mibps,
                                 remaining,
+                                |readable| {
+                                    torrent.note_startup_progress(
+                                        &self.info_hash,
+                                        selected_file_idx,
+                                        probe_bytes_needed as u64,
+                                        readable as u64,
+                                    )
+                                },
                             )
                             .await?;
 
@@ -806,6 +895,9 @@ impl TorrentSource {
 
                     match range_readable {
                         Ok((startup_bytes, startup_read_mibps)) => {
+                            VERIFIED_TORRENT_RANGES.insert(cache_key, startup_bytes);
+                            torrent
+                                .note_range_ready(&self.info_hash, selected_file_idx);
                             tracing::info!(
                                 cached_bytes = status.current_cached_bytes,
                                 total_bytes = status.current_total_bytes,
@@ -1244,6 +1336,32 @@ mod torrent_prefetch_tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
+    #[test]
+    fn internal_header_probe_requires_the_real_startup_buffer() {
+        const MIB: usize = 1024 * 1024;
+        let total = 100 * MIB as u64;
+        let bounded_end = MIB as u64 - 1;
+
+        assert_eq!(
+            TorrentSource::readiness_probe_bytes(total, 0, bounded_end, 6 * MIB, false),
+            MIB
+        );
+        assert_eq!(
+            TorrentSource::readiness_probe_bytes(total, 0, bounded_end, 6 * MIB, true),
+            6 * MIB
+        );
+        assert_eq!(
+            TorrentSource::readiness_probe_bytes(
+                3 * MIB as u64,
+                0,
+                bounded_end,
+                6 * MIB,
+                true
+            ),
+            3 * MIB
+        );
+    }
+
     #[tokio::test]
     async fn reads_ahead_without_client_polling_and_preserves_response() {
         let (sent, received) = tokio::sync::oneshot::channel();
@@ -1436,8 +1554,17 @@ impl StreamSource for TorrentSource {
                     .ok()
             });
         torrent.note_range_requested(&self.info_hash, selected_file_idx);
+        let require_playback_readiness = headers
+            .get(PROBE_PLAYBACK_READINESS_HEADER)
+            .is_some();
         if let Err(error) = self
-            .wait_until_ready(&torrent, &resolved, requested_range)
+            .wait_until_ready(
+                &torrent,
+                &resolved,
+                requested_range,
+                selected_file_idx,
+                require_playback_readiness,
+            )
             .await
         {
             // Preserve verified pieces for a cold retry. The lease's normal
@@ -1564,6 +1691,35 @@ mod tests {
         let playback_mibps = 400_000.0 / 8.0 / MIB as f64;
         assert!((minimum_mibps - playback_mibps * 0.8).abs() < 1e-10);
         assert!(minimum_mibps < playback_mibps);
+    }
+
+    #[test]
+    fn remembered_startup_range_is_specific_to_torrent_file_and_offset() {
+        let hash = uuid::Uuid::new_v4().to_string();
+        let key = (hash.clone(), 2, 0);
+        super::VERIFIED_TORRENT_RANGES.insert(key.clone(), 4 * 1024 * 1024);
+        assert!(
+            super::VERIFIED_TORRENT_RANGES
+                .get(&key)
+                .unwrap()
+                >= 4 * 1024 * 1024
+        );
+        assert!(
+            super::VERIFIED_TORRENT_RANGES
+                .get(&key)
+                .unwrap()
+                < 5 * 1024 * 1024
+        );
+        assert!(
+            super::VERIFIED_TORRENT_RANGES
+                .get(&(hash.clone(), 3, 0))
+                .is_none()
+        );
+        assert!(
+            super::VERIFIED_TORRENT_RANGES
+                .get(&(hash, 2, 100))
+                .is_none()
+        );
     }
 
     #[test]

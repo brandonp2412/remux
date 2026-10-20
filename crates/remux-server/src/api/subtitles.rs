@@ -99,10 +99,11 @@ struct ExtractableSubtitle {
     canvas: Option<(i64, i64)>,
 }
 
-/// How long an extraction may run before it's killed and its partial output
-/// discarded. Only local files are ever extracted, so this is generous.
+/// Bound local extraction separately from torrent reads that can await peers.
 const SUBTITLE_EXTRACTION_TIMEOUT: std::time::Duration =
     std::time::Duration::from_secs(600);
+const TORRENT_SUBTITLE_EXTRACTION_TIMEOUT: std::time::Duration =
+    std::time::Duration::from_secs(45);
 
 /// A batch extraction's outcome, shared across every caller waiting on the
 /// same in-flight run. `anyhow::Error` isn't `Clone` (required for `Shared`,
@@ -162,6 +163,7 @@ pub(crate) fn prefetch_embedded_subtitles(
             media_source_id,
             stream_index,
             cache_codec,
+            false,
         )
         .await
         {
@@ -254,6 +256,23 @@ fn extractable_subtitles(
             outputs
         })
         .collect()
+}
+
+/// Torrents extract only the requested subtitle, never the full embedded batch.
+/// Unknown text codecs are also isolated so they cannot spoil a good batch.
+fn solo_subtitle_index(
+    probe: &api::MediaSourceInfo,
+    stream_index: i64,
+    is_torrent: bool,
+) -> Option<i64> {
+    (is_torrent
+        || !probe
+            .media_streams
+            .iter()
+            .any(|s| {
+                s.index == stream_index && !s.is_external && is_known_text_codec(s)
+            }))
+    .then_some(stream_index)
 }
 
 /// Whether `stream` has a recognized text subtitle codec.
@@ -381,6 +400,7 @@ async fn extract_subtitles_to_cache(
     item_id: Uuid,
     media_source_id: Uuid,
     streams: &[ExtractableSubtitle],
+    timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     if streams.is_empty() {
         return Ok(());
@@ -413,15 +433,14 @@ async fn extract_subtitles_to_cache(
         });
     };
 
-    let output =
-        match tokio::time::timeout(SUBTITLE_EXTRACTION_TIMEOUT, cmd.output()).await {
-            Err(_) => {
-                delete_tmp_outputs(cache_paths);
-                anyhow::bail!("subtitle extraction timed out");
-            }
-            Ok(Err(e)) => anyhow::bail!("failed to run ffmpeg: {e}"),
-            Ok(Ok(output)) => output,
-        };
+    let output = match tokio::time::timeout(timeout, cmd.output()).await {
+        Err(_) => {
+            delete_tmp_outputs(cache_paths);
+            anyhow::bail!("subtitle extraction timed out");
+        }
+        Ok(Err(e)) => anyhow::bail!("failed to run ffmpeg: {e}"),
+        Ok(Ok(output)) => output,
+    };
 
     if !output
         .status
@@ -471,6 +490,7 @@ async fn ensure_subtitle_cached(
     media_source_id: Uuid,
     stream_index: i64,
     requested_cache_codec: api::SubtitleCodec,
+    is_torrent: bool,
 ) -> anyhow::Result<std::path::PathBuf> {
     let requested_path = subtitle_cache_path(
         data_dir,
@@ -495,14 +515,16 @@ async fn ensure_subtitle_cached(
         // the whole batch, losing every good track with it. Batch only known
         // text codecs; an unknown-codec track is extracted on its own, and only
         // when it's the one requested.
-        let solo = (!probe
-            .media_streams
-            .iter()
-            .any(|s| {
-                s.index == stream_index && !s.is_external && is_known_text_codec(s)
-            }))
-        .then_some(stream_index);
-        let key = (item_id, media_source_id, solo);
+        // Extract just the selected track from a torrent. A full 26-track
+        // batch reads much more data than necessary and competes with video.
+        let solo = solo_subtitle_index(probe, stream_index, is_torrent);
+        // Serialize all torrent extraction attempts for the same source.
+        // Another subtitle request will join, then retry its own track.
+        let key = (
+            item_id,
+            media_source_id,
+            if is_torrent { None } else { solo },
+        );
         let shared = {
             let mut inflight = SUBTITLE_EXTRACTION_INFLIGHT
                 .lock()
@@ -540,6 +562,11 @@ async fn ensure_subtitle_cached(
                             item_id,
                             media_source_id,
                             &missing,
+                            if is_torrent {
+                                TORRENT_SUBTITLE_EXTRACTION_TIMEOUT
+                            } else {
+                                SUBTITLE_EXTRACTION_TIMEOUT
+                            },
                         )
                         .await
                         .map_err(|e| e.to_string());
@@ -917,6 +944,15 @@ async fn subtitles_stream_inner(
                 .clone()
                 .unwrap_or_default();
             let dedup = SubtitleDedupSettings::from_config(&server_cfg);
+            let is_torrent = source
+                .stream_info
+                .as_ref()
+                .is_some_and(|si| {
+                    matches!(
+                        si.descriptor,
+                        crate::stream::StreamDescriptor::Torrent { .. }
+                    )
+                });
             // With dedup on, PlaybackInfo's embedded set depends on the add-on
             // list, so it's needed up front; otherwise only for an external.
             let mut subs = if dedup.enabled {
@@ -954,7 +990,11 @@ async fn subtitles_stream_inner(
                                 subtitle_mode,
                             )
                         });
-                    if let Some(ref subs) = subs {
+                    // Match PlaybackInfo: torrent embedded tracks are never
+                    // removed just because an external has the same language.
+                    if let Some(ref subs) = subs
+                        && dedup_embedded_subtitles(dedup.enabled, is_torrent)
+                    {
                         drop_unsupported_embedded_subtitles_with_external_match(
                             &mut probe,
                             subs,
@@ -1108,11 +1148,17 @@ async fn subtitles_stream_inner(
         })
         .context_not_found("media source has no URL")?;
 
-    // Defense in depth: a client can hit this endpoint directly with any
-    // stream_index, regardless of what delivery_method PlaybackInfo actually
-    // advertised (`apply_subtitle_delivery`'s upstream feasibility check).
-    // Never start an extraction — reading the whole remote file — for a
-    // remote source.
+    let is_torrent = media
+        .stream_info
+        .as_ref()
+        .is_some_and(|si| {
+            matches!(
+                si.descriptor,
+                crate::stream::StreamDescriptor::Torrent { .. }
+            )
+        });
+    // Defense in depth: all sources still require opt-in; HTTP/RTSP sources
+    // are never extracted. Torrent extraction is bounded and on demand.
     if !media
         .allows_subtitle_extraction(
             &state
@@ -1180,7 +1226,12 @@ async fn subtitles_stream_inner(
         ]);
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
-        let output = tokio::time::timeout(SUBTITLE_EXTRACTION_TIMEOUT, cmd.output())
+        let timeout = if is_torrent {
+            TORRENT_SUBTITLE_EXTRACTION_TIMEOUT
+        } else {
+            SUBTITLE_EXTRACTION_TIMEOUT
+        };
+        let output = tokio::time::timeout(timeout, cmd.output())
             .await
             .map_err(|_| anyhow!("subtitle extraction timed out"))?
             .map_err(|e| anyhow!("failed to run ffmpeg: {e}"))?;
@@ -1219,6 +1270,7 @@ async fn subtitles_stream_inner(
         media_source_id,
         stream_index,
         cache_codec,
+        is_torrent,
     )
     .await
     {
@@ -1280,6 +1332,12 @@ pub(crate) fn descriptor_to_subtitle_url(sub: &crate::addons::SubtitleInfo) -> S
 /// `max_external_subtitles_per_language`, resolved once per request so
 /// `append_external_subtitles` and the download endpoint's index
 /// reconstruction always agree on what was advertised.
+/// Torrent embedded tracks remain selectable even when an add-on supplies
+/// another subtitle in the same language.
+pub(crate) fn dedup_embedded_subtitles(enabled: bool, is_torrent: bool) -> bool {
+    enabled && !is_torrent
+}
+
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct SubtitleDedupSettings {
     /// When true: at most one subtitle per language, and a language already
@@ -1565,6 +1623,36 @@ mod tests {
     use http::header::HeaderValue;
 
     use crate::integration_test::{auth_header_with_token, authenticated_server};
+
+    #[test]
+    fn torrent_embedded_subtitles_survive_external_language_duplicates() {
+        assert!(!dedup_embedded_subtitles(true, true));
+        assert!(dedup_embedded_subtitles(true, false));
+        assert!(!dedup_embedded_subtitles(false, false));
+    }
+
+    #[test]
+    fn torrent_extraction_targets_only_requested_embedded_track() {
+        let probe = api::MediaSourceInfo {
+            media_streams: vec![
+                api::MediaStream {
+                    type_: Some(api::MediaStreamType::Subtitle),
+                    codec: Some("srt".into()),
+                    index: 3,
+                    ..Default::default()
+                },
+                api::MediaStream {
+                    type_: Some(api::MediaStreamType::Subtitle),
+                    codec: Some("srt".into()),
+                    index: 4,
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert_eq!(solo_subtitle_index(&probe, 3, true), Some(3));
+        assert_eq!(solo_subtitle_index(&probe, 3, false), None);
+    }
 
     const DEDUP_ON: SubtitleDedupSettings = SubtitleDedupSettings {
         enabled: true,

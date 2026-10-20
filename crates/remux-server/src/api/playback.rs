@@ -474,7 +474,7 @@ async fn items_playbackinfo_inner(
                 .load(media)
                 .await?;
             service
-                .probe_candidates(ranking, ranking_prefs)
+                .probe_candidates(ranking, ranking_prefs, q.start_time_ticks)
                 .await
         },
         async {
@@ -494,7 +494,32 @@ async fn items_playbackinfo_inner(
             }
         }
     );
-    let probed = probed?;
+    let probed = match probed {
+        Ok(probed) => probed,
+        Err(error) => {
+            if let Some(pending) = error
+                .downcast_ref::<crate::services::stream_service::P2pReadinessPending>(
+            ) {
+                warn!(
+                    cached_bytes = pending.cached_bytes,
+                    total_bytes = pending.total_bytes,
+                    download_mibps = pending.download_mibps,
+                    live_peers = pending.live_peers,
+                    "playback pending while source downloads"
+                );
+                return Ok((
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    [(http::header::RETRY_AFTER, "10")],
+                    Json(json!({
+                        "ErrorCode": "P2P_SOURCE_BUFFERING",
+                        "Message": "Source is downloading slowly. Wait, then retry playback.",
+                        "RetryAfterSeconds": 10
+                    })),
+                ).into_response());
+            }
+            return Err(error.into());
+        }
+    };
     let item_runtime_seconds = subtitle_media
         .as_ref()
         .and_then(|item| item.runtime);
@@ -534,11 +559,20 @@ async fn items_playbackinfo_inner(
             api::inject_lyric_stream(&mut source);
         }
 
+        let is_torrent = effective_stream
+            .stream_info
+            .as_ref()
+            .is_some_and(|si| {
+                matches!(
+                    si.descriptor,
+                    crate::stream::StreamDescriptor::Torrent { .. }
+                )
+            });
+
         // Drop an embedded subtitle stream that can't be delivered any way we
         // support (see `subtitle_codec_deliverable`: deliverable via Embed,
-        // or via External when extraction is feasible — only ever for a local
-        // source; a remote one would mean ffmpeg reading the entire remote
-        // file, so we never extract those). When not
+        // or via External when extraction is feasible — locally, or for a
+        // torrent with bounded on-demand extraction). When not
         // deliverable, an image (PGS) subtitle can still be burned in
         // (subtitle_mode == Burn) — text subtitles have no burn-in path in
         // the transcode pipeline at all, so those (and everything else in
@@ -564,7 +598,12 @@ async fn items_playbackinfo_inner(
         // exists. Must also run before resolve_default_streams below.
         // Gated on the dedup setting: with it off, the user asked to see
         // every subtitle option, embedded ones included.
-        if subtitle_dedup.enabled {
+        // Torrent embedded tracks may be the original, better-synced subtitles.
+        // Keep them alongside addon externals, even for matching languages.
+        if super::subtitles::dedup_embedded_subtitles(
+            subtitle_dedup.enabled,
+            is_torrent,
+        ) {
             drop_unsupported_embedded_subtitles_with_external_match(
                 &mut source,
                 &external_subtitles,
@@ -727,7 +766,10 @@ async fn items_playbackinfo_inner(
         // The subtitle the client will most likely request (the selected or
         // default one, when it's an embedded text track delivered externally).
         // Only started for the selected source, after ranking.
+        // A torrent may be incomplete. Never start reading its entire subtitle
+        // track during playback startup; extraction is explicitly on-demand.
         let subtitle_prefetch = if allow_subtitle_extraction
+            && !is_torrent
             && let Some(index) = effective_sub_idx
             && let Some(delivery_format) = source
                 .media_streams
@@ -1055,7 +1097,7 @@ async fn items_playbackinfo_inner(
     };
 
     trace!(?info, "items_playbackinfo_result");
-    Ok(Json(info))
+    Ok(Json(info).into_response())
 }
 
 static NO_STREAMS_VIDEO: &[u8] = include_bytes!("../../assets/no-streams.mp4");

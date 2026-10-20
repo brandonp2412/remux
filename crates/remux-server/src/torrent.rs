@@ -1,4 +1,4 @@
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{io::SeekFrom, path::PathBuf, sync::Arc, time::Duration};
 
 use anyhow::{Context, Result};
 use librqbit::{
@@ -9,6 +9,7 @@ use librqbit::{
     http_api::HttpApi,
 };
 use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tracing::{debug, info, warn};
 
 // Keep cached pieces briefly reusable after playback, but stop requesting
@@ -44,6 +45,9 @@ struct TorrentObservedProgress {
     range_requests: u64,
     range_ready: u64,
     range_bytes_served: u64,
+    startup_required_bytes: Option<u64>,
+    startup_readable_bytes: u64,
+    startup_ready: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -144,6 +148,11 @@ pub struct TorrentPrefetchStatus {
     pub next_total_bytes: Option<u64>,
     pub download_mibps: f64,
     pub live_peers: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_required_bytes: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub startup_readable_bytes: Option<u64>,
+    pub startup_ready: bool,
 }
 
 pub struct TorrentManager {
@@ -321,16 +330,92 @@ impl TorrentManager {
         })
     }
 
+    pub(crate) async fn probe_stream_range(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        start: u64,
+        bytes_needed: usize,
+        required_download_mibps: f64,
+        wait: Duration,
+        mut on_progress: impl FnMut(usize),
+    ) -> Result<(usize, f64)> {
+        let hash = librqbit::Magnet::parse(&format!("magnet:?xt=urn:btih:{info_hash}"))
+            .context("invalid torrent info hash")?
+            .as_id20()
+            .context("torrent info hash is not a v1 hash")?;
+        let handle = self
+            .session
+            .get(TorrentIdOrHash::Hash(hash))
+            .context("torrent is not managed")?;
+        let mut stream = handle
+            .stream(file_idx)
+            .context("failed to open native torrent file stream")?;
+        if start > 0 {
+            stream
+                .seek(SeekFrom::Start(start))
+                .await
+                .context("failed to seek native torrent file stream")?;
+        }
+
+        let started_at = tokio::time::Instant::now();
+        let received = tokio::time::timeout(wait, async {
+            let mut received = 0usize;
+            let mut buffer = vec![0_u8; 64 * 1024];
+            while received < bytes_needed {
+                let remaining = bytes_needed - received;
+                let read_len = remaining.min(buffer.len());
+                let read = stream
+                    .read(&mut buffer[..read_len])
+                    .await
+                    .context("failed reading native torrent file stream")?;
+                if read == 0 {
+                    break;
+                }
+                received = received.saturating_add(read);
+                on_progress(received);
+            }
+            anyhow::ensure!(
+                received >= bytes_needed,
+                "native torrent range at byte {start} produced only {received} of {bytes_needed} required bytes"
+            );
+            Ok::<usize, anyhow::Error>(received)
+        })
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "native torrent range at byte {start} timed out after {:.2}s",
+                wait.as_secs_f64()
+            )
+        })??;
+
+        let elapsed_secs = started_at
+            .elapsed()
+            .as_secs_f64()
+            .max(0.001);
+        let readable_mibps = received as f64 / 1024.0 / 1024.0 / elapsed_secs;
+        if bytes_needed >= 256 * 1024 {
+            anyhow::ensure!(
+                readable_mibps >= required_download_mibps,
+                "native torrent range at byte {start} read {received} bytes at {readable_mibps:.2} MiB/s, below required {required_download_mibps:.2} MiB/s"
+            );
+        }
+        Ok((received, readable_mibps))
+    }
+
     pub(crate) fn note_range_requested(&self, info_hash: &str, file_idx: usize) {
         let key = (normalized_info_hash(info_hash), file_idx);
         if let Ok(mut progress) = self
             .probe_progress
             .lock()
         {
-            progress
+            let entry = progress
                 .entry(key)
-                .or_default()
-                .range_requests += 1;
+                .or_default();
+            entry.range_requests += 1;
+            entry.startup_required_bytes = None;
+            entry.startup_readable_bytes = 0;
+            entry.startup_ready = false;
         }
     }
 
@@ -340,10 +425,30 @@ impl TorrentManager {
             .probe_progress
             .lock()
         {
-            progress
+            let entry = progress
                 .entry(key)
-                .or_default()
-                .range_ready += 1;
+                .or_default();
+            entry.range_ready += 1;
+            entry.startup_ready = true;
+        }
+    }
+
+    pub(crate) fn note_startup_progress(
+        &self,
+        info_hash: &str,
+        file_idx: usize,
+        required: u64,
+        readable: u64,
+    ) {
+        if let Ok(mut progress) = self
+            .probe_progress
+            .lock()
+        {
+            let entry = progress
+                .entry((normalized_info_hash(info_hash), file_idx))
+                .or_default();
+            entry.startup_required_bytes = Some(required);
+            entry.startup_readable_bytes = readable.min(required);
         }
     }
 
@@ -700,6 +805,15 @@ impl TorrentManager {
         let live = stats
             .live
             .as_ref();
+        let startup = self
+            .probe_progress
+            .lock()
+            .ok()
+            .and_then(|progress| {
+                progress
+                    .get(&(normalized_info_hash(info_hash), index))
+                    .cloned()
+            });
         Some(TorrentPrefetchStatus {
             current_cached_bytes: stats
                 .file_progress
@@ -726,6 +840,15 @@ impl TorrentManager {
                     .peer_stats
                     .live as u64
             }),
+            startup_required_bytes: startup
+                .as_ref()
+                .and_then(|p| p.startup_required_bytes),
+            startup_readable_bytes: startup
+                .as_ref()
+                .map(|p| p.startup_readable_bytes),
+            startup_ready: startup
+                .as_ref()
+                .is_some_and(|p| p.startup_ready),
         })
     }
 
@@ -1097,13 +1220,15 @@ impl TorrentManager {
             .torrents
             .into_iter()
             .filter(|torrent| {
-                !leases
-                    .get(
-                        &torrent
-                            .info_hash
-                            .to_ascii_lowercase(),
-                    )
-                    .is_some_and(|lease| lease.strong_count() != 0)
+                // A dead weak lease is still inside the two-hour retry-cache
+                // lifecycle. TorrentLease::drop() will remove it through
+                // delete_if_unused() when that grace expires; maintenance must
+                // not erase its cached pieces early.
+                !leases.contains_key(
+                    &torrent
+                        .info_hash
+                        .to_ascii_lowercase(),
+                )
             })
             .filter(|torrent| {
                 !background.contains_key(
@@ -2251,6 +2376,45 @@ mod tests {
     use super::*;
 
     #[test]
+    fn startup_readiness_telemetry_is_additive_and_distinct_from_file_cache() {
+        let status = TorrentPrefetchStatus {
+            current_cached_bytes: 80_000_000,
+            current_total_bytes: 100_000_000,
+            next_cached_bytes: None,
+            next_total_bytes: None,
+            download_mibps: 2.0,
+            live_peers: 3,
+            startup_required_bytes: Some(8_000_000),
+            startup_readable_bytes: Some(2_000_000),
+            startup_ready: false,
+        };
+        let json = serde_json::to_value(&status).unwrap();
+        assert_eq!(json["currentCachedBytes"], 80_000_000);
+        assert_eq!(json["startupRequiredBytes"], 8_000_000);
+        assert_eq!(json["startupReadableBytes"], 2_000_000);
+        assert_eq!(json["startupReady"], false);
+        assert!(
+            json.get("nextCachedBytes")
+                .is_some()
+        );
+
+        let unknown = TorrentPrefetchStatus {
+            startup_required_bytes: None,
+            startup_readable_bytes: None,
+            ..status
+        };
+        let json = serde_json::to_value(unknown).unwrap();
+        assert!(
+            json.get("startupRequiredBytes")
+                .is_none()
+        );
+        assert!(
+            json.get("startupReadableBytes")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn recent_playback_is_retained_for_retries() {
         assert_eq!(TORRENT_IDLE_GRACE, Duration::from_secs(7200));
     }
@@ -2484,6 +2648,84 @@ mod tests {
                 .torrents
                 .len(),
             1
+        );
+        manager
+            .shutdown()
+            .await;
+    }
+
+    #[tokio::test]
+    async fn maintenance_cleanup_preserves_dropped_lease_retry_cache() {
+        let dir = tempfile::tempdir().unwrap();
+        let manager = Arc::new(
+            TorrentManager::new(
+                dir.path()
+                    .join("data"),
+                dir.path()
+                    .join("cache"),
+                None,
+                true,
+                None,
+                true,
+            )
+            .await
+            .unwrap(),
+        );
+        manager
+            .session
+            .add_torrent(
+                AddTorrent::from_bytes(
+                    &b"d4:infod6:lengthi1e4:name1:x12:piece lengthi16384e6:pieces20:....................ee"[..],
+                ),
+                Some(AddTorrentOptions {
+                    paused: true,
+                    disable_trackers: true,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let api = Api::new(
+            manager
+                .session
+                .clone(),
+            None,
+            None,
+        );
+        let hash = api
+            .api_torrent_list()
+            .torrents[0]
+            .info_hash
+            .clone();
+
+        let lease = manager
+            .acquire(&hash)
+            .await;
+        drop(lease);
+
+        assert_eq!(
+            manager
+                .delete_unused_with_files(&Default::default())
+                .await
+                .unwrap(),
+            0,
+            "maintenance must not delete pieces retained for the retry grace"
+        );
+        assert_eq!(
+            api.api_torrent_list()
+                .torrents
+                .len(),
+            1
+        );
+
+        manager
+            .delete_if_unused(&hash)
+            .await
+            .unwrap();
+        assert!(
+            api.api_torrent_list()
+                .torrents
+                .is_empty()
         );
         manager
             .shutdown()

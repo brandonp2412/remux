@@ -524,7 +524,33 @@ fn chapter_title_to_type(title: &str) -> Option<MediaSegmentType> {
     }
 }
 
-fn chapters_to_segments(chapters: &[FfprobeChapter]) -> MediaSegments {
+const MAX_PROBED_INTRO_END_TICKS: i64 = 8 * 60 * 10_000_000;
+
+fn plausible_chapter_segment(
+    kind: MediaSegmentType,
+    segment: &Segment,
+    media_duration_ticks: Option<i64>,
+) -> bool {
+    if segment.start_ticks < 0 || segment.end_ticks <= segment.start_ticks {
+        return false;
+    }
+    if kind != MediaSegmentType::Intro {
+        return true;
+    }
+
+    // Chapter titles often describe the section that follows rather than a
+    // skippable range. A chapter named "Intro" that runs into the main feature
+    // must not become a skip button. Keep this aligned with the client-side
+    // safety policy: intros end early and never span most of the media.
+    segment.end_ticks <= MAX_PROBED_INTRO_END_TICKS
+        && media_duration_ticks
+            .is_none_or(|duration| duration <= 0 || segment.end_ticks <= duration / 3)
+}
+
+fn chapters_to_segments(
+    chapters: &[FfprobeChapter],
+    media_duration_ticks: Option<i64>,
+) -> MediaSegments {
     let mut segs = MediaSegments::default();
     for ch in chapters {
         let title = ch
@@ -551,6 +577,16 @@ fn chapters_to_segments(chapters: &[FfprobeChapter]) -> MediaSegments {
             start_ticks: start,
             end_ticks: end,
         };
+        if !plausible_chapter_segment(kind, &seg, media_duration_ticks) {
+            warn!(
+                ?kind,
+                start_ticks = seg.start_ticks,
+                end_ticks = seg.end_ticks,
+                media_duration_ticks,
+                "ignoring implausible media chapter segment"
+            );
+            continue;
+        }
         match kind {
             MediaSegmentType::Intro
                 if segs
@@ -1204,7 +1240,12 @@ fn probe_media_with_local_stream_rw_timeout(
     // in probe data. The per-stream `is_default` flags above are the container
     // facts that derivation builds on.
 
-    let segments = chapters_to_segments(&probe.chapters);
+    let media_duration_ticks = probe
+        .format
+        .duration
+        .as_deref()
+        .and_then(|duration| duration.to_ticks(TickUnit::Seconds));
+    let segments = chapters_to_segments(&probe.chapters, media_duration_ticks);
 
     Ok((
         api::MediaSourceInfo {
@@ -1316,6 +1357,40 @@ fn can_fallback_to_stale_probe_cache(cached: &api::MediaSourceInfo) -> bool {
                 .is_some())
 }
 
+/// Run the bounded Matroska-header probe and its normal fallback within one
+/// shared wall-clock budget. A failed first ffprobe must not get a second full
+/// timeout while the caller's outer readiness deadline is already expiring.
+fn probe_with_shared_header_deadline<T>(
+    timeout: std::time::Duration,
+    mut probe: impl FnMut(bool, std::time::Duration) -> Result<T>,
+) -> Result<T> {
+    let deadline = std::time::Instant::now() + timeout;
+    let remaining = || deadline.saturating_duration_since(std::time::Instant::now());
+
+    let bounded_budget = remaining();
+    if bounded_budget.is_zero() {
+        return Err(anyhow!(
+            "probe deadline expired before bounded header probe"
+        ));
+    }
+    match probe(true, bounded_budget) {
+        Ok(result) => Ok(result),
+        Err(bounded_error) => {
+            let normal_budget = remaining();
+            if normal_budget.is_zero() {
+                return Err(bounded_error.context(
+                    "bounded header probe exhausted the shared probe deadline",
+                ));
+            }
+            probe(false, normal_budget).map_err(|normal_error| {
+                anyhow!(
+                    "bounded header probe failed ({bounded_error:#}); normal probe failed: {normal_error:#}"
+                )
+            })
+        }
+    }
+}
+
 /// Resolve probe data for a single source: cache hit → skip → live probe with fallback.
 pub(crate) async fn probe_stream(
     stream: &db::Media,
@@ -1326,6 +1401,7 @@ pub(crate) async fn probe_stream(
     max_retries: usize,
     probe_pool: &[db::Media],
     restrict_resolution: bool,
+    start_time_ticks: Option<i64>,
     port: u16,
     db: &sqlx::SqlitePool,
 ) -> axum_anyhow::ApiResult<(api::MediaSourceInfo, db::Media)> {
@@ -1394,18 +1470,48 @@ pub(crate) async fn probe_stream(
         p2p_max_retries,
         probe_pool,
         restrict_resolution,
+        start_time_ticks,
         port,
         db,
-        move |url, attempt_timeout_secs, sequential_matroska| {
-            // Readiness may hold headers until near the attempt deadline.
-            // The outer timeout still bounds ffprobe, including optional seeks.
-            let local_stream_rw_timeout =
-                std::time::Duration::from_secs(attempt_timeout_secs);
+        move |url, attempt_timeout_secs, bounded_header_probe, sequential_matroska| {
+            let attempt_budget = std::time::Duration::from_secs(attempt_timeout_secs);
+            if bounded_header_probe {
+                return probe_with_shared_header_deadline(
+                    attempt_budget,
+                    |bounded, remaining| {
+                        if bounded {
+                            // A usable EBML header alone is insufficient; the live stream endpoint
+                            // must also prove the startup buffer. Keep that request within the same
+                            // overall deadline as the normal ffprobe fallback.
+                            let headers = format!(
+                                "Range: bytes=0-1048575\r\n{}: 1\r\n",
+                                crate::stream::PROBE_PLAYBACK_READINESS_HEADER
+                            );
+                            probe_media_with_local_stream_rw_timeout(
+                                &url,
+                                Some(&headers),
+                                Some(remaining),
+                                remaining,
+                                true,
+                            )
+                        } else {
+                            probe_media_with_local_stream_rw_timeout(
+                                &url,
+                                None,
+                                Some(remaining),
+                                remaining,
+                                sequential_matroska,
+                            )
+                        }
+                    },
+                );
+            }
+
             probe_media_with_local_stream_rw_timeout(
                 &url,
                 None,
-                Some(std::time::Duration::from_secs(attempt_timeout_secs)),
-                local_stream_rw_timeout,
+                Some(attempt_budget),
+                attempt_budget,
                 sequential_matroska,
             )
         },
@@ -1604,18 +1710,23 @@ fn select_candidates(
                         .as_ref()
                         .and_then(|info| info.seeders)
                         .unwrap_or(0);
-                    seeders >= 3 || same_tier_count < max_retries
+                    seeders >= 3
+                        || same_tier_count < max_retries
+                        || primary_height >= 2160
                 })
                 .max_by_key(|candidate| {
                     (
-                        resolution_height(candidate).unwrap_or_default(),
-                        torrent_codec_family(candidate)
-                            == Some(TorrentCodecFamily::Avc),
+                        // Recovery is about playability, not the highest lower-res badge.
+                        // Harry Potter had a stalled 800p/15-seeder fallback while 720p
+                        // candidates with 109/100 seeders were available.
                         candidate
                             .stream_info
                             .as_ref()
                             .and_then(|info| info.seeders)
                             .unwrap_or(0),
+                        torrent_codec_family(candidate)
+                            == Some(TorrentCodecFamily::Avc),
+                        resolution_height(candidate).unwrap_or_default(),
                     )
                 })
         })
@@ -1648,10 +1759,45 @@ fn select_candidates(
         })
         .collect();
 
+    // With two P2P retries and one reserved lower-resolution rescue, there
+    // is only one same-tier slot. Waiting for a second same-tier retry to
+    // diversify means it never happens. After a non-AVC primary fails, spend
+    // that slot on a seeded encoded AVC release when one is available.
+    // Keep the normal order when the primary is AVC or no such release exists.
+    let avc_first = pri_p2p
+        && torrent_codec_family(primary)
+            .is_some_and(|codec| codec != TorrentCodecFamily::Avc);
+    let first_same_tier = avc_first
+        .then(|| {
+            same_tier
+                .iter()
+                .copied()
+                .find(|candidate| {
+                    torrent_codec_family(candidate) == Some(TorrentCodecFamily::Avc)
+                        && candidate
+                            .stream_info
+                            .as_ref()
+                            .is_some_and(|info| {
+                                info.seeders
+                                    .unwrap_or(0)
+                                    >= 3
+                                    && !info
+                                        .filename
+                                        .as_deref()
+                                        .unwrap_or(&candidate.title)
+                                        .to_ascii_lowercase()
+                                        .contains("remux")
+                            })
+                })
+        })
+        .flatten()
+        .or_else(|| {
+            same_tier
+                .first()
+                .copied()
+        });
     if same_tier_budget > 0
-        && let Some(first) = same_tier
-            .first()
-            .copied()
+        && let Some(first) = first_same_tier
     {
         selected.push(first);
         if let Some(family) = torrent_codec_family(first)
@@ -1804,12 +1950,72 @@ fn probe_attempt_timeout(
     }
 }
 
+// A source with no filename (common in Torrentio) may still be Matroska.
+// Give its small EBML header one bounded range before requesting large sparse
+// pieces. An explicit MP4/MOV source must retain the ordinary seekable probe.
+fn torrent_matroska_probe_mode(stream: &db::Media) -> (bool, bool) {
+    let Some(info) = stream
+        .stream_info
+        .as_ref()
+        .filter(|info| info.is_p2p())
+    else {
+        return (false, false);
+    };
+    let name = info
+        .filename
+        .as_deref()
+        .or_else(|| match &info.descriptor {
+            crate::stream::StreamDescriptor::Torrent { file_hint, .. } => {
+                file_hint.as_deref()
+            }
+            _ => None,
+        });
+    let Some(name) = name else {
+        return (true, false); // Probe unknown containers briefly, then normally.
+    };
+    let is_matroska = std::path::Path::new(name)
+        .extension()
+        .is_some_and(|ext| {
+            ext.eq_ignore_ascii_case("mkv") || ext.eq_ignore_ascii_case("webm")
+        });
+    (is_matroska, is_matroska)
+}
+
 // P2P cached metadata is not evidence that a torrent is currently playable.
 // Before reusing a previously completed probe, ask the same local stream proxy
-// used by ffprobe for a real, bounded startup range. The proxy itself checks
-// consecutive torrent pieces and sustainable read speed.
-async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result<()> {
-    const PROOF_BYTES: usize = 1024 * 1024;
+// used by ffprobe for real bounded ranges. The proxy itself checks consecutive
+// torrent pieces and sustainable read speed.
+const P2P_READINESS_PROOF_BYTES: u64 = 1024 * 1024;
+
+fn resume_range_start(
+    source: &api::MediaSourceInfo,
+    start_time_ticks: Option<i64>,
+) -> Option<u64> {
+    let start = start_time_ticks?.max(0) as u64;
+    let runtime = source
+        .run_time_ticks?
+        .max(0) as u64;
+    let size = source
+        .size?
+        .max(0) as u64;
+    if start == 0 || runtime == 0 || size <= P2P_READINESS_PROOF_BYTES {
+        return None;
+    }
+
+    // A direct-play client seeking by time will usually land near this byte
+    // fraction. It is intentionally approximate (VBR/container indexes can move
+    // the exact seek), but requesting it makes rqbit prioritize the relevant
+    // pieces before PlaybackInfo says the source is ready.
+    let start = start.min(runtime.saturating_sub(1));
+    let estimated = ((size as u128 * start as u128) / runtime as u128) as u64;
+    Some(estimated.min(size - P2P_READINESS_PROOF_BYTES))
+}
+
+async fn verify_local_p2p_range(
+    url: &str,
+    timeout_secs: u64,
+    start: u64,
+) -> Result<()> {
     let parsed = url::Url::parse(url)?;
     anyhow::ensure!(
         matches!(parsed.host_str(), Some("127.0.0.1" | "::1" | "localhost"))
@@ -1818,18 +2024,17 @@ async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result
                 .starts_with("/stream/"),
         "cached torrent readiness must use the local stream proxy"
     );
+    let end = start + P2P_READINESS_PROOF_BYTES - 1;
     let response = reqwest::Client::new()
         .get(url)
-        .header(
-            reqwest::header::RANGE,
-            format!("bytes=0-{}", PROOF_BYTES - 1),
-        )
+        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+        .header(crate::stream::PROBE_PLAYBACK_READINESS_HEADER, "1")
         .timeout(std::time::Duration::from_secs(timeout_secs))
         .send()
         .await?;
     anyhow::ensure!(
         response.status() == reqwest::StatusCode::PARTIAL_CONTENT,
-        "cached torrent startup range was not served: {}",
+        "cached torrent readiness range {start}-{end} was not served: {}",
         response.status()
     );
     // Even a byte-complete 206 can be an upstream proxy's padded error page.
@@ -1883,8 +2088,8 @@ async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result
             ))
         });
     anyhow::ensure!(
-        range.is_some_and(|(start, end, total)| {
-            start == 0 && end == (PROOF_BYTES as u64 - 1) && total > end
+        range.is_some_and(|(range_start, range_end, total)| {
+            range_start == start && range_end == end && total > range_end
         }),
         "cached torrent startup response has invalid Content-Range"
     );
@@ -1892,10 +2097,10 @@ async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result
         .bytes()
         .await?;
     anyhow::ensure!(
-        bytes.len() == PROOF_BYTES,
-        "cached torrent startup range was truncated ({} of {} bytes)",
+        bytes.len() == P2P_READINESS_PROOF_BYTES as usize,
+        "cached torrent readiness range {start}-{end} was truncated ({} of {} bytes)",
         bytes.len(),
-        PROOF_BYTES
+        P2P_READINESS_PROOF_BYTES
     );
     Ok(())
 }
@@ -1923,6 +2128,249 @@ fn filename_requires_video(stream: &db::Media) -> bool {
         })
 }
 
+// For a resumed episode, warm the backup's estimated playback offset as well
+// as its container header. The previously header-only warmup wasted the
+// primary's probe window on bytes a resumed player would not consume.
+fn fallback_prewarm_ranges(
+    stream: &db::Media,
+    start_time_ticks: Option<i64>,
+) -> Vec<(u64, u64)> {
+    let mut ranges = vec![(0, P2P_READINESS_PROOF_BYTES - 1)];
+    let mut source = api::MediaSourceInfo::from(stream.clone());
+    source.size = source
+        .size
+        .or_else(|| {
+            stream
+                .stream_info
+                .as_ref()
+                .and_then(|info| info.size)
+        });
+    source.run_time_ticks = source
+        .run_time_ticks
+        .or_else(|| {
+            stream
+                .runtime
+                .and_then(|seconds| seconds.checked_mul(10_000_000))
+        });
+    if let Some(start) = resume_range_start(&source, start_time_ticks) {
+        ranges.push((start, start + P2P_READINESS_PROOF_BYTES - 1));
+    }
+    ranges
+}
+
+// Prewarm a *single* P2P fallback while the primary is being probed. This
+// allows both swarms to acquire their startup and resume pieces within the
+// existing PlaybackInfo budget.
+fn is_local_p2p_prewarm_url(stream: &db::Media, url: &str) -> bool {
+    stream
+        .stream_info
+        .as_ref()
+        .is_some_and(|info| info.is_p2p())
+        && url::Url::parse(url).is_ok_and(|parsed| {
+            matches!(parsed.host_str(), Some("127.0.0.1" | "::1" | "localhost"))
+                && parsed
+                    .path()
+                    .starts_with("/stream/")
+        })
+}
+
+struct AbortPrewarm(Option<tokio::task::JoinHandle<()>>);
+
+impl Drop for AbortPrewarm {
+    fn drop(&mut self) {
+        if let Some(task) = self
+            .0
+            .take()
+        {
+            task.abort();
+        }
+    }
+}
+
+async fn verify_cached_p2p_playback_ranges(
+    url: &str,
+    timeout_secs: u64,
+    source: &api::MediaSourceInfo,
+    start_time_ticks: Option<i64>,
+) -> Result<()> {
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), async {
+        // Both ranges are necessary, but independent. Request them concurrently:
+        // serial reads can exhaust the single probe budget on a cold resume.
+        if let Some(resume_start) = resume_range_start(source, start_time_ticks) {
+            tokio::try_join!(
+                verify_local_p2p_range(url, timeout_secs, 0),
+                verify_local_p2p_range(url, timeout_secs, resume_start),
+            )?;
+            debug!(
+                resume_start,
+                start_time_ticks, "verified cached torrent resume range"
+            );
+        } else {
+            verify_local_p2p_range(url, timeout_secs, 0).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    })
+    .await
+    .map_err(|_| {
+        anyhow::anyhow!("cached torrent readiness proof exceeded {timeout_secs}s")
+    })?
+}
+
+const PRIMARY_P2P_RECOVERY_REPROBE_TIMEOUT_SECS: u64 = 5;
+
+async fn recheck_primary_after_warmup<F>(
+    stream: &db::Media,
+    url: &str,
+    timeout_secs: u64,
+    start_time_ticks: Option<i64>,
+    db: &sqlx::SqlitePool,
+    probe_fn: F,
+) -> Result<(api::MediaSourceInfo, db::Media)>
+where
+    F: Fn(
+            String,
+            u64,
+            bool,
+            bool,
+        )
+            -> anyhow::Result<(api::MediaSourceInfo, remux_sdks::remux::MediaSegments)>
+        + Send
+        + 'static,
+{
+    if stream
+        .probe_data
+        .as_ref()
+        .is_some_and(is_reusable_probe_cache)
+    {
+        let info = api::MediaSourceInfo::from(stream.clone());
+        verify_cached_p2p_playback_ranges(url, timeout_secs, &info, start_time_ticks)
+            .await?;
+        let mut info = info;
+        apply_video_bitrate_fallback(&mut info.media_streams, info.bitrate);
+        return Ok((info, stream.clone()));
+    }
+
+    let recovery = async {
+        let probe_timeout = timeout_secs
+            .saturating_sub(2)
+            .max(1);
+        let (bounded_header_probe, sequential_matroska) =
+            torrent_matroska_probe_mode(stream);
+        let probe_url = url.to_owned();
+        let probe_result = tokio::time::timeout(
+            std::time::Duration::from_secs(probe_timeout),
+            tokio::task::spawn_blocking(move || {
+                probe_fn(
+                    probe_url,
+                    probe_timeout,
+                    bounded_header_probe,
+                    sequential_matroska,
+                )
+            }),
+        )
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!("warmed primary torrent probe exceeded {probe_timeout}s")
+        })?
+        .map_err(|error| {
+            anyhow::anyhow!("warmed primary probe task failed: {error}")
+        })?;
+        let (mut probed, segments) = probe_result?;
+        anyhow::ensure!(
+            probed
+                .video_stream()
+                .is_some()
+                || probed
+                    .audio_stream()
+                    .is_some(),
+            "warmed primary probe found no audio or video stream"
+        );
+        if probed
+            .video_stream()
+            .is_some()
+            && let Some(probed_ticks) = probed.run_time_ticks
+        {
+            let max_threshold = 5_i64
+                .to_ticks(TickUnit::Minutes)
+                .unwrap_or(0);
+            let threshold_ticks = match stream.runtime {
+                Some(known_secs) => known_secs
+                    .to_ticks(TickUnit::Seconds)
+                    .map(|ticks| (ticks / 2).min(max_threshold))
+                    .unwrap_or(max_threshold),
+                None => 3_i64
+                    .to_ticks(TickUnit::Minutes)
+                    .unwrap_or(0),
+            };
+            anyhow::ensure!(
+                probed_ticks >= threshold_ticks,
+                "warmed primary probe found suspiciously short media ({probed_ticks} < {threshold_ticks} ticks)"
+            );
+        }
+        if !segments.is_empty() {
+            probed.segments = Some(segments);
+        }
+        probed.run_time_ticks = probed
+            .run_time_ticks
+            .or_else(|| {
+                stream
+                    .runtime
+                    .and_then(|seconds| seconds.to_ticks(TickUnit::Seconds))
+            });
+        probed.size = probed
+            .size
+            .or_else(|| {
+                stream
+                    .stream_info
+                    .as_ref()
+                    .and_then(|info| info.size)
+            });
+
+        // The live ffprobe proves that the media container and first A/V stream
+        // are readable. Also prove the requested startup and estimated resume
+        // ranges before selecting a resumed source; both checks share the same
+        // short recovery budget. Runtime prefers the real probe, then metadata.
+        let mut readiness_info = api::MediaSourceInfo::from(stream.clone());
+        if probed
+            .run_time_ticks
+            .is_some()
+        {
+            readiness_info.run_time_ticks = probed.run_time_ticks;
+        }
+        readiness_info.size = probed
+            .size
+            .or_else(|| {
+                stream
+                    .stream_info
+                    .as_ref()
+                    .and_then(|info| info.size)
+            });
+        let range_timeout = timeout_secs
+            .saturating_sub(probe_timeout)
+            .max(1);
+        verify_cached_p2p_playback_ranges(
+            url,
+            range_timeout,
+            &readiness_info,
+            start_time_ticks,
+        )
+        .await?;
+
+        if let Err(error) = db::Media::save_probe_data(db, &stream.id, &probed).await {
+            warn!(id = %stream.id, %error, "failed to save recovered probe data");
+        }
+        apply_video_bitrate_fallback(&mut probed.media_streams, probed.bitrate);
+        Ok::<_, anyhow::Error>((probed, stream.clone()))
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(timeout_secs), recovery)
+        .await
+        .map_err(|_| {
+            anyhow::anyhow!(
+                "warmed primary probe and range proof exceeded {timeout_secs}s"
+            )
+        })?
+}
+
 /// Probe a stream URL, retrying with the next matching candidate on failure.
 ///
 /// Returns a 500 error if all candidates fail to probe.
@@ -1934,6 +2382,7 @@ async fn probe_with_fallback<F>(
     max_retries: usize,
     probe_pool: &[db::Media],
     restrict_resolution: bool,
+    start_time_ticks: Option<i64>,
     port: u16,
     db: &sqlx::SqlitePool,
     probe_fn: F,
@@ -1942,6 +2391,7 @@ where
     F: Fn(
             String,
             u64,
+            bool,
             bool,
         )
             -> anyhow::Result<(api::MediaSourceInfo, remux_sdks::remux::MediaSegments)>
@@ -1958,15 +2408,78 @@ where
         port,
     );
 
-    let all_to_try: Vec<_> = std::iter::once((primary.clone(), primary_url))
+    let all_to_try: Vec<_> = std::iter::once((primary.clone(), primary_url.clone()))
         .chain(
             candidates
                 .into_iter()
                 .map(|(m, u)| (m, Some(u))),
         )
         .collect();
+    // Start one local P2P backup immediately. Warm its header and, when the
+    // source size/runtime are known, its resume range in parallel; neither may
+    // block the other. Never prewarm remote URLs or non-P2P sources.
+    let backup = if primary
+        .stream_info
+        .as_ref()
+        .is_some_and(|info| info.is_p2p())
+    {
+        all_to_try
+            .iter()
+            .skip(1)
+            .find_map(|(stream, url)| {
+                url.as_ref()
+                    .filter(|url| is_local_p2p_prewarm_url(stream, url))
+                    .map(|url| {
+                        (
+                            url.clone(),
+                            fallback_prewarm_ranges(stream, start_time_ticks),
+                        )
+                    })
+            })
+    } else {
+        None
+    };
+    let _prewarm = AbortPrewarm(backup.map(|(url, ranges)| {
+        tokio::spawn(async move {
+            let client = reqwest::Client::new();
+            let mut tasks = tokio::task::JoinSet::new();
+            for (start, end) in ranges {
+                let client = client.clone();
+                let url = url.clone();
+                tasks.spawn(async move {
+                    let response = client
+                        .get(&url)
+                        .header(reqwest::header::RANGE, format!("bytes={start}-{end}"))
+                        .timeout(std::time::Duration::from_secs(35))
+                        .send()
+                        .await;
+                    if let Ok(response) = response {
+                        if response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
+                            let _ = response
+                                .bytes()
+                                .await;
+                        }
+                    }
+                });
+            }
+            while tasks
+                .join_next()
+                .await
+                .is_some()
+            {}
+        })
+    }));
     let total_available = probe_pool.len();
     let total_attempts = all_to_try.len();
+    // Keep a local P2P primary eligible for one final live probe after alternate
+    // candidates have warmed its swarm, even when the primary had no reusable
+    // probe metadata on the initial request.
+    let primary_recovery = primary_url
+        .as_ref()
+        .filter(|url| is_local_p2p_prewarm_url(&primary, url))
+        .cloned()
+        .map(|url| (primary.clone(), url));
+    let mut primary_recovery_attempted = false;
     let mut attempts = 0usize;
     // Torrent startup depends on piece availability and can otherwise hold
     // PlaybackInfo for the full configured 60s per candidate. Keep real P2P
@@ -1991,6 +2504,58 @@ where
             diversified_recovery,
             attempt_index == 0,
         );
+        // A cold torrent keeps downloading while alternate candidates are checked.
+        // Before spending the final fallback slot, cheaply revisit the preferred
+        // source: real-device Project Hail Mary playback had a healthy 4K swarm
+        // become range-readable only after the first alternate probe completed.
+        // This is deliberately a short second-chance check, not another full
+        // candidate timeout, and it cannot accept a source without a real 1 MiB
+        // playback-readiness range.
+        if attempt_index > 1
+            && !primary_recovery_attempted
+            && let Some((recovery, recovery_url)) = &primary_recovery
+        {
+            primary_recovery_attempted = true;
+            let cached_probe = recovery
+                .probe_data
+                .as_ref()
+                .is_some_and(is_reusable_probe_cache);
+            let recheck_timeout = if cached_probe {
+                effective_timeout.min(2)
+            } else {
+                effective_timeout.min(PRIMARY_P2P_RECOVERY_REPROBE_TIMEOUT_SECS)
+            };
+            match recheck_primary_after_warmup(
+                recovery,
+                recovery_url,
+                recheck_timeout,
+                start_time_ticks,
+                db,
+                probe_fn.clone(),
+            )
+            .await
+            {
+                Ok((info, recovered)) => {
+                    info!(
+                        id = %recovered.id,
+                        after_attempts = attempts,
+                        recheck_timeout,
+                        cached_probe,
+                        "preferred torrent became playback-ready while fallbacks were probing"
+                    );
+                    return Ok((info, recovered));
+                }
+                Err(error) => {
+                    debug!(
+                        id = %recovery.id,
+                        %error,
+                        recheck_timeout,
+                        cached_probe,
+                        "preferred torrent still not playback-ready after fallback warmup"
+                    );
+                }
+            }
+        }
         let url = match url_opt {
             Some(u) => u,
             None => {
@@ -2010,7 +2575,15 @@ where
                         .is_some_and(|info| info.is_p2p())
             })
         {
-            match verify_cached_p2p_startup_range(&url, effective_timeout).await {
+            let cached_info = api::MediaSourceInfo::from(stream.clone());
+            match verify_cached_p2p_playback_ranges(
+                &url,
+                effective_timeout,
+                &cached_info,
+                start_time_ticks,
+            )
+            .await
+            {
                 Ok(()) => {
                     info!(
                         id = %stream.id,
@@ -2044,27 +2617,17 @@ where
         let stream2 = stream.clone();
         let db2 = db.clone();
         let f = probe_fn.clone();
-        let sequential_matroska = stream
-            .stream_info
-            .as_ref()
-            .is_some_and(|info| {
-                info.is_p2p()
-                    && info
-                        .filename
-                        .as_deref()
-                        .is_some_and(|name| {
-                            std::path::Path::new(name)
-                                .extension()
-                                .is_some_and(|ext| {
-                                    ext.eq_ignore_ascii_case("mkv")
-                                        || ext.eq_ignore_ascii_case("webm")
-                                })
-                        })
-            });
+        let (bounded_header_probe, sequential_matroska) =
+            torrent_matroska_probe_mode(&stream);
         let probe_result = tokio::time::timeout(
             std::time::Duration::from_secs(effective_timeout),
             tokio::task::spawn_blocking(move || {
-                f(url2, effective_timeout, sequential_matroska)
+                f(
+                    url2,
+                    effective_timeout,
+                    bounded_header_probe,
+                    sequential_matroska,
+                )
             }),
         )
         .await;
@@ -2156,6 +2719,55 @@ where
         }
     }
 
+    // With only one fallback there is no later retry at which to revisit the
+    // primary. Give it one short readiness check after that fallback has had
+    // time to warm the swarm in the background.
+    if attempts > 1
+        && !primary_recovery_attempted
+        && let Some((recovery, recovery_url)) = &primary_recovery
+    {
+        primary_recovery_attempted = true;
+        let cached_probe = recovery
+            .probe_data
+            .as_ref()
+            .is_some_and(is_reusable_probe_cache);
+        let recheck_timeout = if cached_probe {
+            timeout_secs.min(2)
+        } else {
+            timeout_secs.min(PRIMARY_P2P_RECOVERY_REPROBE_TIMEOUT_SECS)
+        };
+        match recheck_primary_after_warmup(
+            recovery,
+            recovery_url,
+            recheck_timeout,
+            start_time_ticks,
+            db,
+            probe_fn.clone(),
+        )
+        .await
+        {
+            Ok((info, recovered)) => {
+                info!(
+                    id = %recovered.id,
+                    after_attempts = attempts,
+                    recheck_timeout,
+                    cached_probe,
+                    "preferred torrent became playback-ready after fallback exhaustion"
+                );
+                return Ok((info, recovered));
+            }
+            Err(error) => {
+                debug!(
+                    id = %recovery.id,
+                    %error,
+                    recheck_timeout,
+                    cached_probe,
+                    "preferred torrent still not playback-ready after fallback exhaustion"
+                );
+            }
+        }
+    }
+
     Err(anyhow!(
         "all probe attempts failed for '{}' (tried {attempts} of {total_available} streams)",
         primary.full_title()
@@ -2166,6 +2778,396 @@ where
 #[cfg(test)]
 mod probe_tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn range_response(
+        headers: &axum::http::HeaderMap,
+        status: reqwest::StatusCode,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let body = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            vec![0_u8; P2P_READINESS_PROOF_BYTES as usize]
+        } else {
+            Vec::new()
+        };
+        let mut response = (status, body).into_response();
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let start = headers
+                .get(axum::http::header::RANGE)
+                .and_then(|value| {
+                    value
+                        .to_str()
+                        .ok()
+                })
+                .and_then(|value| value.strip_prefix("bytes="))
+                .and_then(|range| range.split_once('-'))
+                .and_then(|(start, _)| {
+                    start
+                        .parse::<u64>()
+                        .ok()
+                })
+                .unwrap_or(0);
+            let value = format!(
+                "bytes {start}-{}/200000000",
+                start + P2P_READINESS_PROOF_BYTES - 1
+            );
+            response
+                .headers_mut()
+                .insert(
+                    axum::http::header::CONTENT_RANGE,
+                    axum::http::HeaderValue::from_str(&value).unwrap(),
+                );
+        }
+        response
+    }
+
+    async fn readiness_range_server(
+        statuses: Vec<(u64, u16)>,
+    ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        let task = tokio::spawn(async move {
+            let mut requests = Vec::new();
+            for _ in 0..statuses.len() {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .unwrap();
+                let mut request = Vec::new();
+                let mut chunk = [0u8; 2048];
+                loop {
+                    let read = socket
+                        .read(&mut chunk)
+                        .await
+                        .unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&chunk[..read]);
+                    if request
+                        .windows(4)
+                        .any(|window| window == b"\r\n\r\n")
+                    {
+                        break;
+                    }
+                }
+                let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
+                let selected = statuses
+                    .iter()
+                    .find(|(start, _)| {
+                        request.contains(&format!("range: bytes={start}-"))
+                    });
+                let status = selected
+                    .map(|(_, status)| *status)
+                    .unwrap_or(400);
+                let range_start = selected
+                    .map(|(start, _)| *start)
+                    .unwrap_or(0);
+                requests.push(request);
+                let body = if status == 206 {
+                    vec![b'x'; P2P_READINESS_PROOF_BYTES as usize]
+                } else {
+                    Vec::new()
+                };
+                let reason = if status == 206 {
+                    "Partial Content"
+                } else {
+                    "Unavailable"
+                };
+                let range_header = if status == 206 {
+                    format!(
+                        "Content-Range: bytes {range_start}-{}/200000000\r\n",
+                        range_start + P2P_READINESS_PROOF_BYTES - 1
+                    )
+                } else {
+                    String::new()
+                };
+                let headers = format!(
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n{range_header}Connection: close\r\n\r\n",
+                    body.len()
+                );
+                socket
+                    .write_all(headers.as_bytes())
+                    .await
+                    .unwrap();
+                socket
+                    .write_all(&body)
+                    .await
+                    .unwrap();
+                socket
+                    .shutdown()
+                    .await
+                    .unwrap();
+            }
+            requests
+        });
+        (format!("http://{addr}/stream/test"), task)
+    }
+
+    fn chapter(start: &str, end: &str, title: &str) -> FfprobeChapter {
+        FfprobeChapter {
+            start_time: start.to_string(),
+            end_time: end.to_string(),
+            tags: HashMap::from([("title".to_string(), title.to_string())]),
+        }
+    }
+
+    #[test]
+    fn chapters_to_segments_rejects_intro_spanning_almost_entire_episode() {
+        let segments = chapters_to_segments(
+            &[
+                chapter("1.001", "996.955", "Intro"),
+                chapter("996.955", "1087.968", "Outro"),
+            ],
+            Some(1080 * 10_000_000),
+        );
+
+        assert_eq!(segments.intro, None);
+        assert_eq!(
+            segments.outro,
+            Some(Segment {
+                start_ticks: 9_969_550_000,
+                end_ticks: 10_879_680_000,
+            })
+        );
+    }
+
+    #[test]
+    fn chapters_to_segments_keeps_single_intro_when_duration_is_unknown() {
+        let segments = chapters_to_segments(&[chapter("0.0", "90.0", "Intro")], None);
+        assert_eq!(
+            segments.intro,
+            Some(Segment {
+                start_ticks: 0,
+                end_ticks: 900_000_000,
+            })
+        );
+    }
+
+    #[test]
+    fn chapters_to_segments_keeps_normal_intro() {
+        let segments = chapters_to_segments(
+            &[
+                chapter("0.0", "90.0", "Intro"),
+                chapter("90.0", "1000.0", "Main"),
+                chapter("1000.0", "1080.0", "Credits"),
+            ],
+            Some(1080 * 10_000_000),
+        );
+
+        assert_eq!(
+            segments.intro,
+            Some(Segment {
+                start_ticks: 0,
+                end_ticks: 900_000_000,
+            })
+        );
+        assert_eq!(
+            segments.outro,
+            Some(Segment {
+                start_ticks: 10_000_000_000,
+                end_ticks: 10_800_000_000,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_readiness_proves_startup_and_estimated_resume_ranges() {
+        let (url, server) =
+            readiness_range_server(vec![(0, 206), (50_000_000, 206)]).await;
+        let source = api::MediaSourceInfo {
+            run_time_ticks: Some(1_000),
+            size: Some(100_000_000),
+            ..Default::default()
+        };
+        verify_cached_p2p_playback_ranges(&url, 3, &source, Some(500))
+            .await
+            .unwrap();
+        let requests = server
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.contains("range: bytes=0-1048575"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.contains("range: bytes=50000000-51048575"))
+        );
+        assert!(
+            requests
+                .iter()
+                .all(|request| {
+                    request.contains("x-remux-probe-playback-readiness: 1")
+                })
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_readiness_requests_header_and_resume_without_serial_delay() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let url = format!(
+            "http://{}/stream/test",
+            listener
+                .local_addr()
+                .unwrap()
+        );
+        let server = tokio::spawn(async move {
+            let mut sockets = Vec::new();
+            for _ in 0..2 {
+                let (mut socket, _) = listener
+                    .accept()
+                    .await
+                    .unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut buf = [0_u8; 4096];
+                    let count = socket
+                        .read(&mut buf)
+                        .await
+                        .unwrap();
+                    assert!(count > 0);
+                    request.extend_from_slice(&buf[..count]);
+                    if request
+                        .windows(4)
+                        .any(|part| part == b"\r\n\r\n")
+                    {
+                        break;
+                    }
+                }
+                sockets.push((socket, String::from_utf8_lossy(&request).into_owned()));
+            }
+            // Neither range is served until both requests have been made.
+            for (socket, request) in &mut sockets {
+                let body = vec![b'x'; P2P_READINESS_PROOF_BYTES as usize];
+                let range_start = request
+                    .to_ascii_lowercase()
+                    .split("range: bytes=")
+                    .nth(1)
+                    .and_then(|part| part.split_once('-'))
+                    .and_then(|(start, _)| {
+                        start
+                            .parse::<u64>()
+                            .ok()
+                    })
+                    .unwrap();
+                let headers = format!(
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {range_start}-{}/200000000\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                    range_start + P2P_READINESS_PROOF_BYTES - 1
+                );
+                socket
+                    .write_all(headers.as_bytes())
+                    .await
+                    .unwrap();
+                socket
+                    .write_all(&body)
+                    .await
+                    .unwrap();
+                socket
+                    .shutdown()
+                    .await
+                    .unwrap();
+            }
+            sockets
+                .into_iter()
+                .map(|(_, req)| req)
+                .collect::<Vec<_>>()
+        });
+        let source = api::MediaSourceInfo {
+            run_time_ticks: Some(1_000),
+            size: Some(100_000_000),
+            ..Default::default()
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(3),
+            verify_cached_p2p_playback_ranges(&url, 2, &source, Some(500)),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let requests = server
+            .await
+            .unwrap();
+        assert!(
+            requests
+                .iter()
+                .any(|r| r
+                    .to_ascii_lowercase()
+                    .contains("range: bytes=0-1048575"))
+        );
+        assert!(
+            requests
+                .iter()
+                .any(|r| r
+                    .to_ascii_lowercase()
+                    .contains("range: bytes=50000000-51048575"))
+        );
+    }
+
+    #[tokio::test]
+    async fn cached_readiness_rejects_unavailable_resume_range() {
+        let (url, server) =
+            readiness_range_server(vec![(0, 206), (50_000_000, 503)]).await;
+        let source = api::MediaSourceInfo {
+            run_time_ticks: Some(1_000),
+            size: Some(100_000_000),
+            ..Default::default()
+        };
+        let error = verify_cached_p2p_playback_ranges(&url, 3, &source, Some(500))
+            .await
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("was not served")
+        );
+        let requests = server
+            .await
+            .unwrap();
+        assert_eq!(requests.len(), 2);
+        assert!(
+            requests
+                .iter()
+                .any(|r| r.contains("range: bytes=50000000-51048575"))
+        );
+    }
+
+    #[test]
+    fn resume_range_estimate_tracks_position_and_caps_at_eof() {
+        let source = api::MediaSourceInfo {
+            run_time_ticks: Some(1_000),
+            size: Some(100_000_000),
+            ..Default::default()
+        };
+        assert_eq!(resume_range_start(&source, Some(500)), Some(50_000_000));
+        assert_eq!(
+            resume_range_start(&source, Some(999)),
+            Some(100_000_000 - P2P_READINESS_PROOF_BYTES)
+        );
+    }
+
+    #[test]
+    fn resume_range_estimate_requires_known_nonzero_runtime_and_size() {
+        let source = api::MediaSourceInfo::default();
+        assert_eq!(resume_range_start(&source, Some(500)), None);
+        let known = api::MediaSourceInfo {
+            run_time_ticks: Some(1_000),
+            size: Some(100_000_000),
+            ..Default::default()
+        };
+        assert_eq!(resume_range_start(&known, Some(0)), None);
+        assert_eq!(resume_range_start(&known, None), None);
+    }
 
     #[test]
     fn bit_depth_from_pix_fmt_known_formats() {
@@ -2477,12 +3479,16 @@ mod probe_tests {
         String,
         u64,
         bool,
+        bool,
     ) -> anyhow::Result<(api::MediaSourceInfo, MediaSegments)>
     + Clone
     + Send
     + 'static {
         let q = Arc::new(Mutex::new(VecDeque::from(results)));
-        move |_url: String, _timeout_secs: u64, _sequential_matroska: bool| {
+        move |_url: String,
+              _timeout_secs: u64,
+              _bounded: bool,
+              _sequential_matroska: bool| {
             q.lock()
                 .unwrap()
                 .pop_front()
@@ -2498,6 +3504,61 @@ mod probe_tests {
             .await
             .unwrap();
         db
+    }
+
+    #[test]
+    fn bounded_header_retry_uses_only_the_shared_deadline_remainder() {
+        use std::{sync::Mutex, thread, time::Duration};
+
+        let calls = Mutex::new(Vec::new());
+        let result = probe_with_shared_header_deadline(
+            Duration::from_millis(300),
+            |bounded, budget| {
+                calls
+                    .lock()
+                    .unwrap()
+                    .push((bounded, budget));
+                if bounded {
+                    thread::sleep(Duration::from_millis(220));
+                    Err(anyhow!("header readiness timed out"))
+                } else {
+                    assert!(budget < Duration::from_millis(120));
+                    thread::sleep(Duration::from_millis(40));
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(result.is_ok());
+        let calls = calls
+            .into_inner()
+            .unwrap();
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].0);
+        assert!(!calls[1].0);
+        assert!(calls[1].1 < calls[0].1);
+    }
+
+    #[test]
+    fn exhausted_bounded_header_probe_skips_normal_retry() {
+        use std::{cell::Cell, thread, time::Duration};
+
+        let normal_called = Cell::new(false);
+        let result = probe_with_shared_header_deadline(
+            Duration::from_millis(40),
+            |bounded, _| {
+                if bounded {
+                    thread::sleep(Duration::from_millis(70));
+                    Err(anyhow!("header readiness timed out"))
+                } else {
+                    normal_called.set(true);
+                    Ok(())
+                }
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!normal_called.get());
     }
 
     #[test]
@@ -2643,7 +3704,79 @@ mod probe_tests {
     }
 
     #[test]
-    fn lower_resolution_recovery_prefers_avc_within_best_tier() {
+    fn two_retry_budget_diversifies_before_reserved_lower_resolution_rescue() {
+        let primary =
+            p2p_media_with_filename("The.Mentalist.S01E01.1080p.x265.mkv", 263);
+        let same_codec = p2p_media_with_filename(
+            "The.Mentalist.S01E01.1080p.x265-KONTRAST.mkv",
+            130,
+        );
+        let avc =
+            p2p_media_with_filename("The.Mentalist.S01E01.1080p.H.264-HHWEB.mkv", 57);
+        let lower = p2p_media_with_filename("The.Mentalist.S01E01.720p.x264.mkv", 233);
+        let pool = vec![same_codec.clone(), avc.clone(), lower.clone()];
+        let result = select_candidates(&primary, &pool, true, 2, false, 3000);
+        assert_eq!(
+            result
+                .iter()
+                .map(|(source, _)| source.id)
+                .collect::<Vec<_>>(),
+            vec![avc.id, lower.id]
+        );
+        let avc_primary =
+            p2p_media_with_filename("The.Mentalist.S01E01.1080p.x264.mkv", 263);
+        let result = select_candidates(&avc_primary, &pool, true, 2, false, 3000);
+        assert_eq!(
+            result[0]
+                .0
+                .id,
+            same_codec.id
+        );
+        let mut dead_avc = avc;
+        dead_avc
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .seeders = Some(0);
+        let result = select_candidates(
+            &primary,
+            &[same_codec.clone(), dead_avc, lower],
+            true,
+            2,
+            false,
+            3000,
+        );
+        assert_eq!(
+            result[0]
+                .0
+                .id,
+            same_codec.id
+        );
+    }
+
+    #[test]
+    fn cold_4k_recovery_reserves_1080p_even_with_missing_seeder_metadata() {
+        // Project Hail Mary: multiple 4K torrents download bytes but none
+        // serves the requested startup range before the probe deadline.
+        // Reported seeder counts are only hints, not proof of unplayability.
+        let primary = p2p_media_with_filename("Movie.2160p.AV1.mkv", 100);
+        let same_a = p2p_media_with_filename("Movie.2160p.HEVC.a.mkv", 50);
+        let same_b = p2p_media_with_filename("Movie.2160p.HEVC.b.mkv", 40);
+        let lower = p2p_media_with_filename("Movie.1080p.H264.mkv", 0);
+        let lower_id = lower.id;
+        let result =
+            select_candidates(&primary, &[same_a, same_b, lower], true, 2, false, 3000);
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[1]
+                .0
+                .id,
+            lower_id
+        );
+    }
+
+    #[test]
+    fn lower_resolution_recovery_prefers_seed_availability_over_height() {
         let primary = p2p_media_with_filename("Movie.2160p.AV1.mkv", 300);
         let same = p2p_media_with_filename("Movie.2160p.HEVC.mkv", 200);
         let vc1 = p2p_media_with_filename("Movie.1080p.REMUX.VC-1.mkv", 250);
@@ -2666,13 +3799,120 @@ mod probe_tests {
             result[1]
                 .0
                 .id,
-            avc_id
+            lower_avc_id
         );
         assert_ne!(
             result[1]
                 .0
                 .id,
-            lower_avc_id
+            avc_id
+        );
+    }
+
+    #[test]
+    fn harry_potter_recovery_prefers_well_seeded_720p_over_800p() {
+        let primary =
+            p2p_media_with_filename("Goblet.Of.Fire.2005.1080p.x264.mp4", 390);
+        let other_1080 =
+            p2p_media_with_filename("Goblet.Of.Fire.2005.1080p.DTS.mkv", 207);
+        let tall_800 =
+            p2p_media_with_filename("Goblet.Of.Fire.2005.1920x800.x264.mkv", 15);
+        let seeded_720 =
+            p2p_media_with_filename("Goblet.Of.Fire.2005.720p.x264.mkv", 109);
+        let other_720 =
+            p2p_media_with_filename("Goblet.Of.Fire.2005.720p.AAC.mp4", 100);
+        let result = select_candidates(
+            &primary,
+            &[other_1080, tall_800, seeded_720.clone(), other_720],
+            true,
+            2,
+            false,
+            3000,
+        );
+        assert_eq!(result.len(), 2);
+        assert_eq!(
+            result[1]
+                .0
+                .id,
+            seeded_720.id
+        );
+    }
+
+    #[test]
+    fn unknown_torrent_filename_first_tries_bounded_matroska_header() {
+        assert_eq!(torrent_matroska_probe_mode(&p2p_media()), (true, false));
+        assert_eq!(
+            torrent_matroska_probe_mode(&p2p_media_with_filename("episode.mkv", 5)),
+            (true, true)
+        );
+        assert_eq!(
+            torrent_matroska_probe_mode(&p2p_media_with_filename("episode.mp4", 5)),
+            (false, false)
+        );
+        assert_eq!(
+            torrent_matroska_probe_mode(&http_media("http://example.com/movie.mkv")),
+            (false, false)
+        );
+        let mut hinted = p2p_media();
+        if let Some(info) = hinted
+            .stream_info
+            .as_mut()
+        {
+            if let crate::stream::StreamDescriptor::Torrent { file_hint, .. } =
+                &mut info.descriptor
+            {
+                *file_hint = Some("S04E10.720p.mkv".into());
+            }
+        }
+        assert_eq!(torrent_matroska_probe_mode(&hinted), (true, true));
+    }
+
+    #[test]
+    fn fallback_prewarm_rejects_remote_urls_and_non_torrents() {
+        let torrent = p2p_media();
+        assert!(is_local_p2p_prewarm_url(
+            &torrent,
+            "http://127.0.0.1:3100/stream/abc"
+        ));
+        assert!(!is_local_p2p_prewarm_url(
+            &torrent,
+            "https://example.org/stream/abc"
+        ));
+        assert!(!is_local_p2p_prewarm_url(
+            &torrent,
+            "http://127.0.0.1:3100/admin"
+        ));
+        assert!(!is_local_p2p_prewarm_url(
+            &http_media("https://example.org/movie.mkv"),
+            "http://127.0.0.1:3100/stream/abc"
+        ));
+    }
+
+    #[test]
+    fn fallback_prewarm_targets_resume_and_header_when_size_is_known() {
+        let mut torrent = p2p_media();
+        torrent.runtime = Some(660);
+        torrent
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(660_000_000);
+        assert_eq!(
+            fallback_prewarm_ranges(&torrent, Some(330 * 10_000_000)),
+            vec![(0, 1_048_575), (330_000_000, 331_048_575)]
+        );
+        assert_eq!(
+            fallback_prewarm_ranges(&torrent, Some(0)),
+            vec![(0, 1_048_575)]
+        );
+        torrent
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = None;
+        assert_eq!(
+            fallback_prewarm_ranges(&torrent, Some(330 * 10_000_000)),
+            vec![(0, 1_048_575)]
         );
     }
 
@@ -2722,8 +3962,13 @@ mod probe_tests {
             .unwrap();
         let app = axum::Router::new().route(
             "/stream/test",
-            axum::routing::get(move || async move {
+            axum::routing::get(move |headers: axum::http::HeaderMap| async move {
                 use axum::response::IntoResponse;
+                if !headers.contains_key(crate::stream::PROBE_PLAYBACK_READINESS_HEADER)
+                {
+                    return (reqwest::StatusCode::BAD_REQUEST, Vec::new())
+                        .into_response();
+                }
                 let mut response = (status, vec![0_u8; body_size]).into_response();
                 if let Some(value) = content_range {
                     response
@@ -2762,7 +4007,7 @@ mod probe_tests {
         )
         .await;
         assert!(
-            verify_cached_p2p_startup_range(&good_url, 3)
+            verify_local_p2p_range(&good_url, 3, 0)
                 .await
                 .is_ok()
         );
@@ -2776,7 +4021,7 @@ mod probe_tests {
         )
         .await;
         assert!(
-            verify_cached_p2p_startup_range(&bad_url, 3)
+            verify_local_p2p_range(&bad_url, 3, 0)
                 .await
                 .is_err()
         );
@@ -2790,7 +4035,7 @@ mod probe_tests {
         )
         .await;
         assert!(
-            verify_cached_p2p_startup_range(&short_url, 3)
+            verify_local_p2p_range(&short_url, 3, 0)
                 .await
                 .is_err()
         );
@@ -2811,7 +4056,7 @@ mod probe_tests {
             )
             .await;
             assert!(
-                verify_cached_p2p_startup_range(&url, 3)
+                verify_local_p2p_range(&url, 3, 0)
                     .await
                     .is_err(),
                 "invalid Content-Range {content_range:?} must not establish cached torrent readiness"
@@ -2835,7 +4080,7 @@ mod probe_tests {
             )
             .await;
             assert!(
-                verify_cached_p2p_startup_range(&url, 3)
+                verify_local_p2p_range(&url, 3, 0)
                     .await
                     .is_err(),
                 "HTTP error document {content_type} must not prove torrent readiness"
@@ -2850,7 +4095,7 @@ mod probe_tests {
         )
         .await;
         assert!(
-            verify_cached_p2p_startup_range(&url, 3)
+            verify_local_p2p_range(&url, 3, 0)
                 .await
                 .is_ok()
         );
@@ -2882,9 +4127,10 @@ mod probe_tests {
             0,
             &[primary],
             false,
+            None,
             3000,
             &db,
-            |_url, _timeout, _sequential| {
+            |_url, _timeout, _bounded, _sequential| {
                 panic!("ffprobe must be skipped for readable cached torrent")
             },
         )
@@ -2897,6 +4143,310 @@ mod probe_tests {
                 .is_some()
         );
         assert_eq!(source.id, id);
+    }
+
+    #[tokio::test]
+    async fn cold_cached_primary_is_rechecked_after_first_fallback() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = test_db().await;
+        let mut primary = p2p_media_with_filename("Movie.2160p.HEVC.primary.mkv", 100);
+        let mut fallback_a = p2p_media_with_filename("Movie.2160p.HEVC.a.mkv", 90);
+        let mut fallback_b = p2p_media_with_filename("Movie.2160p.AV1.b.mkv", 80);
+        for stream in [&mut primary, &mut fallback_a, &mut fallback_b] {
+            stream.probe_data = Some(
+                video_probe()
+                    .unwrap()
+                    .0,
+            );
+        }
+        let primary_id = primary.id;
+        let all = vec![primary.clone(), fallback_a, fallback_b];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        let requests = Arc::new(AtomicUsize::new(0));
+        let seen = requests.clone();
+        let app = axum::Router::new().route(
+            "/stream/{id}",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    // Concurrent fallback prewarming intentionally does not carry
+                    // the playback-readiness header. Let that request complete
+                    // without consuming this test's simulated readiness failures.
+                    if !headers
+                        .contains_key(crate::stream::PROBE_PLAYBACK_READINESS_HEADER)
+                    {
+                        return range_response(
+                            &headers,
+                            reqwest::StatusCode::PARTIAL_CONTENT,
+                        );
+                    }
+                    let request = seen.fetch_add(1, Ordering::SeqCst);
+                    if request < 2 {
+                        range_response(&headers, reqwest::StatusCode::BAD_GATEWAY)
+                    } else {
+                        range_response(&headers, reqwest::StatusCode::PARTIAL_CONTENT)
+                    }
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+
+        let result = probe_with_fallback(
+            primary,
+            Some(format!("http://{addr}/stream/{primary_id}")),
+            5,
+            true,
+            2,
+            &all,
+            false,
+            None,
+            addr.port(),
+            &db,
+            |_url, _timeout, _bounded, _sequential| {
+                panic!("cached P2P recovery must not rerun ffprobe")
+            },
+        )
+        .await;
+        server.abort();
+
+        let (_, effective) = result.unwrap();
+        assert_eq!(effective.id, primary_id);
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            3,
+            "primary fails readiness, first fallback fails, then primary is rechecked"
+        );
+    }
+
+    #[tokio::test]
+    async fn uncached_cold_p2p_primary_is_reprobed_after_fallback_warmup() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = test_db().await;
+        let mut primary = p2p_media_with_filename("Movie.2160p.HEVC.primary.mkv", 100);
+        primary.runtime = Some(1_000);
+        primary
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(100_000_000);
+        let fallback_a = p2p_media_with_filename("Movie.2160p.HEVC.a.mkv", 90);
+        let fallback_b = p2p_media_with_filename("Movie.2160p.AV1.b.mkv", 80);
+        let primary_id = primary.id;
+        let all = vec![primary.clone(), fallback_a, fallback_b];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        let readiness_ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_ranges = readiness_ranges.clone();
+        let app = axum::Router::new().route(
+            "/stream/{id}",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let seen_ranges = seen_ranges.clone();
+                async move {
+                    if headers
+                        .contains_key(crate::stream::PROBE_PLAYBACK_READINESS_HEADER)
+                    {
+                        let range = headers
+                            .get(axum::http::header::RANGE)
+                            .and_then(|value| {
+                                value
+                                    .to_str()
+                                    .ok()
+                            })
+                            .unwrap_or_default()
+                            .to_owned();
+                        seen_ranges
+                            .lock()
+                            .unwrap()
+                            .push(range);
+                    }
+                    range_response(&headers, reqwest::StatusCode::PARTIAL_CONTENT)
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let result = probe_with_fallback(
+            primary,
+            Some(format!("http://{addr}/stream/{primary_id}")),
+            10,
+            true,
+            2,
+            &all,
+            false,
+            Some(5_000_000_000),
+            addr.port(),
+            &db,
+            move |_url, _timeout, _bounded, _sequential| {
+                if probe_calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                    video_probe()
+                } else {
+                    Err(anyhow!(
+                        "cold candidate has not produced a probeable header"
+                    ))
+                }
+            },
+        )
+        .await;
+        server.abort();
+
+        let (probed, recovered) = result.unwrap();
+        assert!(
+            probed
+                .video_stream()
+                .is_some()
+        );
+        assert_eq!(recovered.id, primary_id);
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            3,
+            "primary probe, one fallback probe, then a bounded live primary re-probe"
+        );
+        let ranges = readiness_ranges
+            .lock()
+            .unwrap();
+        assert!(
+            ranges
+                .iter()
+                .any(|range| range == "bytes=0-1048575")
+        );
+        assert!(
+            ranges
+                .iter()
+                .any(|range| range == "bytes=50000000-51048575")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_uncached_primary_recovery_rejects_resume_range_and_is_not_repeated()
+    {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = test_db().await;
+        let mut primary = p2p_media_with_filename("Movie.2160p.HEVC.primary.mkv", 100);
+        primary.runtime = Some(1_000);
+        primary
+            .stream_info
+            .as_mut()
+            .unwrap()
+            .size = Some(100_000_000);
+        let fallback_a = p2p_media_with_filename("Movie.2160p.HEVC.a.mkv", 90);
+        let fallback_b = p2p_media_with_filename("Movie.2160p.AV1.b.mkv", 80);
+        let primary_id = primary.id;
+        let all = vec![primary.clone(), fallback_a, fallback_b];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        let readiness_ranges = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen_ranges = readiness_ranges.clone();
+        let app = axum::Router::new().route(
+            "/stream/{id}",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let seen_ranges = seen_ranges.clone();
+                async move {
+                    if headers
+                        .contains_key(crate::stream::PROBE_PLAYBACK_READINESS_HEADER)
+                    {
+                        let range = headers
+                            .get(axum::http::header::RANGE)
+                            .and_then(|value| {
+                                value
+                                    .to_str()
+                                    .ok()
+                            })
+                            .unwrap_or_default()
+                            .to_owned();
+                        seen_ranges
+                            .lock()
+                            .unwrap()
+                            .push(range.clone());
+                        if range == "bytes=50000000-51048575" {
+                            return range_response(
+                                &headers,
+                                reqwest::StatusCode::SERVICE_UNAVAILABLE,
+                            );
+                        }
+                    }
+                    range_response(&headers, reqwest::StatusCode::PARTIAL_CONTENT)
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+        let calls = Arc::new(AtomicUsize::new(0));
+        let probe_calls = calls.clone();
+        let result = probe_with_fallback(
+            primary,
+            Some(format!("http://{addr}/stream/{primary_id}")),
+            10,
+            true,
+            2,
+            &all,
+            false,
+            Some(5_000_000_000),
+            addr.port(),
+            &db,
+            move |_url, _timeout, _bounded, _sequential| {
+                if probe_calls.fetch_add(1, Ordering::SeqCst) == 2 {
+                    video_probe()
+                } else {
+                    Err(anyhow!("candidate is still not probeable"))
+                }
+            },
+        )
+        .await;
+        server.abort();
+
+        assert!(
+            result.is_err(),
+            "an unavailable resume range must reject recovery"
+        );
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            4,
+            "the cold primary is retried once after the first fallback, not again after exhaustion"
+        );
+        let ranges = readiness_ranges
+            .lock()
+            .unwrap();
+        assert!(
+            ranges
+                .iter()
+                .any(|range| range == "bytes=0-1048575")
+        );
+        assert!(
+            ranges
+                .iter()
+                .any(|range| range == "bytes=50000000-51048575")
+        );
     }
 
     #[tokio::test]
@@ -2913,6 +4463,7 @@ mod probe_tests {
             0,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![video_probe()]),
@@ -2940,6 +4491,7 @@ mod probe_tests {
             0,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![video_probe()]),
@@ -2970,6 +4522,7 @@ mod probe_tests {
             5,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![Err(anyhow!("primary failed")), video_probe()]),
@@ -3013,6 +4566,7 @@ mod probe_tests {
             2,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![audio_only, video_probe()]),
@@ -3058,6 +4612,7 @@ mod probe_tests {
             0,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![audio_only]),
@@ -3085,6 +4640,7 @@ mod probe_tests {
             5,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![Err(anyhow!("fail")), Err(anyhow!("fail"))]),
@@ -3125,6 +4681,7 @@ mod probe_tests {
             5,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![short_probe, video_probe()]),
@@ -3150,6 +4707,7 @@ mod probe_tests {
             0,
             &all,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![]),
@@ -3177,6 +4735,7 @@ mod probe_tests {
             1, // one fallback candidate even when resolution is unrestricted
             &sources,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![Err(anyhow!("fail")), Err(anyhow!("fail"))]),
@@ -3210,6 +4769,7 @@ mod probe_tests {
             5,
             &probe_pool,
             false,
+            None,
             3000,
             &db,
             queued_probe(vec![
