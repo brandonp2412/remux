@@ -889,6 +889,13 @@ impl HttpSource {
             req = req.header(http::header::RANGE, v.clone());
         }
         for (k, v) in &self.request_headers {
+            // A source's fixed Range must never accompany the client's seek:
+            // duplicate Range fields can make strict upstreams return 416.
+            if k.eq_ignore_ascii_case("range")
+                && headers.contains_key(http::header::RANGE)
+            {
+                continue;
+            }
             req = req.header(k.as_str(), v.as_str());
         }
 
@@ -1676,6 +1683,110 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(body.len(), 1024);
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_client_seek_overrides_source_range_header() {
+        let server = httpmock::MockServer::start();
+        let expected = server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/file.mkv")
+                .header("Range", "bytes=128-")
+                .header("X-Source-Token", "keep");
+            then.status(206)
+                .header("Content-Range", "bytes 128-2047/2048")
+                .body(vec![b'z'; 1920]);
+        });
+        let source = HttpSource {
+            url: format!("{}/file.mkv", server.base_url()),
+            request_headers: [
+                ("Range".to_owned(), "bytes=0-".to_owned()),
+                ("X-Source-Token".to_owned(), "keep".to_owned()),
+            ]
+            .into(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            "bytes=128-255"
+                .parse()
+                .unwrap(),
+        );
+        let response = source
+            .serve_inner(&headers, true)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_RANGE],
+            "bytes 128-255/2048"
+        );
+        let body = axum::body::to_bytes(response.into_body(), 2048)
+            .await
+            .unwrap();
+        assert_eq!(body.len(), 128);
+        expected.assert();
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_sends_one_client_range_header_upstream() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener
+                .accept()
+                .await
+                .unwrap();
+            let mut request = [0; 4096];
+            let length = socket
+                .read(&mut request)
+                .await
+                .unwrap();
+            tx.send(String::from_utf8_lossy(&request[..length]).into_owned())
+                .unwrap();
+            socket.write_all(b"HTTP/1.1 206 Partial Content\r\nContent-Range: bytes 128-255/2048\r\nContent-Length: 128\r\nConnection: close\r\n\r\n")
+                .await.unwrap();
+            socket
+                .write_all(&vec![b'x'; 128])
+                .await
+                .unwrap();
+        });
+        let source = HttpSource {
+            url: format!("http://{addr}/file.mkv"),
+            request_headers: [("Range".into(), "bytes=0-".into())].into(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            "bytes=128-255"
+                .parse()
+                .unwrap(),
+        );
+        let response = source
+            .serve_inner(&headers, true)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+        let received = rx
+            .await
+            .unwrap();
+        let range_headers: Vec<_> = received
+            .lines()
+            .filter(|line| {
+                line.to_ascii_lowercase()
+                    .starts_with("range:")
+            })
+            .collect();
+        assert_eq!(range_headers.len(), 1, "HTTP request: {received}");
+        assert_eq!(range_headers[0].trim(), "range: bytes=128-");
     }
 
     #[tokio::test]
