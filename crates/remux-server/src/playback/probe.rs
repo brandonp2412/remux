@@ -1900,6 +1900,29 @@ async fn verify_cached_p2p_startup_range(url: &str, timeout_secs: u64) -> Result
     Ok(())
 }
 
+// A media URL can respond with a valid audio track but no video, e.g. an
+// incorrect torrent file or a non-video replacement. Do not report such a
+// source as playable for a video-container release: that gives Android TV
+// a successful PlaybackInfo response followed by a black screen.
+fn filename_requires_video(stream: &db::Media) -> bool {
+    stream
+        .stream_info
+        .as_ref()
+        .and_then(|info| {
+            info.filename
+                .as_deref()
+        })
+        .and_then(|name| std::path::Path::new(name).extension())
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase()
+                    .as_str(),
+                "mkv" | "mp4" | "m4v" | "webm" | "avi" | "mov" | "ts"
+            )
+        })
+}
+
 /// Probe a stream URL, retrying with the next matching candidate on failure.
 ///
 /// Returns a 500 error if all candidates fail to probe.
@@ -2048,6 +2071,17 @@ where
 
         match probe_result {
             Ok(Ok(Ok((mut probed, segments)))) => {
+                if probed
+                    .video_stream()
+                    .is_none()
+                    && probed
+                        .audio_stream()
+                        .is_some()
+                    && filename_requires_video(&stream)
+                {
+                    warn!(id = %stream.id, url = %url, "video release probed as audio-only; trying another source");
+                    continue;
+                }
                 // Reject streams whose probed duration is suspiciously short
                 // relative to the known metadata runtime (or absolutely < 3 min
                 // when unknown) — these are typically error/copyright-strike
@@ -2946,6 +2980,95 @@ mod probe_tests {
             effective.id, fallback_id,
             "fallback succeeded — effective stream must be the fallback, not the primary"
         );
+    }
+
+    #[tokio::test]
+    async fn audio_only_mkv_cannot_win_video_fallback() {
+        let db = test_db().await;
+        let primary = http_media_with_filename(
+            "http://a.example.com",
+            "Modern.Family.S05E09.1080p.mkv",
+        );
+        let fallback = http_media_with_filename(
+            "http://b.example.com",
+            "Modern.Family.S05E09.720p.mkv",
+        );
+        let fallback_id = fallback.id;
+        let all = vec![primary.clone(), fallback];
+        let audio_only = Ok((
+            api::MediaSourceInfo {
+                media_streams: vec![MediaStream {
+                    type_: Some(MediaStreamType::Audio),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            MediaSegments::default(),
+        ));
+        let result = probe_with_fallback(
+            primary,
+            Some("http://a.example.com".into()),
+            10,
+            true,
+            2,
+            &all,
+            false,
+            3000,
+            &db,
+            queued_probe(vec![audio_only, video_probe()]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result
+                .0
+                .video_stream()
+                .is_some()
+        );
+        assert_eq!(
+            result
+                .1
+                .id,
+            fallback_id
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_only_mp3_remains_playable() {
+        let db = test_db().await;
+        let primary =
+            http_media_with_filename("http://a.example.com", "album-track.mp3");
+        let primary_id = primary.id;
+        let audio_only = Ok((
+            api::MediaSourceInfo {
+                media_streams: vec![MediaStream {
+                    type_: Some(MediaStreamType::Audio),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            MediaSegments::default(),
+        ));
+        let all = vec![primary.clone()];
+        let (info, source) = probe_with_fallback(
+            primary,
+            Some("http://a.example.com".into()),
+            10,
+            false,
+            0,
+            &all,
+            false,
+            3000,
+            &db,
+            queued_probe(vec![audio_only]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            info.audio_stream()
+                .is_some()
+        );
+        assert_eq!(source.id, primary_id);
     }
 
     #[tokio::test]
