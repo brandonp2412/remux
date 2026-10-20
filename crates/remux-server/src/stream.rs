@@ -719,10 +719,17 @@ impl TorrentSource {
         usize::try_from(available.min(required)).unwrap_or(startup_target_bytes)
     }
 
+    /// A warm range proof may be reused only if the selected file still has
+    /// enough checked bytes. A retained proof must not turn a freshly evicted
+    /// torrent with zero cached bytes into a false ready-to-play result.
+    fn reusable_range_proof(verified: usize, required: usize, cached: u64) -> bool {
+        verified >= required && cached >= required as u64
+    }
+
     /// Size the verified contiguous startup buffer by *seconds of media*,
     /// not a universal number of megabytes. Low-bitrate 720p should not be
     /// rejected for needing 20+ seconds to read an unnecessary 4-8 MiB.
-    /// A source slightly slower than real-time playback gets a longer buffer;
+    /// A source slower than real-time playback gets a longer buffer;
     /// sources substantially slower still fall back within the bounded probe.
     fn readiness_plan(
         expected_bitrate_bps: Option<i64>,
@@ -742,7 +749,16 @@ impl TorrentSource {
             // exceed the media rate and reject otherwise playable sources.
             let minimum_sustainable = playback_mibps * 0.8;
             let needs_buffer = download_mibps < playback_mibps * 1.1;
-            let seconds_to_buffer = if needs_buffer { 6.0 } else { 4.0 };
+            // Physical-TV evidence: a 2.6 Mbit/s cold torrent passed a
+            // six-second startup proof but buffered after ~6s of playback.
+            // Preserve extra headroom for slow swarms and brief peer churn.
+            let seconds_to_buffer = if download_mibps < playback_mibps * 0.9 {
+                12.0
+            } else if needs_buffer {
+                8.0
+            } else {
+                6.0
+            };
             // Keep a real multi-second media buffer for high-bitrate remuxes.
             // A 4-8 MiB cap is barely a second at typical Blu-ray bitrates and
             // lets the player outrun a healthy swarm immediately after startup.
@@ -844,7 +860,11 @@ impl TorrentSource {
                     if VERIFIED_TORRENT_RANGES
                         .get(&cache_key)
                         .is_some_and(|verified_bytes| {
-                            verified_bytes >= probe_bytes_needed
+                            Self::reusable_range_proof(
+                                verified_bytes,
+                                probe_bytes_needed,
+                                status.current_cached_bytes,
+                            )
                         })
                     {
                         torrent.note_range_ready(&self.info_hash, selected_file_idx);
@@ -1682,15 +1702,51 @@ mod tests {
     #[test]
     fn low_bitrate_readiness_does_not_require_faster_than_real_time() {
         const MIB: usize = 1024 * 1024;
-        // 400 kbit/s video needs around 300 kB for a 6s startup buffer,
+        // 400 kbit/s video needs around 600 kB for a 12s cold buffer,
         // not a fixed 1 MiB (~21 seconds) or a 0.06 MiB/s download.
         let (bytes, minimum_mibps, buffering) =
             TorrentSource::readiness_plan(Some(400_000), 0.04).unwrap();
         assert!(buffering);
-        assert_eq!(bytes, 300_000);
+        assert_eq!(bytes, 600_000);
         let playback_mibps = 400_000.0 / 8.0 / MIB as f64;
         assert!((minimum_mibps - playback_mibps * 0.8).abs() < 1e-10);
         assert!(minimum_mibps < playback_mibps);
+    }
+
+    #[test]
+    fn a_stale_proof_cannot_fast_path_an_evicted_startup_range() {
+        const MIB: usize = 1024 * 1024;
+        assert!(!TorrentSource::reusable_range_proof(4 * MIB, 4 * MIB, 0));
+        assert!(!TorrentSource::reusable_range_proof(
+            4 * MIB,
+            4 * MIB,
+            MIB as u64
+        ));
+        assert!(!TorrentSource::reusable_range_proof(
+            2 * MIB,
+            4 * MIB,
+            (8 * MIB) as u64
+        ));
+        assert!(TorrentSource::reusable_range_proof(
+            4 * MIB,
+            4 * MIB,
+            (8 * MIB) as u64
+        ));
+    }
+
+    #[test]
+    fn marginal_swarm_needs_longer_verified_startup_buffer() {
+        const MIB: usize = 1024 * 1024;
+        let (slow, _, slow_buffering) =
+            TorrentSource::readiness_plan(Some(8 * 1024 * 1024), 0.0).unwrap();
+        let (marginal, _, marginal_buffering) =
+            TorrentSource::readiness_plan(Some(8 * 1024 * 1024), 0.95).unwrap();
+        let (healthy, _, healthy_buffering) =
+            TorrentSource::readiness_plan(Some(8 * 1024 * 1024), 2.0).unwrap();
+        assert_eq!(slow, 12 * MIB);
+        assert_eq!(marginal, 8 * MIB);
+        assert_eq!(healthy, 6 * MIB);
+        assert!(slow_buffering && marginal_buffering && !healthy_buffering);
     }
 
     #[test]
@@ -1729,7 +1785,7 @@ mod tests {
             TorrentSource::readiness_plan(Some(23_347_839), 6.0).unwrap();
 
         assert!(!buffering);
-        assert!((11 * MIB..=12 * MIB).contains(&bytes));
+        assert!((16 * MIB..=17 * MIB).contains(&bytes));
         assert!((2.2..2.3).contains(&minimum_mibps));
     }
 
