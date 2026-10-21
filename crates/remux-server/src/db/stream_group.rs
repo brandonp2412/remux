@@ -603,10 +603,35 @@ impl StreamGroup {
             })
             .cloned()
             .collect();
+        // Keep administrator-defined group priority and the stored order for
+        // mixed cached/debrid/local sources; swarm estimates are only
+        // comparable among torrent sources within the SAME group.
         v.sort_by_key(|s| {
             s.idx
                 .unwrap_or(0)
         });
+        if v.iter()
+            .all(|s| {
+                s.stream_info
+                    .as_ref()
+                    .is_some_and(|info| info.is_p2p())
+            })
+        {
+            // Stable sorting retains idx when seeds tie. Unknown seed counts
+            // are worth trying before explicitly zero-seeded torrents.
+            v.sort_by_cached_key(|s| {
+                let availability = match s
+                    .stream_info
+                    .as_ref()
+                    .and_then(|info| info.seeders)
+                {
+                    Some(0) => (0, 0),
+                    None => (1, 0),
+                    Some(count) => (2, count),
+                };
+                std::cmp::Reverse(availability)
+            });
+        }
         v
     }
 
