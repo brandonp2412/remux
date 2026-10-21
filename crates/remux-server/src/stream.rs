@@ -158,6 +158,65 @@ mod internal_host_tests {
     }
 }
 
+#[cfg(test)]
+mod http_liveness_tests {
+    use super::StreamDescriptor;
+
+    #[tokio::test]
+    async fn cached_probe_rejects_http_200_error_documents_and_empty_bodies() {
+        let server = httpmock::MockServer::start();
+        for (path, content_type, body) in [
+            ("/login", "text/html; charset=utf-8", "<html>Sign in</html>"),
+            (
+                "/expired",
+                "application/problem+json",
+                r#"{"error":"expired"}"#,
+            ),
+            ("/json", "application/json", r#"{"error":"not found"}"#),
+            ("/empty", "video/mp4", ""),
+        ] {
+            server.mock(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(path)
+                    .header("Range", "bytes=0-0");
+                then.status(200)
+                    .header("Content-Type", content_type)
+                    .body(body);
+            });
+            assert!(
+                !StreamDescriptor::http(format!("{}{}", server.base_url(), path))
+                    .is_alive()
+                    .await,
+                "cached probe should reject {path}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_probe_keeps_real_ranged_video_and_unknown_media_types() {
+        let server = httpmock::MockServer::start();
+        for (path, content_type) in [
+            ("/video", "video/mp4"),
+            ("/stream", "application/octet-stream"),
+        ] {
+            server.mock(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path(path)
+                    .header("Range", "bytes=0-0");
+                then.status(206)
+                    .header("Content-Type", content_type)
+                    .body(vec![0u8]);
+            });
+            assert!(
+                StreamDescriptor::http(format!("{}{}", server.base_url(), path))
+                    .is_alive()
+                    .await,
+                "cached probe should accept {path}"
+            );
+        }
+    }
+}
+
 fn deserialize_tracker_urls<'de, D>(
     deserializer: D,
 ) -> std::result::Result<Vec<TrackerUrl>, D::Error>
@@ -305,9 +364,32 @@ impl StreamDescriptor {
             .await
         {
             Ok(r) => {
-                r.status()
-                    .as_u16()
-                    < 400
+                if !r
+                    .status()
+                    .is_success()
+                    || r.content_length() == Some(0)
+                {
+                    return false;
+                }
+                // HTTP 200 is not evidence of video: expired CDN links can
+                // return an HTML login page or a JSON error document.
+                let content_type = r
+                    .headers()
+                    .get(http::header::CONTENT_TYPE)
+                    .and_then(|value| {
+                        value
+                            .to_str()
+                            .ok()
+                    })
+                    .unwrap_or("")
+                    .split(';')
+                    .next()
+                    .unwrap_or("")
+                    .trim()
+                    .to_ascii_lowercase();
+                !(content_type == "text/html"
+                    || content_type == "application/json"
+                    || content_type.ends_with("+json"))
             }
             Err(_) => false,
         }
@@ -659,6 +741,29 @@ impl TorrentSource {
                 "range at byte {start} returned HTTP {}",
                 response.status()
             );
+            // A 206 with the wrong Content-Range is not proof that the
+            // requested seek/startup offset is readable. Misrouted range
+            // responses otherwise falsely qualify stalled/sparse torrents.
+            if response.status() == http::StatusCode::PARTIAL_CONTENT {
+                let range = response
+                    .headers()
+                    .get(http::header::CONTENT_RANGE)
+                    .and_then(|value| value.to_str().ok())
+                    .ok_or_else(|| anyhow::anyhow!("range at byte {start} returned 206 without Content-Range"))?;
+                let (bounds, total) = range
+                    .strip_prefix("bytes ")
+                    .and_then(|value| value.split_once('/'))
+                    .ok_or_else(|| anyhow::anyhow!("malformed Content-Range: {range}"))?;
+                let (first, last) = bounds
+                    .split_once('-')
+                    .ok_or_else(|| anyhow::anyhow!("malformed Content-Range: {range}"))?;
+                let first: u64 = first.parse()?;
+                let last: u64 = last.parse()?;
+                anyhow::ensure!(
+                    first == start && last >= first && (total == "*" || total.parse::<u64>()? > last),
+                    "range at byte {start} returned mismatched Content-Range: {range}"
+                );
+            }
             let mut stream = response.bytes_stream();
             let mut received = 0usize;
             while received < bytes_needed {
@@ -1634,6 +1739,7 @@ impl StreamSource for TorrentSource {
 }
 
 pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
+    anyhow::ensure!(file_size > 0, "cannot range-read an empty file");
     let bytes = range
         .strip_prefix("bytes=")
         .ok_or_else(|| anyhow::anyhow!("expected bytes= prefix"))?;
@@ -1643,10 +1749,12 @@ pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
 
     if start_str.is_empty() {
         let suffix: u64 = end_str.parse()?;
+        anyhow::ensure!(suffix > 0, "zero-length suffix range");
         return Ok((file_size.saturating_sub(suffix), file_size - 1));
     }
 
     let start: u64 = start_str.parse()?;
+    anyhow::ensure!(start < file_size, "range starts beyond end of file");
     let end: u64 = if end_str.is_empty() {
         file_size - 1
     } else {
@@ -1654,7 +1762,7 @@ pub fn parse_range(range: &str, file_size: u64) -> anyhow::Result<(u64, u64)> {
             .parse::<u64>()?
             .min(file_size - 1)
     };
-
+    anyhow::ensure!(start <= end, "range ends before it starts");
     Ok((start, end))
 }
 
@@ -1704,6 +1812,33 @@ mod tests {
     use std::path::Path;
 
     #[test]
+    fn parse_range_rejects_unsatisfiable_seek_and_empty_files() {
+        for range in ["bytes=0-", "bytes=-1", "bytes=0-0"] {
+            assert!(super::parse_range(range, 0).is_err(), "{range}");
+        }
+        for range in [
+            "bytes=10-",
+            "bytes=10-11",
+            "bytes=5-4",
+            "bytes=-0",
+            "bytes=",
+            "bytes=1-2-3",
+            "bytes=1-2,4-5",
+            "items=0-1",
+        ] {
+            assert!(super::parse_range(range, 10).is_err(), "{range}");
+        }
+    }
+
+    #[test]
+    fn parse_range_clamps_valid_prefix_and_suffix_without_underflow() {
+        assert_eq!(super::parse_range("bytes=0-", 10).unwrap(), (0, 9));
+        assert_eq!(super::parse_range("bytes=2-100", 10).unwrap(), (2, 9));
+        assert_eq!(super::parse_range("bytes=-3", 10).unwrap(), (7, 9));
+        assert_eq!(super::parse_range("bytes=-100", 10).unwrap(), (0, 9));
+        assert_eq!(super::parse_range("bytes=9-9", 10).unwrap(), (9, 9));
+    }
+
     fn low_bitrate_readiness_does_not_require_faster_than_real_time() {
         const MIB: usize = 1024 * 1024;
         // 400 kbit/s video needs around 600 kB for a 12s cold buffer,
@@ -1840,6 +1975,7 @@ mod tests {
             when.method(httpmock::Method::GET)
                 .path("/cached");
             then.status(206)
+                .header("Content-Range", format!("bytes 0-{}/{bytes}", bytes - 1))
                 .body(vec![0u8; bytes]);
         });
         let result = TorrentSource::probe_readable_range(
@@ -1864,6 +2000,10 @@ mod tests {
                 .path("/seek")
                 .header("Range", "bytes=3306-");
             then.status(206)
+                .header(
+                    "Content-Range",
+                    format!("bytes 3306-{}/{}", 3306 + bytes - 1, 3306 + bytes),
+                )
                 .body(vec![0u8; bytes]);
         });
         TorrentSource::probe_readable_range(
@@ -2002,6 +2142,58 @@ mod tests {
     #[test]
     fn stream_proxy_client_builds_without_panic() {
         let _ = &*STREAM_PROXY_CLIENT;
+    }
+
+    #[tokio::test]
+    async fn torrent_readiness_rejects_mismatched_seek_range() {
+        let server = httpmock::MockServer::start();
+        let payload = vec![b'x'; 4096];
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/seek.mkv")
+                .header("Range", "bytes=4096-");
+            then.status(206)
+                .header("Content-Range", "bytes 0-4095/16384")
+                .body(payload);
+        });
+        let result = TorrentSource::probe_readable_range(
+            &format!("{}/seek.mkv", server.base_url()),
+            4096,
+            1024,
+            0.0,
+            std::time::Duration::from_secs(3),
+        )
+        .await;
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("mismatched Content-Range")
+        );
+    }
+
+    #[tokio::test]
+    async fn torrent_readiness_accepts_matching_seek_range() {
+        let server = httpmock::MockServer::start();
+        let payload = vec![b'x'; 4096];
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/seek.mkv")
+                .header("Range", "bytes=4096-");
+            then.status(206)
+                .header("Content-Range", "bytes 4096-8191/16384")
+                .body(payload);
+        });
+        let (bytes, _) = TorrentSource::probe_readable_range(
+            &format!("{}/seek.mkv", server.base_url()),
+            4096,
+            1024,
+            0.0,
+            std::time::Duration::from_secs(3),
+        )
+        .await
+        .unwrap();
+        assert!(bytes >= 1024);
     }
 
     #[tokio::test]
@@ -2164,6 +2356,112 @@ mod tests {
             .collect();
         assert_eq!(range_headers.len(), 1, "HTTP request: {received}");
         assert_eq!(range_headers[0].trim(), "range: bytes=128-");
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_rejects_invalid_upstream_seek_range() {
+        for content_range in [
+            Some("bytes 0-255/1024"),
+            Some("bytes 128-255/200"),
+            Some("not a byte range"),
+            None,
+        ] {
+            let server = httpmock::MockServer::start();
+            server.mock(|when, then| {
+                when.method(httpmock::Method::GET)
+                    .path("/seek")
+                    .header("Range", "bytes=128-");
+                let mut then = then.status(206);
+                if let Some(range) = content_range {
+                    then = then.header("Content-Range", range);
+                }
+                then.body(vec![b'x'; 128]);
+            });
+            let source = HttpSource {
+                url: format!("{}/seek", server.base_url()),
+                request_headers: Default::default(),
+                response_headers: Default::default(),
+            };
+            let mut headers = http::HeaderMap::new();
+            headers.insert(
+                http::header::RANGE,
+                http::HeaderValue::from_static("bytes=128-255"),
+            );
+            assert!(
+                source
+                    .serve_inner(&headers, true)
+                    .await
+                    .is_err()
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_rejects_upstream_ignoring_nonzero_seek() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/seek")
+                .header("Range", "bytes=128-");
+            then.status(200)
+                .body(vec![b'x'; 1024]);
+        });
+        let source = HttpSource {
+            url: format!("{}/seek", server.base_url()),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=128-255"),
+        );
+        assert!(
+            source
+                .serve_inner(&headers, true)
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn torrent_proxy_bounds_finite_range_to_upstream_last_byte() {
+        let server = httpmock::MockServer::start();
+        server.mock(|when, then| {
+            when.method(httpmock::Method::GET)
+                .path("/seek")
+                .header("Range", "bytes=128-");
+            then.status(206)
+                .header("Content-Range", "bytes 128-191/1024")
+                .body(vec![b'x'; 64]);
+        });
+        let source = HttpSource {
+            url: format!("{}/seek", server.base_url()),
+            request_headers: Default::default(),
+            response_headers: Default::default(),
+        };
+        let mut headers = http::HeaderMap::new();
+        headers.insert(
+            http::header::RANGE,
+            http::HeaderValue::from_static("bytes=128-255"),
+        );
+        let response = source
+            .serve_inner(&headers, true)
+            .await
+            .unwrap();
+        assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
+        assert_eq!(
+            response.headers()[http::header::CONTENT_RANGE],
+            "bytes 128-191/1024"
+        );
+        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "64");
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .len(),
+            64
+        );
     }
 
     #[tokio::test]
