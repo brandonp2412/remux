@@ -4049,6 +4049,7 @@ mod probe_tests {
             0,
             &[primary],
             false,
+            None,
             3104,
             &db,
             queued_probe(vec![Err(anyhow!("torrent readiness timeout"))]),
@@ -4071,6 +4072,7 @@ mod probe_tests {
             0,
             &[primary],
             false,
+            None,
             3104,
             &db,
             queued_probe(vec![Err(anyhow!("invalid media format"))]),
@@ -4093,6 +4095,7 @@ mod probe_tests {
             1,
             &[primary, fallback],
             false,
+            None,
             3104,
             &db,
             queued_probe(vec![
