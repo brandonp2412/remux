@@ -1720,7 +1720,11 @@ mod tests {
     #[test]
     fn a_stale_proof_cannot_fast_path_an_evicted_startup_range() {
         const MIB: usize = 1024 * 1024;
-        assert!(!TorrentSource::reusable_range_proof(Some(4 * MIB), 4 * MIB, 0));
+        assert!(!TorrentSource::reusable_range_proof(
+            Some(4 * MIB),
+            4 * MIB,
+            0
+        ));
         assert!(!TorrentSource::reusable_range_proof(
             Some(4 * MIB),
             4 * MIB,
