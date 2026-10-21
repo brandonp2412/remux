@@ -2037,6 +2037,62 @@ async fn verify_local_p2p_range(
         "cached torrent readiness range {start}-{end} was not served: {}",
         response.status()
     );
+    // Even a byte-complete 206 can be an upstream proxy's padded error page.
+    // Missing or binary media content types are acceptable; known text/JSON/XML
+    // response types cannot establish a usable torrent startup range.
+    if let Some(content_type) = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| {
+            value
+                .to_str()
+                .ok()
+        })
+    {
+        let kind = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        anyhow::ensure!(
+            !kind.starts_with("text/")
+                && kind != "application/json"
+                && !kind.ends_with("+json")
+                && kind != "application/xml"
+                && !kind.ends_with("+xml"),
+            "cached torrent startup range returned an error-document Content-Type: {content_type}"
+        );
+    }
+    let range = response
+        .headers()
+        .get(reqwest::header::CONTENT_RANGE)
+        .and_then(|value| {
+            value
+                .to_str()
+                .ok()
+        })
+        .and_then(|value| value.strip_prefix("bytes "))
+        .and_then(|value| value.split_once('/'))
+        .and_then(|(span, total)| {
+            let (start, end) = span.split_once('-')?;
+            Some((
+                start
+                    .parse::<u64>()
+                    .ok()?,
+                end.parse::<u64>()
+                    .ok()?,
+                total
+                    .parse::<u64>()
+                    .ok()?,
+            ))
+        });
+    anyhow::ensure!(
+        range.is_some_and(|(range_start, range_end, total)| {
+            range_start == start && range_end == end && total > range_end
+        }),
+        "cached torrent startup response has invalid Content-Range"
+    );
     let bytes = response
         .bytes()
         .await?;
@@ -2047,6 +2103,29 @@ async fn verify_local_p2p_range(
         P2P_READINESS_PROOF_BYTES
     );
     Ok(())
+}
+
+// A media URL can respond with a valid audio track but no video, e.g. an
+// incorrect torrent file or a non-video replacement. Do not report such a
+// source as playable for a video-container release: that gives Android TV
+// a successful PlaybackInfo response followed by a black screen.
+fn filename_requires_video(stream: &db::Media) -> bool {
+    stream
+        .stream_info
+        .as_ref()
+        .and_then(|info| {
+            info.filename
+                .as_deref()
+        })
+        .and_then(|name| std::path::Path::new(name).extension())
+        .and_then(|ext| ext.to_str())
+        .is_some_and(|ext| {
+            matches!(
+                ext.to_ascii_lowercase()
+                    .as_str(),
+                "mkv" | "mp4" | "m4v" | "webm" | "avi" | "mov" | "ts"
+            )
+        })
 }
 
 // For a resumed episode, warm the backup's estimated playback offset as well
@@ -2555,6 +2634,17 @@ where
 
         match probe_result {
             Ok(Ok(Ok((mut probed, segments)))) => {
+                if probed
+                    .video_stream()
+                    .is_none()
+                    && probed
+                        .audio_stream()
+                        .is_some()
+                    && filename_requires_video(&stream)
+                {
+                    warn!(id = %stream.id, url = %url, "video release probed as audio-only; trying another source");
+                    continue;
+                }
                 // Reject streams whose probed duration is suspiciously short
                 // relative to the known metadata runtime (or absolutely < 3 min
                 // when unknown) — these are typically error/copyright-strike
@@ -2690,6 +2780,47 @@ mod probe_tests {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+    fn range_response(
+        headers: &axum::http::HeaderMap,
+        status: reqwest::StatusCode,
+    ) -> axum::response::Response {
+        use axum::response::IntoResponse;
+        let body = if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            vec![0_u8; P2P_READINESS_PROOF_BYTES as usize]
+        } else {
+            Vec::new()
+        };
+        let mut response = (status, body).into_response();
+        if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            let start = headers
+                .get(axum::http::header::RANGE)
+                .and_then(|value| {
+                    value
+                        .to_str()
+                        .ok()
+                })
+                .and_then(|value| value.strip_prefix("bytes="))
+                .and_then(|range| range.split_once('-'))
+                .and_then(|(start, _)| {
+                    start
+                        .parse::<u64>()
+                        .ok()
+                })
+                .unwrap_or(0);
+            let value = format!(
+                "bytes {start}-{}/200000000",
+                start + P2P_READINESS_PROOF_BYTES - 1
+            );
+            response
+                .headers_mut()
+                .insert(
+                    axum::http::header::CONTENT_RANGE,
+                    axum::http::HeaderValue::from_str(&value).unwrap(),
+                );
+        }
+        response
+    }
+
     async fn readiness_range_server(
         statuses: Vec<(u64, u16)>,
     ) -> (String, tokio::task::JoinHandle<Vec<String>>) {
@@ -2725,13 +2856,17 @@ mod probe_tests {
                     }
                 }
                 let request = String::from_utf8_lossy(&request).to_ascii_lowercase();
-                let status = statuses
+                let selected = statuses
                     .iter()
                     .find(|(start, _)| {
                         request.contains(&format!("range: bytes={start}-"))
-                    })
+                    });
+                let status = selected
                     .map(|(_, status)| *status)
                     .unwrap_or(400);
+                let range_start = selected
+                    .map(|(start, _)| *start)
+                    .unwrap_or(0);
                 requests.push(request);
                 let body = if status == 206 {
                     vec![b'x'; P2P_READINESS_PROOF_BYTES as usize]
@@ -2743,8 +2878,16 @@ mod probe_tests {
                 } else {
                     "Unavailable"
                 };
+                let range_header = if status == 206 {
+                    format!(
+                        "Content-Range: bytes {range_start}-{}/200000000\r\n",
+                        range_start + P2P_READINESS_PROOF_BYTES - 1
+                    )
+                } else {
+                    String::new()
+                };
                 let headers = format!(
-                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    "HTTP/1.1 {status} {reason}\r\nContent-Length: {}\r\n{range_header}Connection: close\r\n\r\n",
                     body.len()
                 );
                 socket
@@ -2904,11 +3047,23 @@ mod probe_tests {
                 sockets.push((socket, String::from_utf8_lossy(&request).into_owned()));
             }
             // Neither range is served until both requests have been made.
-            for (socket, _) in &mut sockets {
+            for (socket, request) in &mut sockets {
                 let body = vec![b'x'; P2P_READINESS_PROOF_BYTES as usize];
+                let range_start = request
+                    .to_ascii_lowercase()
+                    .split("range: bytes=")
+                    .nth(1)
+                    .and_then(|part| part.split_once('-'))
+                    .and_then(|(start, _)| {
+                        start
+                            .parse::<u64>()
+                            .ok()
+                    })
+                    .unwrap();
                 let headers = format!(
-                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                    body.len()
+                    "HTTP/1.1 206 Partial Content\r\nContent-Length: {}\r\nContent-Range: bytes {range_start}-{}/200000000\r\nConnection: close\r\n\r\n",
+                    body.len(),
+                    range_start + P2P_READINESS_PROOF_BYTES - 1
                 );
                 socket
                     .write_all(headers.as_bytes())
@@ -3796,6 +3951,8 @@ mod probe_tests {
     async fn startup_range_test_server(
         status: reqwest::StatusCode,
         body_size: usize,
+        content_range: Option<&'static str>,
+        content_type: Option<&'static str>,
     ) -> (String, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -3806,11 +3963,30 @@ mod probe_tests {
         let app = axum::Router::new().route(
             "/stream/test",
             axum::routing::get(move |headers: axum::http::HeaderMap| async move {
+                use axum::response::IntoResponse;
                 if !headers.contains_key(crate::stream::PROBE_PLAYBACK_READINESS_HEADER)
                 {
-                    return (reqwest::StatusCode::BAD_REQUEST, Vec::new());
+                    return (reqwest::StatusCode::BAD_REQUEST, Vec::new())
+                        .into_response();
                 }
-                (status, vec![0_u8; body_size])
+                let mut response = (status, vec![0_u8; body_size]).into_response();
+                if let Some(value) = content_range {
+                    response
+                        .headers_mut()
+                        .insert(
+                            axum::http::header::CONTENT_RANGE,
+                            axum::http::HeaderValue::from_static(value),
+                        );
+                }
+                if let Some(value) = content_type {
+                    response
+                        .headers_mut()
+                        .insert(
+                            axum::http::header::CONTENT_TYPE,
+                            axum::http::HeaderValue::from_static(value),
+                        );
+                }
+                response
             }),
         );
         let task = tokio::spawn(async move {
@@ -3826,6 +4002,8 @@ mod probe_tests {
         let (good_url, good_server) = startup_range_test_server(
             reqwest::StatusCode::PARTIAL_CONTENT,
             1024 * 1024,
+            Some("bytes 0-1048575/2097152"),
+            None,
         )
         .await;
         assert!(
@@ -3835,8 +4013,13 @@ mod probe_tests {
         );
         good_server.abort();
 
-        let (bad_url, bad_server) =
-            startup_range_test_server(reqwest::StatusCode::OK, 1024 * 1024).await;
+        let (bad_url, bad_server) = startup_range_test_server(
+            reqwest::StatusCode::OK,
+            1024 * 1024,
+            Some("bytes 0-1048575/2097152"),
+            None,
+        )
+        .await;
         assert!(
             verify_local_p2p_range(&bad_url, 3, 0)
                 .await
@@ -3844,14 +4027,79 @@ mod probe_tests {
         );
         bad_server.abort();
 
-        let (short_url, short_server) =
-            startup_range_test_server(reqwest::StatusCode::PARTIAL_CONTENT, 1024).await;
+        let (short_url, short_server) = startup_range_test_server(
+            reqwest::StatusCode::PARTIAL_CONTENT,
+            1024,
+            Some("bytes 0-1023/2097152"),
+            None,
+        )
+        .await;
         assert!(
             verify_local_p2p_range(&short_url, 3, 0)
                 .await
                 .is_err()
         );
         short_server.abort();
+
+        for content_range in [
+            None,
+            Some("bytes 1024-1049599/2097152"),
+            Some("bytes 0-1048574/2097152"),
+            Some("bytes 0-1048575/1048575"),
+            Some("bytes nope-1048575/2097152"),
+        ] {
+            let (url, server) = startup_range_test_server(
+                reqwest::StatusCode::PARTIAL_CONTENT,
+                1024 * 1024,
+                content_range,
+                None,
+            )
+            .await;
+            assert!(
+                verify_local_p2p_range(&url, 3, 0)
+                    .await
+                    .is_err(),
+                "invalid Content-Range {content_range:?} must not establish cached torrent readiness"
+            );
+            server.abort();
+        }
+    }
+
+    #[tokio::test]
+    async fn cached_torrent_must_not_accept_padded_error_document() {
+        for content_type in [
+            "text/html; charset=utf-8",
+            "application/problem+json",
+            "application/json",
+        ] {
+            let (url, server) = startup_range_test_server(
+                reqwest::StatusCode::PARTIAL_CONTENT,
+                1024 * 1024,
+                Some("bytes 0-1048575/2097152"),
+                Some(content_type),
+            )
+            .await;
+            assert!(
+                verify_local_p2p_range(&url, 3, 0)
+                    .await
+                    .is_err(),
+                "HTTP error document {content_type} must not prove torrent readiness"
+            );
+            server.abort();
+        }
+        let (url, server) = startup_range_test_server(
+            reqwest::StatusCode::PARTIAL_CONTENT,
+            1024 * 1024,
+            Some("bytes 0-1048575/2097152"),
+            Some("video/mp4"),
+        )
+        .await;
+        assert!(
+            verify_local_p2p_range(&url, 3, 0)
+                .await
+                .is_ok()
+        );
+        server.abort();
     }
 
     #[tokio::test]
@@ -3867,6 +4115,8 @@ mod probe_tests {
         let (url, server) = startup_range_test_server(
             reqwest::StatusCode::PARTIAL_CONTENT,
             1024 * 1024,
+            Some("bytes 0-1048575/2097152"),
+            None,
         )
         .await;
         let result = probe_with_fallback(
@@ -3932,19 +4182,16 @@ mod probe_tests {
                     if !headers
                         .contains_key(crate::stream::PROBE_PLAYBACK_READINESS_HEADER)
                     {
-                        return (
+                        return range_response(
+                            &headers,
                             reqwest::StatusCode::PARTIAL_CONTENT,
-                            vec![0_u8; 1024 * 1024],
                         );
                     }
                     let request = seen.fetch_add(1, Ordering::SeqCst);
                     if request < 2 {
-                        (reqwest::StatusCode::BAD_GATEWAY, Vec::new())
+                        range_response(&headers, reqwest::StatusCode::BAD_GATEWAY)
                     } else {
-                        (
-                            reqwest::StatusCode::PARTIAL_CONTENT,
-                            vec![0_u8; 1024 * 1024],
-                        )
+                        range_response(&headers, reqwest::StatusCode::PARTIAL_CONTENT)
                     }
                 }
             }),
@@ -4029,10 +4276,7 @@ mod probe_tests {
                             .unwrap()
                             .push(range);
                     }
-                    (
-                        reqwest::StatusCode::PARTIAL_CONTENT,
-                        vec![0_u8; 1024 * 1024],
-                    )
+                    range_response(&headers, reqwest::StatusCode::PARTIAL_CONTENT)
                 }
             }),
         );
@@ -4142,16 +4386,13 @@ mod probe_tests {
                             .unwrap()
                             .push(range.clone());
                         if range == "bytes=50000000-51048575" {
-                            return (
+                            return range_response(
+                                &headers,
                                 reqwest::StatusCode::SERVICE_UNAVAILABLE,
-                                Vec::new(),
                             );
                         }
                     }
-                    (
-                        reqwest::StatusCode::PARTIAL_CONTENT,
-                        vec![0_u8; 1024 * 1024],
-                    )
+                    range_response(&headers, reqwest::StatusCode::PARTIAL_CONTENT)
                 }
             }),
         );
@@ -4292,6 +4533,97 @@ mod probe_tests {
             effective.id, fallback_id,
             "fallback succeeded — effective stream must be the fallback, not the primary"
         );
+    }
+
+    #[tokio::test]
+    async fn audio_only_mkv_cannot_win_video_fallback() {
+        let db = test_db().await;
+        let primary = http_media_with_filename(
+            "http://a.example.com",
+            "Modern.Family.S05E09.1080p.mkv",
+        );
+        let fallback = http_media_with_filename(
+            "http://b.example.com",
+            "Modern.Family.S05E09.720p.mkv",
+        );
+        let fallback_id = fallback.id;
+        let all = vec![primary.clone(), fallback];
+        let audio_only = Ok((
+            api::MediaSourceInfo {
+                media_streams: vec![MediaStream {
+                    type_: Some(MediaStreamType::Audio),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            MediaSegments::default(),
+        ));
+        let result = probe_with_fallback(
+            primary,
+            Some("http://a.example.com".into()),
+            10,
+            true,
+            2,
+            &all,
+            false,
+            None,
+            3000,
+            &db,
+            queued_probe(vec![audio_only, video_probe()]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            result
+                .0
+                .video_stream()
+                .is_some()
+        );
+        assert_eq!(
+            result
+                .1
+                .id,
+            fallback_id
+        );
+    }
+
+    #[tokio::test]
+    async fn audio_only_mp3_remains_playable() {
+        let db = test_db().await;
+        let primary =
+            http_media_with_filename("http://a.example.com", "album-track.mp3");
+        let primary_id = primary.id;
+        let audio_only = Ok((
+            api::MediaSourceInfo {
+                media_streams: vec![MediaStream {
+                    type_: Some(MediaStreamType::Audio),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            },
+            MediaSegments::default(),
+        ));
+        let all = vec![primary.clone()];
+        let (info, source) = probe_with_fallback(
+            primary,
+            Some("http://a.example.com".into()),
+            10,
+            false,
+            0,
+            &all,
+            false,
+            None,
+            3000,
+            &db,
+            queued_probe(vec![audio_only]),
+        )
+        .await
+        .unwrap();
+        assert!(
+            info.audio_stream()
+                .is_some()
+        );
+        assert_eq!(source.id, primary_id);
     }
 
     #[tokio::test]
