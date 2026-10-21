@@ -1112,9 +1112,14 @@ fn guard_torrent_body(response: Response, inactivity: std::time::Duration) -> Re
     let (parts, body) = response.into_parts();
     let stream = async_stream::stream! {
         let mut source = body.into_data_stream();
+        let mut deadline = tokio::time::Instant::now() + inactivity;
         loop {
-            match tokio::time::timeout(inactivity, source.next()).await {
-                Ok(Some(Ok(bytes))) => yield Ok::<Bytes, io::Error>(bytes),
+            match tokio::time::timeout_at(deadline, source.next()).await {
+                Ok(Some(Ok(bytes))) if !bytes.is_empty() => {
+                    deadline = tokio::time::Instant::now() + inactivity;
+                    yield Ok::<Bytes, io::Error>(bytes);
+                }
+                Ok(Some(Ok(_))) => continue,
                 Ok(Some(Err(error))) => {
                     yield Err(io::Error::other(error));
                     break;
@@ -1673,6 +1678,49 @@ mod torrent_stall_guard_tests {
         delayed.assert();
     }
 
+    #[test]
+    fn next_episode_prefetch_requires_player_bytes() {
+        assert!(!ready_for_next_episode_prefetch(0));
+        assert!(!ready_for_next_episode_prefetch(
+            MIN_PLAYER_BYTES_BEFORE_EPISODE_PREFETCH - 1
+        ));
+        assert!(ready_for_next_episode_prefetch(
+            MIN_PLAYER_BYTES_BEFORE_EPISODE_PREFETCH
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_torrent_chunks_do_not_extend_inactivity_deadline() {
+        let stream = async_stream::stream! {
+            yield Ok::<Bytes, io::Error>(Bytes::from_static(b"ready"));
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                yield Ok(Bytes::new());
+            }
+        };
+        let response = guard_torrent_body(
+            Response::new(Body::from_stream(stream)),
+            std::time::Duration::from_millis(40),
+        );
+        let mut output = response
+            .into_body()
+            .into_data_stream();
+        assert_eq!(
+            output
+                .next()
+                .await
+                .unwrap()
+                .unwrap(),
+            Bytes::from_static(b"ready")
+        );
+        let stalled =
+            tokio::time::timeout(std::time::Duration::from_millis(250), output.next())
+                .await
+                .expect("empty chunks must not keep a stalled response alive")
+                .expect("body must report its inactivity timeout");
+        assert!(stalled.is_err());
+    }
+
     #[tokio::test]
     async fn stalled_torrent_body_fails_instead_of_hanging() {
         let stream = async_stream::stream! {
@@ -2039,6 +2087,14 @@ fn normalize_torrent_suffix_range(
     Ok(Some(format!("bytes={start}-{end}")))
 }
 
+// A cold stream must establish actual player delivery before speculative
+// downloads compete for the same torrent pieces and peers.
+const MIN_PLAYER_BYTES_BEFORE_EPISODE_PREFETCH: usize = 4 * 1024 * 1024;
+
+fn ready_for_next_episode_prefetch(delivered_bytes: usize) -> bool {
+    delivered_bytes >= MIN_PLAYER_BYTES_BEFORE_EPISODE_PREFETCH
+}
+
 #[async_trait]
 impl StreamSource for TorrentSource {
     async fn serve(&self, state: &AppState, headers: &HeaderMap) -> Result<Response> {
@@ -2154,18 +2210,6 @@ impl StreamSource for TorrentSource {
             drop(lease);
             return Err(torrent_source_buffering(error));
         }
-        if let Err(error) = torrent
-            .enable_next_episode_prefetch(&self.info_hash, selected_file_idx)
-            .await
-        {
-            tracing::debug!(
-                %error,
-                info_hash = %self.info_hash,
-                selected_file_idx,
-                "failed to enable next-episode prefetch after startup"
-            );
-        }
-
         let response = HttpSource {
             url: resolved,
             request_headers: Default::default(),
@@ -2190,7 +2234,41 @@ impl StreamSource for TorrentSource {
             .config
             .torrent_prefetch_mib
             .min(512) as usize;
-        Ok(prefetch_response(response, mib * 1024 * 1024))
+        let response = prefetch_response(response, mib * 1024 * 1024);
+        let (parts, body) = response.into_parts();
+        let info_hash = self
+            .info_hash
+            .clone();
+        let stream = async_stream::stream! {
+            let mut source = body.into_data_stream();
+            let mut delivered_bytes = 0usize;
+            let mut prefetch_started = false;
+            while let Some(chunk) = source.next().await {
+                if let Ok(bytes) = &chunk {
+                    delivered_bytes = delivered_bytes.saturating_add(bytes.len());
+                    if !prefetch_started && ready_for_next_episode_prefetch(delivered_bytes) {
+                        prefetch_started = true;
+                        let torrent = torrent.clone();
+                        let info_hash = info_hash.clone();
+                        tokio::spawn(async move {
+                            if let Err(error) = torrent
+                                .enable_next_episode_prefetch(&info_hash, selected_file_idx)
+                                .await
+                            {
+                                tracing::debug!(
+                                    %error,
+                                    %info_hash,
+                                    selected_file_idx,
+                                    "failed to enable next-episode prefetch after player delivery"
+                                );
+                            }
+                        });
+                    }
+                }
+                yield chunk;
+            }
+        };
+        Ok(Response::from_parts(parts, Body::from_stream(stream)))
     }
 }
 
