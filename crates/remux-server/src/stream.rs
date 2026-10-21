@@ -1239,30 +1239,27 @@ impl HttpSource {
                     .ok_or_else(|| {
                         anyhow::anyhow!("upstream 206 has no valid Content-Range")
                     })
-                    .context_bad_request("invalid upstream byte range")?;
+                    .map_err(torrent_source_buffering)?;
                 if content_range.0 != start {
-                    return Err(anyhow::anyhow!(
+                    return Err(torrent_source_buffering(anyhow::anyhow!(
                         "upstream range starts at {}, expected {start}",
                         content_range.0
-                    )
-                    .into());
+                    )));
                 }
                 if !valid_partial_content_length(
                     content_range,
                     upstream_headers.get(http::header::CONTENT_LENGTH),
                 ) {
-                    return Err(anyhow::anyhow!(
+                    return Err(torrent_source_buffering(anyhow::anyhow!(
                         "upstream Content-Length contradicts its Content-Range"
-                    )
-                    .into());
+                    )));
                 }
                 Some(content_range.1)
             } else {
                 if start > 0 && upstream_status == http::StatusCode::OK {
-                    return Err(anyhow::anyhow!(
+                    return Err(torrent_source_buffering(anyhow::anyhow!(
                         "upstream ignored nonzero seek range starting at {start}"
-                    )
-                    .into());
+                    )));
                 }
                 None
             }
@@ -2989,7 +2986,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn torrent_proxy_bounds_finite_range_to_upstream_last_byte() {
+    async fn torrent_proxy_rejects_short_non_eof_partial_range() {
         let server = httpmock::MockServer::start();
         server.mock(|when, then| {
             when.method(httpmock::Method::GET)
@@ -3009,23 +3006,11 @@ mod tests {
             http::header::RANGE,
             http::HeaderValue::from_static("bytes=128-255"),
         );
-        let response = source
+        let error = source
             .serve_inner(&headers, true)
             .await
-            .unwrap();
-        assert_eq!(response.status(), http::StatusCode::PARTIAL_CONTENT);
-        assert_eq!(
-            response.headers()[http::header::CONTENT_RANGE],
-            "bytes 128-191/1024"
-        );
-        assert_eq!(response.headers()[http::header::CONTENT_LENGTH], "64");
-        assert_eq!(
-            axum::body::to_bytes(response.into_body(), 1024)
-                .await
-                .unwrap()
-                .len(),
-            64
-        );
+            .unwrap_err();
+        assert_eq!(error.status(), http::StatusCode::SERVICE_UNAVAILABLE);
     }
 
     #[tokio::test]
