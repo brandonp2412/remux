@@ -331,15 +331,16 @@ pub async fn init_app(
         .p2p_enabled
         .unwrap_or(true);
     let torrent_mgr = if p2p_enabled {
-        let mgr = torrent::TorrentManager::from_config(&config).await?;
+        let upload_kbps = saved_config
+            .p2p_upload_speed_kbps
+            .unwrap_or(0);
+        let mgr = torrent::TorrentManager::from_config(&config, upload_kbps).await?;
         mgr.update_limits(
-            saved_config
-                .p2p_upload_speed_kbps
-                .unwrap_or(0),
+            upload_kbps,
             saved_config
                 .p2p_download_speed_kbps
                 .unwrap_or(0),
-        );
+        )?;
         Some(mgr)
     } else {
         None
@@ -508,33 +509,42 @@ impl AppContext {
         }
     }
 
-    pub async fn set_p2p_enabled(&self, enabled: bool) -> anyhow::Result<()> {
+    pub async fn set_p2p_enabled(
+        &self,
+        enabled: bool,
+        upload_kbps: i64,
+    ) -> anyhow::Result<()> {
+        let desired_upload_disabled = upload_kbps <= 0;
         let current = self
             .torrent
             .read()
             .await
             .clone();
-        match (enabled, current.is_some()) {
-            (true, false) => {
-                let mgr =
-                    Arc::new(torrent::TorrentManager::from_config(&self.config).await?);
-                *self
-                    .torrent
-                    .write()
-                    .await = Some(mgr);
+        let recreate = enabled
+            && current
+                .as_ref()
+                .is_some_and(|mgr| mgr.upload_disabled() != desired_upload_disabled);
+
+        if !enabled || recreate {
+            let old = self
+                .torrent
+                .write()
+                .await
+                .take();
+            if let Some(mgr) = old {
+                mgr.shutdown()
+                    .await;
             }
-            (false, true) => {
-                let old = self
-                    .torrent
-                    .write()
-                    .await
-                    .take();
-                if let Some(mgr) = old {
-                    mgr.shutdown()
-                        .await;
-                }
-            }
-            _ => {}
+        }
+
+        if enabled && (current.is_none() || recreate) {
+            let mgr = Arc::new(
+                torrent::TorrentManager::from_config(&self.config, upload_kbps).await?,
+            );
+            *self
+                .torrent
+                .write()
+                .await = Some(mgr);
         }
         Ok(())
     }
@@ -580,6 +590,10 @@ fn default_torrent_http_port() -> u16 {
     9876
 }
 
+fn default_torrent_prefetch_mib() -> u32 {
+    128
+}
+
 #[derive(Deserialize, Serialize, Debug, Clone)]
 pub struct Config {
     #[serde(default = "default_data_dir")]
@@ -599,6 +613,10 @@ pub struct Config {
     /// When absent the OS picks a free ephemeral port.
     #[serde(default = "default_torrent_http_port_opt")]
     pub torrent_http_port: Option<u16>,
+    /// Server-side read-ahead per active torrent response, in MiB. Zero disables
+    /// it; values above 512 are capped to bound memory per response.
+    #[serde(default = "default_torrent_prefetch_mib")]
+    pub torrent_prefetch_mib: u32,
     /// Log queries that exceed this threshold in milliseconds. Defaults to 10 000 ms.
     #[serde(default = "default_slow_query_threshold_ms")]
     pub slow_query_threshold_ms: u64,
@@ -619,6 +637,15 @@ pub struct Config {
     /// (not 0) or many trackers will reject the announce.
     #[serde(default = "default_torrent_peer_port")]
     pub torrent_peer_port: Option<u16>,
+    /// Maximum simultaneous user-controlled background torrent downloads.
+    #[serde(default = "default_background_download_max_active")]
+    pub background_download_max_active: usize,
+    /// Total selected-file reservation cap, in GiB.
+    #[serde(default = "default_background_download_max_gib")]
+    pub background_download_max_gib: u64,
+    /// Maximum persisted download age, including paused downloads.
+    #[serde(default = "default_background_download_max_age_hours")]
+    pub background_download_max_age_hours: u64,
     /// Path to the bgutil-pot binary used by yt-dlp for YouTube POT token generation.
     #[serde(default = "default_bgutil_script_path")]
     pub bgutil_script_path: std::path::PathBuf,
@@ -711,6 +738,16 @@ fn default_torrent_http_port_opt() -> Option<u16> {
     Some(default_torrent_http_port())
 }
 
+fn default_background_download_max_active() -> usize {
+    2
+}
+fn default_background_download_max_gib() -> u64 {
+    32
+}
+fn default_background_download_max_age_hours() -> u64 {
+    168
+}
+
 fn default_torrent_peer_port() -> Option<u16> {
     Some(6881)
 }
@@ -753,10 +790,15 @@ impl Default for Config {
             host: default_host(),
             port: default_port(),
             torrent_http_port: default_torrent_http_port_opt(),
+            torrent_prefetch_mib: default_torrent_prefetch_mib(),
             slow_query_threshold_ms: default_slow_query_threshold_ms(),
             disable_dht: false,
             disable_startup_tasks: false,
             torrent_peer_port: default_torrent_peer_port(),
+            background_download_max_active: default_background_download_max_active(),
+            background_download_max_gib: default_background_download_max_gib(),
+            background_download_max_age_hours:
+                default_background_download_max_age_hours(),
             bgutil_script_path: default_bgutil_script_path(),
             tmdb_base_url: default_tmdb_base_url(),
             remuxdb_url: Some("https://remuxdb.1632022.xyz".to_string()),

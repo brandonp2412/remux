@@ -610,6 +610,51 @@ pub async fn remux_metrics_status(
     }))
 }
 
+#[get("/remux/prefetch/{id}")]
+pub async fn remux_prefetch_status(
+    State(state): State<AppState>,
+    _session: auth::AuthSession,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse> {
+    let stream = db::Media::get_by_id(
+        &state
+            .ctx
+            .db,
+        &id,
+    )
+    .await?;
+    let Some(info) = stream
+        .as_ref()
+        .filter(|s| s.kind == db::MediaKind::Stream)
+        .and_then(|s| {
+            s.stream_info
+                .as_ref()
+        })
+    else {
+        return Ok(Json(Option::<crate::torrent::TorrentPrefetchStatus>::None));
+    };
+    let crate::stream::StreamDescriptor::Torrent {
+        info_hash,
+        file_hint,
+        file_idx,
+        ..
+    } = &info.descriptor
+    else {
+        return Ok(Json(Option::<crate::torrent::TorrentPrefetchStatus>::None));
+    };
+    let manager = state
+        .ctx
+        .torrent
+        .read()
+        .await;
+    let status = manager
+        .as_ref()
+        .and_then(|manager| {
+            manager.prefetch_status(info_hash, *file_idx, file_hint.as_deref())
+        });
+    Ok(Json(status))
+}
+
 #[get("/remux/streams/{id}")]
 pub async fn remux_streams(
     State(state): State<AppState>,

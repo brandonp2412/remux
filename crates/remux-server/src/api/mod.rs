@@ -8,6 +8,7 @@ pub mod artists;
 pub mod client_log;
 pub mod collections;
 pub mod devices;
+pub mod downloads;
 pub mod hls;
 pub mod image;
 pub mod images;
