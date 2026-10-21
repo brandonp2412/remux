@@ -1022,16 +1022,15 @@ impl TorrentManager {
             .context("failed to select torrent playback and prefetch files")?;
         }
 
-        let selected_stats = handle.stats();
-        if selected_stats.total_bytes == 0 {
-            anyhow::bail!(
-                "torrent file selection produced zero selected bytes for file {} ({})",
-                file_idx,
-                files[file_idx].name
-            );
-        }
-
-        if !matches!(selected_stats.state, TorrentStatsState::Live) {
+        // Fresh stream-only torrents start with no selected files. rqbit may
+        // publish the updated selected-byte statistics only after start, so an
+        // immediate zero-byte check here can reject a playable cold source.
+        if !matches!(
+            handle
+                .stats()
+                .state,
+            TorrentStatsState::Live
+        ) {
             if let Err(error) = api
                 .api_torrent_action_start(TorrentIdOrHash::Id(torrent_id))
                 .await
@@ -1050,6 +1049,44 @@ impl TorrentManager {
                 }
             }
         }
+
+        let mut selected_bytes = wait_for_selected_bytes(
+            || {
+                handle
+                    .stats()
+                    .total_bytes
+            },
+            Duration::from_millis(900),
+        )
+        .await;
+        if selected_bytes == 0 {
+            // Reconcile a stale selection once after starting. Parallel episode
+            // requests may have replaced our file list during cold metadata
+            // initialization; preserve their files when restoring ours.
+            let current = api_details_included(&self.session, torrent_id);
+            let restored = merge_playback_selection(&files, file_idx, &current);
+            api.api_torrent_action_update_only_files(
+                TorrentIdOrHash::Id(torrent_id),
+                &restored,
+            )
+            .await
+            .context("failed to restore zero-byte torrent file selection")?;
+            selected_bytes = wait_for_selected_bytes(
+                || {
+                    handle
+                        .stats()
+                        .total_bytes
+                },
+                Duration::from_millis(900),
+            )
+            .await;
+        }
+        anyhow::ensure!(
+            selected_bytes > 0,
+            "torrent file selection produced zero selected bytes for file {} ({})",
+            file_idx,
+            files[file_idx].name
+        );
 
         debug!(
             torrent_id,
@@ -2096,6 +2133,20 @@ fn episode_prefetch_selection(
     selected
 }
 
+async fn wait_for_selected_bytes(
+    mut selected_bytes: impl FnMut() -> u64,
+    budget: Duration,
+) -> u64 {
+    let deadline = tokio::time::Instant::now() + budget;
+    loop {
+        let bytes = selected_bytes();
+        if bytes > 0 || tokio::time::Instant::now() >= deadline {
+            return bytes;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 fn stream_only_options() -> AddTorrentOptions {
     AddTorrentOptions {
         // An empty selection leaves piece ownership to librqbit's HTTP
@@ -3052,6 +3103,36 @@ mod tests {
         ];
 
         assert_eq!(select_file_index(&files, None, None).unwrap(), 1);
+    }
+
+    #[tokio::test]
+    async fn cold_torrent_selection_waits_for_post_start_stats() {
+        let mut polls = 0;
+        let selected = super::wait_for_selected_bytes(
+            || {
+                polls += 1;
+                if polls >= 3 { 4096 } else { 0 }
+            },
+            Duration::from_secs(1),
+        )
+        .await;
+        assert_eq!(selected, 4096);
+        assert_eq!(polls, 3);
+    }
+
+    #[tokio::test]
+    async fn truly_empty_torrent_selection_stays_rejectable() {
+        let mut polls = 0;
+        let selected = super::wait_for_selected_bytes(
+            || {
+                polls += 1;
+                0
+            },
+            Duration::from_millis(115),
+        )
+        .await;
+        assert_eq!(selected, 0);
+        assert!(polls >= 2);
     }
 
     #[test]
