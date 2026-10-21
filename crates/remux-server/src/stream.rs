@@ -178,7 +178,7 @@ mod http_liveness_tests {
             server.mock(|when, then| {
                 when.method(httpmock::Method::GET)
                     .path(path)
-                    .header("Range", "bytes=0-0");
+                    .header("Range", "bytes=0-7");
                 then.status(200)
                     .header("Content-Type", content_type)
                     .body(body);
@@ -202,7 +202,7 @@ mod http_liveness_tests {
             server.mock(|when, then| {
                 when.method(httpmock::Method::GET)
                     .path(path)
-                    .header("Range", "bytes=0-0");
+                    .header("Range", "bytes=0-7");
                 then.status(206)
                     .header("Content-Type", content_type)
                     .body(vec![0u8]);
@@ -366,15 +366,36 @@ impl StreamDescriptor {
         else {
             return false;
         };
-        if response
+        if !response
             .status()
-            .as_u16()
-            >= 400
+            .is_success()
+            || response.content_length() == Some(0)
             || response
                 .url()
                 .path()
                 .rsplit_once("/static/")
                 .is_some_and(|(_, clip)| AIOSTREAMS_ERROR_CLIPS.contains(&clip))
+        {
+            return false;
+        }
+        let content_type = response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|value| {
+                value
+                    .to_str()
+                    .ok()
+            })
+            .unwrap_or("")
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        if content_type.eq_ignore_ascii_case("text/html")
+            || content_type.eq_ignore_ascii_case("application/json")
+            || content_type
+                .to_ascii_lowercase()
+                .ends_with("+json")
         {
             return false;
         }
@@ -391,9 +412,10 @@ impl StreamDescriptor {
                 _ => break,
             }
         }
-        !ARCHIVE_MAGIC
-            .iter()
-            .any(|magic| head.starts_with(magic))
+        !head.is_empty()
+            && !ARCHIVE_MAGIC
+                .iter()
+                .any(|magic| head.starts_with(magic))
     }
 
     /// Instantiate the runtime service for self-contained variants.
