@@ -300,6 +300,27 @@ fn meets_minimum_p2p_resolution(source: &db::Media) -> bool {
     !is_p2p || p2p_resolution_height(source).is_some_and(|height| height >= 720)
 }
 
+/// A complete >=720p torrent is more immediately usable than a cold source.
+/// Preserve the established capability/quality ranking among completed sources.
+fn first_fully_cached_p2p(
+    candidates: &[db::Media],
+    mut is_fully_cached: impl FnMut(&db::Media) -> bool,
+) -> Option<(usize, u32)> {
+    candidates
+        .iter()
+        .enumerate()
+        .find_map(|(index, source)| {
+            let info = source
+                .stream_info
+                .as_ref()?;
+            if !info.is_p2p() {
+                return None;
+            }
+            let height = p2p_resolution_height(source)?;
+            (height >= 720 && is_fully_cached(source)).then_some((index, height))
+        })
+}
+
 fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
     let mut pool = streams.to_vec();
     if pool
@@ -888,13 +909,9 @@ impl StreamService {
             }
             None => Default::default(),
         };
-        // A completed torrent is strong readiness evidence, but cache state must
-        // never silently downgrade a healthy quality-first primary. Only promote
-        // cached P2P sources that are at least the ranked primary's resolution;
-        // lower-resolution cached sources remain available for the bounded
-        // diversified fallback path after the higher-quality source proves bad.
-        // This preserves the fast path for cached same/higher-quality releases
-        // without imposing a universal cached-720p-first policy.
+        // Prefer actual playable-now evidence over a higher-resolution cold swarm.
+        // The original ranking still governs compatibility and quality when
+        // multiple >=720p sources have finished downloading.
         let primary_p2p_height = candidates
             .first()
             .filter(|source| {
@@ -912,36 +929,26 @@ impl StreamService {
                 .await
                 .clone()
         {
-            let cached_choice = candidates
-                .iter()
-                .enumerate()
-                .filter_map(|(index, source)| {
-                    let height = p2p_resolution_height(source)?;
-                    if height < 720 || height < primary_height {
-                        return None;
-                    }
-                    let info = source
-                        .stream_info
-                        .as_ref()?;
-                    let crate::stream::StreamDescriptor::Torrent {
-                        info_hash,
-                        file_hint,
-                        file_idx,
-                        ..
-                    } = &info.descriptor
-                    else {
-                        return None;
-                    };
-                    let status = torrent.prefetch_status(
-                        info_hash,
-                        *file_idx,
-                        file_hint.as_deref(),
-                    )?;
-                    (status.current_total_bytes > 0
-                        && status.current_cached_bytes >= status.current_total_bytes)
-                        .then_some((index, height))
-                })
-                .max_by_key(|(index, height)| (*height, std::cmp::Reverse(*index)));
+            let cached_choice = first_fully_cached_p2p(&candidates, |source| {
+                let Some(crate::stream::StreamDescriptor::Torrent {
+                    info_hash,
+                    file_hint,
+                    file_idx,
+                    ..
+                }) = source
+                    .stream_info
+                    .as_ref()
+                    .map(|info| &info.descriptor)
+                else {
+                    return false;
+                };
+                torrent
+                    .prefetch_status(info_hash, *file_idx, file_hint.as_deref())
+                    .is_some_and(|status| {
+                        status.current_total_bytes > 0
+                            && status.current_cached_bytes >= status.current_total_bytes
+                    })
+            });
             if let Some((index, height)) = cached_choice.filter(|(index, _)| *index > 0)
             {
                 let cached = candidates.remove(index);
@@ -949,7 +956,7 @@ impl StreamService {
                     stream_id = %cached.id,
                     resolution_height = height,
                     primary_resolution_height = primary_height,
-                    "prioritizing same-or-higher-resolution fully cached torrent"
+                    "prioritizing fully cached playable torrent over cold primary"
                 );
                 candidates.insert(0, cached);
             }
@@ -1857,6 +1864,47 @@ mod tests {
     /// Candidates come out in the order PlaybackInfo lists them, and the
     /// first is the one probed and auto-played: addon order with sorting
     /// disabled or for group representatives, capability ranking otherwise.
+    #[test]
+    fn completed_720p_outranks_cold_1080p_but_never_selects_480p() {
+        let torrent = |name: &str| db::Media {
+            title: name.to_string(),
+            stream_info: Some(StreamInfo {
+                descriptor: StreamDescriptor::Torrent {
+                    info_hash: "0123456789abcdef0123456789abcdef01234567".into(),
+                    file_hint: None,
+                    file_idx: None,
+                    trackers: vec![],
+                },
+                filename: Some(format!("{name}.mkv")),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let sources = vec![
+            torrent("cold-1080p"),
+            torrent("cached-480p"),
+            torrent("cached-720p"),
+            torrent("cached-2160p"),
+        ];
+        let completed = |source: &db::Media| {
+            source
+                .title
+                .starts_with("cached")
+        };
+        assert_eq!(first_fully_cached_p2p(&sources, completed), Some((2, 720)));
+        assert_eq!(
+            first_fully_cached_p2p(&sources[..2], completed),
+            None,
+            "completed 480p sources must never be promoted"
+        );
+        let already_cached = vec![torrent("cached-1080p"), torrent("cached-720p")];
+        assert_eq!(
+            first_fully_cached_p2p(&already_cached, completed),
+            Some((0, 1080)),
+            "do not replace an already-cached ranked primary"
+        );
+    }
+
     #[test]
     fn swarm_health_prioritizes_playable_torrents_over_unseeded_4k() {
         let torrent = |name: &str, seeders: Option<i64>| db::Media {
