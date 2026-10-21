@@ -2784,7 +2784,8 @@ where
                         warn!(id = %stream2.id, error = %e, "failed to save probe data");
                     }
                 } else {
-                    warn!(id = %stream2.id, "probe returned no audio or video stream, not caching");
+                    warn!(id = %stream2.id, "probe returned no audio or video stream, trying next source");
+                    continue;
                 }
                 if is_retry {
                     info!(
@@ -4773,6 +4774,71 @@ mod probe_tests {
                 .is_some()
         );
         assert_eq!(effective.id, primary_id);
+    }
+
+    #[tokio::test]
+    async fn empty_probe_falls_back_to_playable_video() {
+        let db = test_db().await;
+        let primary = http_media("http://a.example.com");
+        let fallback = http_media("http://b.example.com");
+        let fallback_id = fallback.id;
+        let all = vec![primary.clone(), fallback];
+        let no_media = Ok((api::MediaSourceInfo::default(), MediaSegments::default()));
+        let result = probe_with_fallback(
+            primary,
+            Some("http://a.example.com".to_string()),
+            10,
+            true,
+            2,
+            &all,
+            false,
+            None,
+            3000,
+            &db,
+            queued_probe(vec![no_media, video_probe()]),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            result
+                .1
+                .id,
+            fallback_id
+        );
+        assert!(
+            result
+                .0
+                .video_stream()
+                .is_some()
+        );
+    }
+
+    #[tokio::test]
+    async fn all_empty_probes_return_error() {
+        let db = test_db().await;
+        let primary = http_media("http://a.example.com");
+        let all = vec![primary.clone()];
+        let result = probe_with_fallback(
+            primary,
+            Some("http://a.example.com".to_string()),
+            10,
+            false,
+            0,
+            &all,
+            false,
+            None,
+            3000,
+            &db,
+            queued_probe(vec![Ok((
+                api::MediaSourceInfo::default(),
+                MediaSegments::default(),
+            ))]),
+        )
+        .await;
+        assert!(
+            result.is_err(),
+            "a stream without audio or video is not playable"
+        );
     }
 
     #[tokio::test]
