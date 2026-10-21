@@ -2619,7 +2619,7 @@ where
         let f = probe_fn.clone();
         let (bounded_header_probe, sequential_matroska) =
             torrent_matroska_probe_mode(&stream);
-        let probe_result = tokio::time::timeout(
+        let fallback_probe = tokio::time::timeout(
             std::time::Duration::from_secs(effective_timeout),
             tokio::task::spawn_blocking(move || {
                 f(
@@ -2629,8 +2629,60 @@ where
                     sequential_matroska,
                 )
             }),
-        )
-        .await;
+        );
+        tokio::pin!(fallback_probe);
+        // A viable cold torrent may become readable while a different source
+        // consumes its entire ffprobe timeout. Race one bounded primary recheck
+        // with the first fallback instead of serializing both waits.
+        let probe_result = if attempt_index == 1
+            && let Some((recovery, recovery_url)) = &primary_recovery
+        {
+            let cached_probe = recovery
+                .probe_data
+                .as_ref()
+                .is_some_and(is_reusable_probe_cache);
+            let recheck_timeout = if cached_probe {
+                effective_timeout.min(2)
+            } else {
+                effective_timeout.min(PRIMARY_P2P_RECOVERY_REPROBE_TIMEOUT_SECS)
+            };
+            let early_recheck = async {
+                tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                recheck_primary_after_warmup(
+                    recovery,
+                    recovery_url,
+                    recheck_timeout,
+                    start_time_ticks,
+                    db,
+                    probe_fn.clone(),
+                )
+                .await
+            };
+            tokio::pin!(early_recheck);
+            tokio::select! {
+                fallback = &mut fallback_probe => fallback,
+                recovered = &mut early_recheck => {
+                    match recovered {
+                        Ok((info, media)) => {
+                            info!(
+                                id = %media.id,
+                                recheck_timeout,
+                                cached_probe,
+                                "preferred torrent became ready during fallback probe"
+                            );
+                            return Ok((info, media));
+                        }
+                        Err(error) => {
+                            debug!(id = %recovery.id, %error,
+                                "preferred torrent still warming during fallback probe");
+                            fallback_probe.await
+                        }
+                    }
+                }
+            }
+        } else {
+            fallback_probe.await
+        };
 
         match probe_result {
             Ok(Ok(Ok((mut probed, segments)))) => {
@@ -4143,6 +4195,82 @@ mod probe_tests {
                 .is_some()
         );
         assert_eq!(source.id, id);
+    }
+
+    #[tokio::test]
+    async fn warmed_primary_returns_before_slow_fallback_probe_timeout() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let db = test_db().await;
+        let mut primary = p2p_media_with_filename("Episode.1080p.primary.mkv", 100);
+        primary.probe_data = Some(
+            video_probe()
+                .unwrap()
+                .0,
+        );
+        let primary_id = primary.id;
+        let fallback = p2p_media_with_filename("Episode.1080p.fallback.mkv", 90);
+        let all = vec![primary.clone(), fallback];
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let addr = listener
+            .local_addr()
+            .unwrap();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let seen = attempts.clone();
+        let app = axum::Router::new().route(
+            "/stream/{id}",
+            axum::routing::get(move |headers: axum::http::HeaderMap| {
+                let seen = seen.clone();
+                async move {
+                    if headers
+                        .contains_key(crate::stream::PROBE_PLAYBACK_READINESS_HEADER)
+                        && seen.fetch_add(1, Ordering::SeqCst) == 0
+                    {
+                        return (reqwest::StatusCode::SERVICE_UNAVAILABLE, Vec::new());
+                    }
+                    (
+                        reqwest::StatusCode::PARTIAL_CONTENT,
+                        vec![0_u8; P2P_READINESS_PROOF_BYTES as usize],
+                    )
+                }
+            }),
+        );
+        let server = tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .unwrap();
+        });
+
+        let started = std::time::Instant::now();
+        let result = probe_with_fallback(
+            primary,
+            Some(format!("http://{addr}/stream/{primary_id}")),
+            15,
+            true,
+            1,
+            &all,
+            false,
+            None,
+            addr.port(),
+            &db,
+            |_url, _timeout, _bounded, _sequential| {
+                std::thread::sleep(std::time::Duration::from_secs(9));
+                Err(anyhow!("fallback probe still waiting for media pieces"))
+            },
+        )
+        .await;
+        server.abort();
+
+        let (_, chosen) = result.unwrap();
+        assert_eq!(chosen.id, primary_id);
+        assert!(attempts.load(Ordering::SeqCst) >= 2);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(8),
+            "ready primary must not wait for the unrelated 9-second fallback probe"
+        );
     }
 
     #[tokio::test]

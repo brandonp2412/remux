@@ -142,6 +142,9 @@ struct SidecarSubtitleFile {
 #[derive(Debug, Clone, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TorrentPrefetchStatus {
+    // Distinguishes a re-added torrent from an earlier cache proof of the same hash.
+    #[serde(skip)]
+    pub(crate) session_torrent_id: usize,
     pub current_cached_bytes: u64,
     pub current_total_bytes: u64,
     pub next_cached_bytes: Option<u64>,
@@ -340,6 +343,7 @@ impl TorrentManager {
         wait: Duration,
         mut on_progress: impl FnMut(usize),
     ) -> Result<(usize, f64)> {
+        anyhow::ensure!(bytes_needed > 0, "cannot prove an empty torrent range");
         let hash = librqbit::Magnet::parse(&format!("magnet:?xt=urn:btih:{info_hash}"))
             .context("invalid torrent info hash")?
             .as_id20()
@@ -815,6 +819,7 @@ impl TorrentManager {
                     .cloned()
             });
         Some(TorrentPrefetchStatus {
+            session_torrent_id: id,
             current_cached_bytes: stats
                 .file_progress
                 .get(index)
@@ -2378,6 +2383,7 @@ mod tests {
     #[test]
     fn startup_readiness_telemetry_is_additive_and_distinct_from_file_cache() {
         let status = TorrentPrefetchStatus {
+            session_torrent_id: 7,
             current_cached_bytes: 80_000_000,
             current_total_bytes: 100_000_000,
             next_cached_bytes: None,
@@ -2393,6 +2399,10 @@ mod tests {
         assert_eq!(json["startupRequiredBytes"], 8_000_000);
         assert_eq!(json["startupReadableBytes"], 2_000_000);
         assert_eq!(json["startupReady"], false);
+        assert!(
+            json.get("sessionTorrentId")
+                .is_none()
+        );
         assert!(
             json.get("nextCachedBytes")
                 .is_some()

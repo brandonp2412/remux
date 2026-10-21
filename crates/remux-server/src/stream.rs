@@ -525,7 +525,7 @@ static AVAILABILITY_CLIENT: std::sync::LazyLock<reqwest::Client> =
 // offset while its session stays warm. Re-probing a large startup window for
 // every FFmpeg/player GET can starve the very reader it was meant to protect.
 static VERIFIED_TORRENT_RANGES: std::sync::LazyLock<
-    moka::sync::Cache<(String, usize, u64), usize>,
+    moka::sync::Cache<(String, usize, u64, usize), usize>,
 > = std::sync::LazyLock::new(|| {
     moka::sync::Cache::builder()
         .max_capacity(4096)
@@ -699,6 +699,17 @@ impl TorrentSource {
         Ok((received, readable_mibps))
     }
 
+    fn reusable_range_proof(
+        verified_bytes: Option<usize>,
+        requested_bytes: usize,
+        cached_bytes: u64,
+    ) -> bool {
+        requested_bytes > 0
+            && verified_bytes.is_some_and(|verified| {
+                verified >= requested_bytes && cached_bytes >= requested_bytes as u64
+            })
+    }
+
     fn readiness_probe_bytes(
         total_bytes: u64,
         probe_start: u64,
@@ -835,18 +846,22 @@ impl TorrentSource {
                         startup_target_bytes,
                         require_playback_readiness,
                     );
+                    anyhow::ensure!(
+                        probe_bytes_needed > 0,
+                        "torrent selected file has no readable startup bytes"
+                    );
                     let cache_key = (
                         self.info_hash
                             .clone(),
                         selected_file_idx,
                         probe_start,
+                        status.session_torrent_id,
                     );
-                    if VERIFIED_TORRENT_RANGES
-                        .get(&cache_key)
-                        .is_some_and(|verified_bytes| {
-                            verified_bytes >= probe_bytes_needed
-                        })
-                    {
+                    if Self::reusable_range_proof(
+                        VERIFIED_TORRENT_RANGES.get(&cache_key),
+                        probe_bytes_needed,
+                        status.current_cached_bytes,
+                    ) {
                         torrent.note_range_ready(&self.info_hash, selected_file_idx);
                         tracing::debug!(info_hash = %self.info_hash, probe_start,
                             probe_bytes_needed, "reusing verified torrent range for playback");
@@ -1696,7 +1711,7 @@ mod tests {
     #[test]
     fn remembered_startup_range_is_specific_to_torrent_file_and_offset() {
         let hash = uuid::Uuid::new_v4().to_string();
-        let key = (hash.clone(), 2, 0);
+        let key = (hash.clone(), 2, 0, 17);
         super::VERIFIED_TORRENT_RANGES.insert(key.clone(), 4 * 1024 * 1024);
         assert!(
             super::VERIFIED_TORRENT_RANGES
@@ -1712,14 +1727,46 @@ mod tests {
         );
         assert!(
             super::VERIFIED_TORRENT_RANGES
-                .get(&(hash.clone(), 3, 0))
+                .get(&(hash.clone(), 3, 0, 17))
                 .is_none()
         );
         assert!(
             super::VERIFIED_TORRENT_RANGES
-                .get(&(hash, 2, 100))
+                .get(&(hash.clone(), 2, 100, 17))
                 .is_none()
         );
+        assert!(
+            super::VERIFIED_TORRENT_RANGES
+                .get(&(hash, 2, 0, 18))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn old_range_proof_requires_downloaded_bytes_in_current_session() {
+        const MIB: usize = 1024 * 1024;
+        assert!(TorrentSource::reusable_range_proof(
+            Some(4 * MIB),
+            MIB,
+            MIB as u64
+        ));
+        assert!(!TorrentSource::reusable_range_proof(Some(4 * MIB), MIB, 0));
+        assert!(!TorrentSource::reusable_range_proof(
+            Some(4 * MIB),
+            MIB,
+            (MIB - 1) as u64
+        ));
+        assert!(!TorrentSource::reusable_range_proof(
+            Some(MIB - 1),
+            MIB,
+            8 * MIB as u64
+        ));
+        assert!(!TorrentSource::reusable_range_proof(
+            None,
+            MIB,
+            8 * MIB as u64
+        ));
+        assert!(!TorrentSource::reusable_range_proof(Some(0), 0, 0));
     }
 
     #[test]
