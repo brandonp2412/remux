@@ -13,6 +13,34 @@ use remux_sdks::{
 use tracing::{debug, warn};
 use uuid::Uuid;
 
+#[derive(Debug)]
+pub(crate) struct P2pReadinessPending {
+    pub cached_bytes: u64,
+    pub total_bytes: u64,
+    pub download_mibps: f64,
+    pub live_peers: u64,
+}
+
+impl std::fmt::Display for P2pReadinessPending {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "P2P source is downloading but its playback range is not ready"
+        )
+    }
+}
+impl std::error::Error for P2pReadinessPending {}
+
+fn progressing_source(status: &crate::torrent::TorrentPrefetchStatus) -> bool {
+    // A ready header is not proof that the requested resume range is readable.
+    // We only reach this check after every real playback probe failed.
+    status.current_total_bytes > 0
+        && status.current_cached_bytes < status.current_total_bytes
+        && status.current_cached_bytes >= 1024 * 1024
+        && status.live_peers > 0
+        && status.download_mibps >= 0.05
+}
+
 /// Result of probing a single stream candidate.
 pub(crate) struct ProbeResult {
     /// Probed source info with id/name/path/remux already stamped.
@@ -29,6 +57,71 @@ pub(crate) struct ProbeResult {
 }
 
 /// What a subtitle addon needs to match subtitles to this exact release.
+fn explicit_episode_filename_date(source: &db::Media) -> Option<chrono::NaiveDate> {
+    static YMD: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:^|[^0-9])((?:19|20)\d{2})[._ -](\d{1,2})[._ -](\d{1,2})(?:[^0-9]|$)",
+        )
+        .expect("valid year-first episode date regex")
+    });
+    static DMY: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(
+            r"(?:^|[^0-9])(\d{1,2})[._ -](\d{1,2})[._ -]((?:19|20)\d{2})(?:[^0-9]|$)",
+        )
+        .expect("valid day-first episode date regex")
+    });
+
+    let filename = source
+        .stream_info
+        .as_ref()?
+        .filename
+        .as_deref()?;
+
+    let date =
+        |captures: regex::Captures<'_>, year: usize, month: usize, day: usize| {
+            chrono::NaiveDate::from_ymd_opt(
+                captures
+                    .get(year)?
+                    .as_str()
+                    .parse()
+                    .ok()?,
+                captures
+                    .get(month)?
+                    .as_str()
+                    .parse()
+                    .ok()?,
+                captures
+                    .get(day)?
+                    .as_str()
+                    .parse()
+                    .ok()?,
+            )
+        };
+
+    YMD.captures(filename)
+        .and_then(|captures| date(captures, 1, 2, 3))
+        .or_else(|| {
+            DMY.captures(filename)
+                .and_then(|captures| date(captures, 3, 2, 1))
+        })
+}
+
+fn episode_source_matches_air_date(
+    source: &db::Media,
+    expected: Option<chrono::NaiveDate>,
+) -> bool {
+    let (Some(expected), Some(actual)) =
+        (expected, explicit_episode_filename_date(source))
+    else {
+        return true;
+    };
+    expected
+        .signed_duration_since(actual)
+        .num_days()
+        .abs()
+        <= 1
+}
+
 fn subtitle_query_for(stream: &db::Media) -> crate::addons::SubtitleQuery {
     let info = stream
         .stream_info
@@ -113,9 +206,128 @@ pub(crate) struct StreamService {
     pub streams: Vec<db::Media>,
 }
 
+/// Coarse swarm-health buckets. Seed counts are estimates; probes remain the
+/// authority on actual source readiness and playable bytes.
+fn torrent_availability_tier(source: &db::Media) -> u8 {
+    let Some(info) = source
+        .stream_info
+        .as_ref()
+    else {
+        return 1;
+    };
+    if !info.is_p2p() {
+        return 1;
+    }
+    match info.seeders {
+        Some(20..) => 4,
+        Some(5..) => 3,
+        Some(1..) => 2,
+        Some(0) => 0,
+        _ => 1,
+    }
+}
+
+/// Uncached Blu-ray remuxes are often much too bitrate-heavy to sustain
+/// over a torrent even when their reported seed count is high. Prefer an
+/// encoded release in the same swarm-health tier before comparing seeders.
+fn torrent_playability_tier(source: &db::Media) -> u8 {
+    let Some(info) = source
+        .stream_info
+        .as_ref()
+    else {
+        return 1;
+    };
+    if !info.is_p2p() {
+        return 1;
+    }
+    let filename = info
+        .filename
+        .as_deref()
+        .unwrap_or(&source.title);
+    u8::from(
+        !filename
+            .to_ascii_lowercase()
+            .contains("remux"),
+    )
+}
+
+fn prefer_available_torrents(sources: &mut [db::Media]) {
+    // Preserve priority of non-P2P or cached service sources: advertised
+    // seeder counts are only comparable between torrent candidates.
+    if !sources
+        .iter()
+        .all(|source| {
+            source
+                .stream_info
+                .as_ref()
+                .is_some_and(|si| si.is_p2p())
+        })
+    {
+        return;
+    }
+    // Stable: keep the client's capability/quality ranking within each tier.
+    sources.sort_by_cached_key(|source| {
+        // Avoid trying a 20-seed torrent before a 120-seed candidate solely
+        // because both fall in the same coarse availability bucket.
+        let seeders = source
+            .stream_info
+            .as_ref()
+            .and_then(|si| si.seeders)
+            .unwrap_or(-1);
+        std::cmp::Reverse((
+            torrent_availability_tier(source),
+            torrent_playability_tier(source),
+            seeders,
+        ))
+    });
+}
+
+fn p2p_resolution_height(source: &db::Media) -> Option<u32> {
+    source
+        .stream_info
+        .as_ref()
+        .and_then(|info| info.resolution_tag())
+        .and_then(|tag| {
+            tag.trim_end_matches(['p', 'i'])
+                .parse::<u32>()
+                .ok()
+        })
+}
+
+fn meets_minimum_p2p_resolution(source: &db::Media) -> bool {
+    let is_p2p = source
+        .stream_info
+        .as_ref()
+        .is_some_and(|info| info.is_p2p());
+    !is_p2p || p2p_resolution_height(source).is_some_and(|height| height >= 720)
+}
+
 fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
     let mut pool = streams.to_vec();
-    pool.sort_by_cached_key(|stream| std::cmp::Reverse(stream.quality_weight()));
+    if pool
+        .iter()
+        .all(|source| {
+            source
+                .stream_info
+                .as_ref()
+                .is_some_and(|si| si.is_p2p())
+        })
+    {
+        pool.sort_by_cached_key(|stream| {
+            std::cmp::Reverse((
+                torrent_availability_tier(stream),
+                torrent_playability_tier(stream),
+                stream.quality_weight(),
+                stream
+                    .stream_info
+                    .as_ref()
+                    .and_then(|si| si.seeders)
+                    .unwrap_or(-1),
+            ))
+        });
+    } else {
+        pool.sort_by_cached_key(|stream| std::cmp::Reverse(stream.quality_weight()));
+    }
     pool
 }
 
@@ -215,6 +427,7 @@ impl StreamService {
             );
             (info, allow_subtitle_extraction)
         });
+        prefer_available_torrents(sources);
         extraction
     }
 
@@ -275,6 +488,12 @@ impl StreamService {
         let root_kind = root
             .kind
             .clone();
+        let root_air_date = (root_kind == db::MediaKind::Episode)
+            .then(|| {
+                root.released_at
+                    .map(|date| date.date())
+            })
+            .flatten();
         let db_streams = root
             .streams(
                 &self
@@ -307,6 +526,24 @@ impl StreamService {
             self.show_ungrouped,
         )
         .await;
+        let streams: Vec<_> = streams
+            .into_iter()
+            .filter(|source| {
+                let keep = root_kind != db::MediaKind::Episode
+                    || episode_source_matches_air_date(source, root_air_date);
+                if !keep {
+                    debug!(
+                        id = %source.id,
+                        filename = ?source.stream_info.as_ref().and_then(|info| info.filename.as_deref()),
+                        expected_air_date = ?root_air_date,
+                        source_date = ?explicit_episode_filename_date(source),
+                        "dropping episode source whose explicit filename date mismatches the requested air date"
+                    );
+                }
+                keep
+            })
+            .collect();
+
         let streams = if let Some(sf) = self
             .stream_filter
             .as_ref()
@@ -337,6 +574,23 @@ impl StreamService {
             );
             streams
         };
+
+        let streams: Vec<_> = streams
+            .into_iter()
+            .filter(|source| {
+                let keep = meets_minimum_p2p_resolution(source);
+                if !keep {
+                    debug!(
+                        id = %source.id,
+                        title = %source.title,
+                        filename = ?source.stream_info.as_ref().and_then(|info| info.filename.as_deref()),
+                        resolution = ?source.stream_info.as_ref().and_then(|info| info.resolution_tag()),
+                        "dropping P2P source below or without verified 720p resolution"
+                    );
+                }
+                keep
+            })
+            .collect();
 
         if streams.is_empty() {
             return Ok(());
@@ -606,7 +860,9 @@ impl StreamService {
         StreamSelection {
             candidates,
             probe_pool,
-            restrict_resolution: true,
+            // Auto-play may fall back from an unseeded 4K source to a viable
+            // 1080p release. Explicitly selected resolutions stay respected.
+            restrict_resolution: specific_requested,
             specific_requested,
         }
     }
@@ -634,6 +890,73 @@ impl StreamService {
             }
             None => Default::default(),
         };
+        // A completed torrent is strong readiness evidence, but cache state must
+        // never silently downgrade a healthy quality-first primary. Only promote
+        // cached P2P sources that are at least the ranked primary's resolution;
+        // lower-resolution cached sources remain available for the bounded
+        // diversified fallback path after the higher-quality source proves bad.
+        // This preserves the fast path for cached same/higher-quality releases
+        // without imposing a universal cached-720p-first policy.
+        let primary_p2p_height = candidates
+            .first()
+            .filter(|source| {
+                source
+                    .stream_info
+                    .as_ref()
+                    .is_some_and(|info| info.is_p2p())
+            })
+            .and_then(p2p_resolution_height);
+        if let Some(primary_height) = primary_p2p_height
+            && let Some(torrent) = self
+                .ctx
+                .torrent
+                .read()
+                .await
+                .clone()
+        {
+            let cached_choice = candidates
+                .iter()
+                .enumerate()
+                .filter_map(|(index, source)| {
+                    let height = p2p_resolution_height(source)?;
+                    if height < 720 || height < primary_height {
+                        return None;
+                    }
+                    let info = source
+                        .stream_info
+                        .as_ref()?;
+                    let crate::stream::StreamDescriptor::Torrent {
+                        info_hash,
+                        file_hint,
+                        file_idx,
+                        ..
+                    } = &info.descriptor
+                    else {
+                        return None;
+                    };
+                    let status = torrent.prefetch_status(
+                        info_hash,
+                        *file_idx,
+                        file_hint.as_deref(),
+                    )?;
+                    (status.current_total_bytes > 0
+                        && status.current_cached_bytes >= status.current_total_bytes)
+                        .then_some((index, height))
+                })
+                .max_by_key(|(index, height)| (*height, std::cmp::Reverse(*index)));
+            if let Some((index, height)) = cached_choice.filter(|(index, _)| *index > 0)
+            {
+                let cached = candidates.remove(index);
+                tracing::info!(
+                    stream_id = %cached.id,
+                    resolution_height = height,
+                    primary_resolution_height = primary_height,
+                    "prioritizing same-or-higher-resolution fully cached torrent"
+                );
+                candidates.insert(0, cached);
+            }
+        }
+
         (candidates, extraction)
     }
 
@@ -649,6 +972,7 @@ impl StreamService {
         &self,
         ranking: Option<SourceRankingContext<'_>>,
         prefs: DefaultStreamPrefs<'_>,
+        start_time_ticks: Option<i64>,
     ) -> anyhow::Result<ProbedStreams> {
         let mut sel = self.select_streams();
         let (candidates, extraction) = self
@@ -785,6 +1109,7 @@ impl StreamService {
                 max_retries,
                 &sel.probe_pool,
                 sel.restrict_resolution,
+                start_time_ticks,
                 port,
                 &self
                     .ctx
@@ -800,8 +1125,68 @@ impl StreamService {
                     .unwrap_or_default(),
                 None => Vec::new(),
             };
-            let (mut source, effective_stream, outcome) =
-                probed.map_err(|e| anyhow::anyhow!("{e:?}"))?;
+            let (mut source, effective_stream, outcome) = match probed {
+                Ok(result) => result,
+                Err(error) => {
+                    // This is not a playable source yet. A verified, growing
+                    // selected-file download deserves Wait/Retry, not HTTP 500.
+                    // Missing peers, stale metadata and stalled downloads must
+                    // retain the ordinary failure path.
+                    if let Some(torrent) = self
+                        .ctx
+                        .torrent
+                        .read()
+                        .await
+                        .clone()
+                    {
+                        let pending = sel
+                            .probe_pool
+                            .iter()
+                            .filter_map(|candidate| {
+                                let info = candidate
+                                    .stream_info
+                                    .as_ref()?;
+                                let crate::stream::StreamDescriptor::Torrent {
+                                    info_hash,
+                                    file_hint,
+                                    file_idx,
+                                    ..
+                                } = &info.descriptor
+                                else {
+                                    return None;
+                                };
+                                torrent
+                                    .prefetch_status(
+                                        info_hash,
+                                        *file_idx,
+                                        file_hint.as_deref(),
+                                    )
+                                    .filter(progressing_source)
+                            })
+                            .max_by(|a, b| {
+                                a.download_mibps
+                                    .total_cmp(&b.download_mibps)
+                            });
+                        if let Some(status) = pending {
+                            warn!(
+                                cached_bytes = status.current_cached_bytes,
+                                total_bytes = status.current_total_bytes,
+                                download_mibps = status.download_mibps,
+                                live_peers = status.live_peers,
+                                "source still downloading after exhausted playback probes"
+                            );
+                            return Err(anyhow::Error::new(P2pReadinessPending {
+                                cached_bytes: status.current_cached_bytes,
+                                total_bytes: status.current_total_bytes,
+                                download_mibps: status.download_mibps,
+                                live_peers: status.live_peers,
+                            })
+                            .context(format!("playback probes exhausted: {error:?}")));
+                        }
+                    }
+                    return Err(anyhow::anyhow!("{error:?}"));
+                }
+            };
             // The probe failed over to another release, whose subtitles are
             // for a different file than the ones just fetched.
             if effective_stream.id != stream.id
@@ -1366,6 +1751,47 @@ mod tests {
     use crate::stream::{StreamDescriptor, StreamInfo};
 
     #[test]
+    fn episode_source_air_date_guard_rejects_raw_episode_from_2025() {
+        let source = db::Media {
+            stream_info: Some(StreamInfo {
+                filename: Some(
+                    "WWE Monday Night Raw (7.07.2025) 1080p WEBDL H264.mkv".into(),
+                ),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let expected = chrono::NaiveDate::from_ymd_opt(1993, 3, 1);
+
+        assert!(!episode_source_matches_air_date(&source, expected));
+    }
+
+    #[test]
+    fn episode_source_air_date_guard_accepts_matching_or_nearby_dates() {
+        let source = |filename: &str| db::Media {
+            stream_info: Some(StreamInfo {
+                filename: Some(filename.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let expected = chrono::NaiveDate::from_ymd_opt(1993, 3, 1);
+
+        assert!(episode_source_matches_air_date(
+            &source("WWE.Monday.Night.Raw.1993.03.01.720p.mkv"),
+            expected
+        ));
+        assert!(episode_source_matches_air_date(
+            &source("Daily.Show.1993-03-02.1080p.mkv"),
+            expected
+        ));
+        assert!(episode_source_matches_air_date(
+            &source("Raw - 1st March 1993.mp4"),
+            expected
+        ));
+    }
+
+    #[test]
     fn subtitle_query_comes_from_the_streams_filename_and_size() {
         let stream = db::Media {
             stream_info: Some(StreamInfo {
@@ -1456,6 +1882,58 @@ mod tests {
     /// Candidates come out in the order PlaybackInfo lists them, and the
     /// first is the one probed and auto-played: addon order with sorting
     /// disabled or for group representatives, capability ranking otherwise.
+    #[test]
+    fn swarm_health_prioritizes_playable_torrents_over_unseeded_4k() {
+        let torrent = |name: &str, seeders: Option<i64>| db::Media {
+            title: name.to_string(),
+            stream_info: Some(StreamInfo {
+                descriptor: StreamDescriptor::Torrent {
+                    info_hash: "0123456789abcdef0123456789abcdef01234567".to_string(),
+                    file_hint: None,
+                    file_idx: None,
+                    trackers: vec![],
+                },
+                filename: Some(format!("{name}.mkv")),
+                seeders,
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let mut sources = vec![
+            torrent("4k_unseeded", Some(0)),
+            torrent("1080p_fast", Some(58)),
+            torrent("4k_unknown", None),
+            torrent("1080p_slow", Some(2)),
+        ];
+        prefer_available_torrents(&mut sources);
+        assert_eq!(
+            sources
+                .iter()
+                .map(|m| m
+                    .title
+                    .as_str())
+                .collect::<Vec<_>>(),
+            vec!["1080p_fast", "1080p_slow", "4k_unknown", "4k_unseeded"]
+        );
+        assert_eq!(quality_ordered_probe_pool(&sources)[0].title, "1080p_fast");
+        let mut mixed = vec![torrent("p2p", Some(100)), db::Media::default()];
+        prefer_available_torrents(&mut mixed);
+        assert_eq!(mixed[0].title, "p2p");
+
+        // A 79 GB UHD Blu-ray remux with more advertised seeders is not
+        // necessarily more playable than an encoded 4K release.
+        let mut high_bitrate = vec![
+            torrent("2160p_bluray_remux", Some(152)),
+            torrent("2160p_web", Some(100)),
+        ];
+        prefer_available_torrents(&mut high_bitrate);
+        assert_eq!(high_bitrate[0].title, "2160p_web");
+        assert_eq!(
+            quality_ordered_probe_pool(&high_bitrate)[0].title,
+            "2160p_web"
+        );
+    }
+
     #[tokio::test]
     async fn rank_candidates_orders_like_playback_info() {
         use crate::integration_test::{authenticated_server, insert_test_source};
@@ -2118,5 +2596,44 @@ mod tests {
             StreamService::selected_stream_for(ctx, "psid-group-request", group_a),
             Some(alive.id)
         );
+    }
+}
+
+#[cfg(test)]
+mod readiness_tests {
+    use super::*;
+
+    fn status() -> crate::torrent::TorrentPrefetchStatus {
+        crate::torrent::TorrentPrefetchStatus {
+            session_torrent_id: 7,
+            current_cached_bytes: 8 * 1024 * 1024,
+            current_total_bytes: 100 * 1024 * 1024,
+            next_cached_bytes: None,
+            next_total_bytes: None,
+            download_mibps: 1.25,
+            live_peers: 2,
+            startup_required_bytes: Some(12 * 1024 * 1024),
+            startup_readable_bytes: Some(4 * 1024 * 1024),
+            startup_ready: false,
+        }
+    }
+
+    #[test]
+    fn only_measured_live_progress_is_retryable() {
+        let mut s = status();
+        assert!(progressing_source(&s));
+        s.startup_ready = true;
+        assert!(progressing_source(&s)); // header was ready, resume range may not be
+        s.current_cached_bytes = s.current_total_bytes;
+        assert!(!progressing_source(&s)); // fully cached failure is a real error
+        s.current_cached_bytes = 8 * 1024 * 1024;
+        s.live_peers = 0;
+        assert!(!progressing_source(&s));
+        s.live_peers = 2;
+        s.download_mibps = 0.0;
+        assert!(!progressing_source(&s));
+        s.download_mibps = 1.0;
+        s.current_cached_bytes = 0;
+        assert!(!progressing_source(&s));
     }
 }
