@@ -2495,6 +2495,61 @@ where
             {}
         })
     }));
+    // Hedge a cold local torrent's first fallback after a brief grace period.
+    // It is already being prewarmed above; probe it while the primary is still
+    // waiting on sparse pieces, but keep the preferred source's first chance.
+    // Reuse the hedge on retry and abort it if the primary succeeds.
+    let first_fallback = all_to_try
+        .get(1)
+        .and_then(|(stream, url)| {
+            url.as_ref()
+                .filter(|url| is_local_p2p_prewarm_url(stream, url))
+                .filter(|_| {
+                    primary_url
+                        .as_ref()
+                        .is_some_and(|url| is_local_p2p_prewarm_url(&primary, url))
+                        && !primary
+                            .probe_data
+                            .as_ref()
+                            .is_some_and(is_reusable_probe_cache)
+                        && !stream
+                            .probe_data
+                            .as_ref()
+                            .is_some_and(is_reusable_probe_cache)
+                })
+                .map(|url| (stream.clone(), url.clone()))
+        });
+    let hedge_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let (mut hedged_fallback_result, mut hedged_fallback_guard) =
+        if let Some((stream, url)) = first_fallback {
+            let effective_timeout =
+                probe_attempt_timeout(&stream, timeout_secs, false, false);
+            let (bounded_header_probe, sequential_matroska) =
+                torrent_matroska_probe_mode(&stream);
+            let probe = probe_fn.clone();
+            let started = hedge_started.clone();
+            let (sender, receiver) = tokio::sync::oneshot::channel();
+            let task = tokio::spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+                started.store(true, std::sync::atomic::Ordering::Release);
+                let result = tokio::time::timeout(
+                    std::time::Duration::from_secs(effective_timeout),
+                    tokio::task::spawn_blocking(move || {
+                        probe(
+                            url,
+                            effective_timeout,
+                            bounded_header_probe,
+                            sequential_matroska,
+                        )
+                    }),
+                )
+                .await;
+                let _ = sender.send(result);
+            });
+            (Some(receiver), AbortPrewarm(Some(task)))
+        } else {
+            (None, AbortPrewarm(None))
+        };
     let total_available = probe_pool.len();
     let total_attempts = all_to_try.len();
     // Keep a local P2P primary eligible for one final live probe after alternate
@@ -2649,24 +2704,50 @@ where
                 "probe failed, trying next matching stream"
             );
         }
+        if attempt_index == 1
+            && !hedge_started.load(std::sync::atomic::Ordering::Acquire)
+        {
+            // If the primary failed in under six seconds, start its fallback
+            // immediately. Waiting for a scheduled hedge would be a regression.
+            hedged_fallback_result.take();
+            if let Some(task) = hedged_fallback_guard
+                .0
+                .take()
+            {
+                task.abort();
+            }
+        }
         let url2 = url.clone();
         let stream2 = stream.clone();
         let db2 = db.clone();
         let f = probe_fn.clone();
         let (bounded_header_probe, sequential_matroska) =
             torrent_matroska_probe_mode(&stream);
-        let fallback_probe = tokio::time::timeout(
-            std::time::Duration::from_secs(effective_timeout),
-            tokio::task::spawn_blocking(move || {
-                f(
-                    url2,
-                    effective_timeout,
-                    bounded_header_probe,
-                    sequential_matroska,
-                )
-            }),
-        );
+        let fallback_probe = async {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(effective_timeout),
+                tokio::task::spawn_blocking(move || {
+                    f(
+                        url2,
+                        effective_timeout,
+                        bounded_header_probe,
+                        sequential_matroska,
+                    )
+                }),
+            )
+            .await
+        };
         tokio::pin!(fallback_probe);
+        let selected_probe = async {
+            if attempt_index == 1
+                && let Some(result) = hedged_fallback_result.take()
+                && let Ok(completed) = result.await
+            {
+                return completed;
+            }
+            fallback_probe.await
+        };
+        tokio::pin!(selected_probe);
         // A viable cold torrent may become readable while a different source
         // consumes its entire ffprobe timeout. Race one bounded primary recheck
         // with the first fallback instead of serializing both waits.
@@ -2696,7 +2777,7 @@ where
             };
             tokio::pin!(early_recheck);
             tokio::select! {
-                fallback = &mut fallback_probe => fallback,
+                fallback = &mut selected_probe => fallback,
                 recovered = &mut early_recheck => {
                     match recovered {
                         Ok((info, media)) => {
@@ -2711,13 +2792,13 @@ where
                         Err(error) => {
                             debug!(id = %recovery.id, %error,
                                 "preferred torrent still warming during fallback probe");
-                            fallback_probe.await
+                            selected_probe.await
                         }
                     }
                 }
             }
         } else {
-            fallback_probe.await
+            selected_probe.await
         };
 
         match probe_result {
@@ -4336,6 +4417,55 @@ mod probe_tests {
                 .is_some()
         );
         assert_eq!(source.id, id);
+    }
+
+    #[tokio::test]
+    async fn first_fallback_probe_is_hedged_before_cold_primary_timeout() {
+        use std::sync::atomic::{AtomicU64, Ordering};
+
+        let db = test_db().await;
+        let primary = p2p_media_with_filename("Movie.1080p.primary.mkv", 100);
+        let fallback = p2p_media_with_filename("Movie.1080p.fallback.mkv", 90);
+        let primary_id = primary.id;
+        let fallback_id = fallback.id;
+        let all = vec![primary.clone(), fallback];
+        let fallback_started_ms = Arc::new(AtomicU64::new(u64::MAX));
+        let observed = fallback_started_ms.clone();
+        let started = std::time::Instant::now();
+
+        let result = probe_with_fallback(
+            primary,
+            Some(format!("http://127.0.0.1:1/stream/{primary_id}")),
+            7,
+            true,
+            1,
+            &all,
+            false,
+            None,
+            1,
+            &db,
+            move |url, _timeout, _bounded, _sequential| {
+                if url.contains(&primary_id.to_string()) {
+                    std::thread::sleep(std::time::Duration::from_secs(8));
+                    Err(anyhow!("primary torrent still lacks sparse pieces"))
+                } else {
+                    observed.store(
+                        started
+                            .elapsed()
+                            .as_millis() as u64,
+                        Ordering::SeqCst,
+                    );
+                    video_probe()
+                }
+            },
+        )
+        .await;
+        let (_, chosen) = result.unwrap();
+        assert_eq!(chosen.id, fallback_id);
+        assert!(
+            fallback_started_ms.load(Ordering::SeqCst) < 7_000,
+            "fallback must be probed before the primary's 7s deadline"
+        );
     }
 
     #[tokio::test]
