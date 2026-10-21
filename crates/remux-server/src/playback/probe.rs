@@ -4229,12 +4229,9 @@ mod probe_tests {
                         .contains_key(crate::stream::PROBE_PLAYBACK_READINESS_HEADER)
                         && seen.fetch_add(1, Ordering::SeqCst) == 0
                     {
-                        return (reqwest::StatusCode::SERVICE_UNAVAILABLE, Vec::new());
+                        return range_response(&headers, reqwest::StatusCode::SERVICE_UNAVAILABLE);
                     }
-                    (
-                        reqwest::StatusCode::PARTIAL_CONTENT,
-                        vec![0_u8; P2P_READINESS_PROOF_BYTES as usize],
-                    )
+                    range_response(&headers, reqwest::StatusCode::PARTIAL_CONTENT)
                 }
             }),
         );
