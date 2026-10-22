@@ -177,6 +177,20 @@ fn video_resolution_text(width: Option<i64>, height: Option<i64>) -> Option<Stri
     }
 }
 
+// Use decoded dimensions, not the torrent's advertised "720p" label. A
+// letterboxed 1280x544 release is still 720p-class; 960x544 is not.
+fn probed_video_meets_minimum_resolution(info: &api::MediaSourceInfo) -> bool {
+    info.video_stream()
+        .is_some_and(|video| {
+            video
+                .width
+                .is_some_and(|width| width >= 1280)
+                || video
+                    .height
+                    .is_some_and(|height| height >= 720)
+        })
+}
+
 /// Conventional channel-layout name for a channel count, matching what
 /// ffprobe's own `channel_layout` normally reports (and what Jellyfin shows)
 /// — used only when the real `channel_layout` string isn't available, so a
@@ -2240,6 +2254,15 @@ where
         .is_some_and(is_reusable_probe_cache)
     {
         let info = api::MediaSourceInfo::from(stream.clone());
+        if info
+            .video_stream()
+            .is_some()
+        {
+            anyhow::ensure!(
+                probed_video_meets_minimum_resolution(&info),
+                "cached torrent video is below 720p"
+            );
+        }
         verify_cached_p2p_playback_ranges(url, timeout_secs, &info, start_time_ticks)
             .await?;
         let mut info = info;
@@ -2273,6 +2296,15 @@ where
             anyhow::anyhow!("warmed primary probe task failed: {error}")
         })?;
         let (mut probed, segments) = probe_result?;
+        if probed
+            .video_stream()
+            .is_some()
+        {
+            anyhow::ensure!(
+                probed_video_meets_minimum_resolution(&probed),
+                "warmed torrent video is below 720p"
+            );
+        }
         anyhow::ensure!(
             probed
                 .video_stream()
@@ -2659,6 +2691,15 @@ where
             })
         {
             let cached_info = api::MediaSourceInfo::from(stream.clone());
+            if cached_info
+                .video_stream()
+                .is_some()
+                && !probed_video_meets_minimum_resolution(&cached_info)
+            {
+                pending_p2p_only = false;
+                warn!(id = %stream.id, "cached torrent video is below 720p; trying next source");
+                continue;
+            }
             match verify_cached_p2p_playback_ranges(
                 &url,
                 effective_timeout,
@@ -2805,6 +2846,23 @@ where
                     && filename_requires_video(&stream)
                 {
                     warn!(id = %stream.id, url = %url, "video release probed as audio-only; trying another source");
+                    continue;
+                }
+                if is_p2p
+                    && probed
+                        .video_stream()
+                        .is_some()
+                    && !probed_video_meets_minimum_resolution(&probed)
+                {
+                    // Persist real dimensions so subsequent attempts reject this
+                    // mislabeled release without downloading it again.
+                    if let Err(error) =
+                        db::Media::save_probe_data(&db2, &stream2.id, &probed).await
+                    {
+                        warn!(id = %stream.id, %error, "failed to save undersized video probe");
+                    }
+                    pending_p2p_only = false;
+                    warn!(id = %stream.id, "torrent advertised 720p+ but decoded below 720p; trying next source");
                     continue;
                 }
                 // Reject streams whose probed duration is suspiciously short
@@ -3641,6 +3699,8 @@ mod probe_tests {
             api::MediaSourceInfo {
                 media_streams: vec![MediaStream {
                     type_: Some(MediaStreamType::Video),
+                    width: Some(1920),
+                    height: Some(1080),
                     ..Default::default()
                 }],
                 ..Default::default()
@@ -4090,6 +4150,59 @@ mod probe_tests {
             fallback_prewarm_ranges(&torrent, Some(330 * 10_000_000)),
             vec![(0, 1_048_575)]
         );
+    }
+
+    #[test]
+    fn decoded_dimensions_enforce_720p_without_rejecting_letterboxed_video() {
+        let source = |width, height| api::MediaSourceInfo {
+            media_streams: vec![api::MediaStream {
+                type_: Some(api::MediaStreamType::Video),
+                width,
+                height,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(probed_video_meets_minimum_resolution(&source(
+            Some(1280),
+            Some(544)
+        )));
+        assert!(probed_video_meets_minimum_resolution(&source(
+            Some(1920),
+            Some(816)
+        )));
+        assert!(!probed_video_meets_minimum_resolution(&source(
+            Some(960),
+            Some(544)
+        )));
+        assert!(!probed_video_meets_minimum_resolution(&source(None, None)));
+    }
+
+    #[tokio::test]
+    async fn mislabeled_p2p_video_cannot_win_startup_probe() {
+        let db = test_db().await;
+        let primary = p2p_media_with_filename("Show.S01E01.720p.H264.mkv", 10);
+        let mut low = video_probe()
+            .unwrap()
+            .0;
+        low.media_streams[0].width = Some(960);
+        low.media_streams[0].height = Some(544);
+        let error = probe_with_fallback(
+            primary.clone(),
+            Some("http://127.0.0.1:3104/stream/probe-test".into()),
+            5,
+            false,
+            0,
+            &[primary],
+            false,
+            None,
+            3104,
+            &db,
+            queued_probe(vec![Ok((low, MediaSegments::default()))]),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(error.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[test]
