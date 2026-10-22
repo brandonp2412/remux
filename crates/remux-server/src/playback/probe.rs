@@ -1739,9 +1739,8 @@ fn select_candidates(
             } else if pri_p2p {
                 // The primary has already passed the normal capability/quality ranking.
                 // After it fails, do not spend the bounded fallback budget climbing to
-                // a higher resolution than the chosen primary. Keep comparable-quality
-                // alternatives first; the reserved final slot below can then diversify
-                // downward when repeated same-tier candidates fail.
+                // a higher resolution than the chosen primary. Give one same-tier
+                // alternative a chance, then diversify to a lower resolution.
                 if let (Some(primary_height), Some(candidate_height)) =
                     (resolution_height(primary), resolution_height(candidate))
                 {
@@ -1920,15 +1919,20 @@ fn select_candidates(
         }
     }
 
-    // After repeated same-resolution failures, reserve the final retry for the
-    // best lower-resolution candidate (still >=720p). This does not impose a
-    // 720p-first policy and cannot slow an already-healthy high-quality source.
+    // After one same-tier retry, try a seeded lower-resolution rescue (>=720p)
+    // before spending more retries on cold releases of the same resolution.
+    // Keep the operator's retry budget and preferred primary unchanged.
     if let Some(lower) = lower_recovery
         && !selected
             .iter()
             .any(|candidate| candidate.id == lower.id)
     {
-        selected.push(lower);
+        selected.insert(
+            selected
+                .len()
+                .min(1),
+            lower,
+        );
     }
 
     // Non-P2P and resolution-restricted paths retain the original bounded
@@ -2579,7 +2583,6 @@ where
             (None, AbortPrewarm(None))
         };
     let total_available = probe_pool.len();
-    let total_attempts = all_to_try.len();
     // Keep a local P2P primary eligible for one final live probe after alternate
     // candidates have warmed its swarm, even when the primary had no reusable
     // probe metadata on the initial request.
@@ -2594,17 +2597,13 @@ where
     // Only report retryable buffering when *every* attempted source is P2P and
     // none produced a definitive invalid-media or transport failure.
     let mut pending_p2p_only = true;
-    // Torrent startup depends on piece availability and can otherwise hold
-    // PlaybackInfo for the full configured 60s per candidate. Keep real P2P
-    // probing tightly bounded, with a slightly larger budget only for the final
-    // deliberately diversified lower-resolution recovery candidate.
+    // Use the operator-configured timeout for each P2P attempt.
     for (attempt_index, (stream, url_opt)) in all_to_try
         .into_iter()
         .enumerate()
     {
         let is_retry = stream.id != primary.id;
         let diversified_recovery = is_retry
-            && attempt_index + 1 == total_attempts
             && match (resolution_height(&primary), resolution_height(&stream)) {
                 (Some(primary_height), Some(stream_height)) => {
                     stream_height < primary_height
@@ -2612,7 +2611,7 @@ where
                 _ => false,
             };
         // The operator's probe timeout applies to every source, including P2P
-        // retries and the final lower-resolution recovery.
+        // retries and lower-resolution recovery.
         let effective_timeout = timeout_secs;
         // A cold torrent keeps downloading while alternate candidates are checked.
         // Before spending the final fallback slot, cheaply revisit the preferred
@@ -3987,6 +3986,29 @@ mod probe_tests {
                 .0
                 .id,
             same_codec.id
+        );
+    }
+
+    #[test]
+    fn three_retries_try_lower_resolution_before_another_unready_same_tier() {
+        let primary = p2p_media_with_filename("Show.S01E01.1080p.Unknown.mkv", 319);
+        let same_hevc = p2p_media_with_filename("Show.S01E01.1080p.x265.mkv", 263);
+        let same_avc = p2p_media_with_filename("Show.S01E01.1080p.x264.mkv", 66);
+        let lower = p2p_media_with_filename("Show.S01E01.720p.x264.mkv", 33);
+        let result = select_candidates(
+            &primary,
+            &[same_hevc.clone(), same_avc.clone(), lower.clone()],
+            true,
+            3,
+            false,
+            3000,
+        );
+        assert_eq!(
+            result
+                .iter()
+                .map(|(source, _)| source.id)
+                .collect::<Vec<_>>(),
+            vec![same_hevc.id, lower.id, same_avc.id]
         );
     }
 
