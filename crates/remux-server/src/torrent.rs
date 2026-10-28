@@ -397,7 +397,53 @@ impl TorrentManager {
             .elapsed()
             .as_secs_f64()
             .max(0.001);
-        let readable_mibps = received as f64 / 1024.0 / 1024.0 / elapsed_secs;
+        let mut readable_mibps = received as f64 / 1024.0 / 1024.0 / elapsed_secs;
+        // A cold read can spend seconds waiting for the first pieces. Re-read
+        // the now-cached range to measure actual playback throughput.
+        if bytes_needed >= 256 * 1024 && readable_mibps < required_download_mibps {
+            stream
+                .seek(SeekFrom::Start(start))
+                .await
+                .context("failed to rewind cached torrent range")?;
+            let cold_read_mibps = readable_mibps;
+            let warm_started = tokio::time::Instant::now();
+            let remaining = wait
+                .saturating_sub(started_at.elapsed())
+                .max(Duration::from_millis(250));
+            let warm_received = tokio::time::timeout(remaining, async {
+                let mut received = 0usize;
+                let mut buffer = vec![0_u8; 64 * 1024];
+                while received < bytes_needed {
+                    let read_len = (bytes_needed - received).min(buffer.len());
+                    let read = stream
+                        .read(&mut buffer[..read_len])
+                        .await
+                        .context("failed re-reading cached torrent range")?;
+                    if read == 0 {
+                        break;
+                    }
+                    received += read;
+                }
+                anyhow::ensure!(
+                    received == bytes_needed,
+                    "cached torrent range only re-read {received} of {bytes_needed} bytes"
+                );
+                Ok::<usize, anyhow::Error>(received)
+            })
+            .await
+            .context("cached torrent range re-read timed out")??;
+            readable_mibps = warm_received as f64
+                / 1024.0
+                / 1024.0
+                / warm_started
+                    .elapsed()
+                    .as_secs_f64()
+                    .max(0.001);
+            debug!(
+                cold_read_mibps,
+                readable_mibps, "rechecked warmed torrent range"
+            );
+        }
         if bytes_needed >= 256 * 1024 {
             anyhow::ensure!(
                 readable_mibps >= required_download_mibps,

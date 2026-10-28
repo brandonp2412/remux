@@ -2131,7 +2131,7 @@ impl StreamSource for TorrentSource {
             .ok_or_else(|| anyhow::anyhow!("P2P is disabled"))
             .context_bad_request("P2P is disabled")?;
         const TORRENT_RESOLVE_WAIT: std::time::Duration =
-            std::time::Duration::from_secs(6);
+            std::time::Duration::from_secs(20);
 
         let lease = torrent
             .acquire(&self.info_hash)
@@ -2167,11 +2167,10 @@ impl StreamSource for TorrentSource {
                         "failed to discard timed-out torrent candidate"
                     );
                 }
-                return Err(anyhow::anyhow!(
+                return Err(torrent_source_buffering(anyhow::anyhow!(
                     "torrent metadata did not resolve within {:.1}s",
                     TORRENT_RESOLVE_WAIT.as_secs_f64()
-                ))
-                .context_bad_request("failed to resolve torrent");
+                )));
             }
         };
         let mut effective_headers = headers.clone();
