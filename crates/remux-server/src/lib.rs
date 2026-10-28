@@ -361,6 +361,7 @@ pub async fn init_app(
         db: conn.clone(),
         store: Store::new_weighted(128 * 1024 * 1024),
         sessions: playback_session::PlaybackSessionManager::new(transcode_sessions_dir),
+        startup_probes: services::startup_telemetry::StartupProbeTracker::default(),
         torrent: Arc::new(tokio::sync::RwLock::new(torrent_mgr.map(Arc::new))),
         ws_tx,
         default_web_client: Arc::new(tokio::sync::RwLock::new(
@@ -483,6 +484,7 @@ pub struct AppContext {
     pub db: sqlx::SqlitePool,
     pub store: Store,
     pub sessions: playback_session::PlaybackSessionManager,
+    pub(crate) startup_probes: services::startup_telemetry::StartupProbeTracker,
     pub torrent: Arc<tokio::sync::RwLock<Option<Arc<torrent::TorrentManager>>>>,
     pub ws_tx: tokio::sync::broadcast::Sender<ws::WsEvent>,
     pub default_web_client: Arc<tokio::sync::RwLock<String>>,

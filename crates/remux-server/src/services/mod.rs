@@ -2,6 +2,7 @@ pub(crate) mod four_k_capability;
 pub mod image;
 pub mod media_tracker;
 pub(crate) mod resolve;
+pub(crate) mod startup_telemetry;
 pub mod stream_provider;
 pub(crate) mod stream_service;
 pub mod stremio;
