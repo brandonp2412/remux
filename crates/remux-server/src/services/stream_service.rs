@@ -15,10 +15,13 @@ use uuid::Uuid;
 
 #[derive(Debug)]
 pub(crate) struct P2pReadinessPending {
+    pub source_id: Uuid,
     pub cached_bytes: u64,
     pub total_bytes: u64,
     pub download_mibps: f64,
     pub live_peers: u64,
+    pub startup_required_bytes: Option<u64>,
+    pub startup_readable_bytes: Option<u64>,
 }
 
 impl std::fmt::Display for P2pReadinessPending {
@@ -974,6 +977,15 @@ impl StreamService {
         prefs: DefaultStreamPrefs<'_>,
         start_time_ticks: Option<i64>,
     ) -> anyhow::Result<ProbedStreams> {
+        // Publish the source being tested while PlaybackInfo is still blocked.
+        // The guard clears it on every success, error, or request cancellation.
+        let probe_guard = self
+            .user_id
+            .map(|user_id| {
+                self.ctx
+                    .startup_probes
+                    .begin(user_id, self.item_id)
+            });
         let mut sel = self.select_streams();
         let (candidates, extraction) = self
             .rank_candidates(std::mem::take(&mut sel.candidates), ranking, prefs)
@@ -1070,13 +1082,14 @@ impl StreamService {
             })
             .collect();
 
-        let mut results = Vec::with_capacity(
-            sel.candidates
-                .len(),
-        );
-        for stream in sel
+        let candidate_count = sel
+            .candidates
+            .len();
+        let mut results = Vec::with_capacity(candidate_count);
+        for (candidate_index, stream) in sel
             .candidates
             .into_iter()
+            .enumerate()
         {
             let url_opt = stream
                 .stream_info
@@ -1100,6 +1113,16 @@ impl StreamService {
             } else {
                 timeout
             };
+            if !skip_probe {
+                if let Some(probe) = &probe_guard {
+                    probe.update(
+                        stream.id,
+                        candidate_index + 1,
+                        candidate_count,
+                        timeout_secs,
+                    );
+                }
+            }
             let probed = probe_stream(
                 &stream,
                 url_opt,
@@ -1162,12 +1185,13 @@ impl StreamService {
                                         file_hint.as_deref(),
                                     )
                                     .filter(progressing_source)
+                                    .map(|status| (candidate.id, status))
                             })
                             .max_by(|a, b| {
-                                a.download_mibps
-                                    .total_cmp(&b.download_mibps)
+                                a.1.download_mibps
+                                    .total_cmp(&b.1.download_mibps)
                             });
-                        if let Some(status) = pending {
+                        if let Some((source_id, status)) = pending {
                             warn!(
                                 cached_bytes = status.current_cached_bytes,
                                 total_bytes = status.current_total_bytes,
@@ -1176,10 +1200,13 @@ impl StreamService {
                                 "source still downloading after exhausted playback probes"
                             );
                             return Err(anyhow::Error::new(P2pReadinessPending {
+                                source_id,
                                 cached_bytes: status.current_cached_bytes,
                                 total_bytes: status.current_total_bytes,
                                 download_mibps: status.download_mibps,
                                 live_peers: status.live_peers,
+                                startup_required_bytes: status.startup_required_bytes,
+                                startup_readable_bytes: status.startup_readable_bytes,
                             })
                             .context(format!("playback probes exhausted: {error:?}")));
                         }

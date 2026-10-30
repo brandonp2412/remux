@@ -655,6 +655,75 @@ pub async fn remux_prefetch_status(
     Ok(Json(status))
 }
 
+// An authenticated, read-only glimpse of a PlaybackInfo probe still running.
+// Clients can show an honest stage and selected-file buffering progress without
+// starting a second stream probe or guessing the source from a search result.
+#[get("/remux/startup/{id}")]
+pub async fn remux_startup_status(
+    State(state): State<AppState>,
+    session: auth::AuthSession,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse> {
+    let Some(probe) = state
+        .ctx
+        .startup_probes
+        .snapshot(
+            session
+                .user
+                .id,
+            id,
+        )
+    else {
+        return Ok(Json(json!({ "Active": false })));
+    };
+    let mut prefetch = None;
+    if let Some(source_id) = probe.source_id {
+        if let Some(source) = db::Media::get_by_id(
+            &state
+                .ctx
+                .db,
+            &source_id,
+        )
+        .await?
+            && source.kind == db::MediaKind::Stream
+        {
+            if let Some(info) = source.stream_info {
+                if let crate::stream::StreamDescriptor::Torrent {
+                    info_hash,
+                    file_hint,
+                    file_idx,
+                    ..
+                } = info.descriptor
+                {
+                    if let Some(manager) = state
+                        .ctx
+                        .torrent
+                        .read()
+                        .await
+                        .as_ref()
+                    {
+                        prefetch = manager.prefetch_status(
+                            &info_hash,
+                            file_idx,
+                            file_hint.as_deref(),
+                        );
+                    }
+                }
+            }
+        }
+    }
+    Ok(Json(json!({
+        "Active": true,
+        "SourceId": probe.source_id,
+        "CandidateIndex": probe.candidate_index,
+        "CandidateCount": probe.candidate_count,
+        "ElapsedSeconds": probe.started_at.elapsed().as_secs(),
+        "ProbeElapsedSeconds": probe.source_started_at.elapsed().as_secs(),
+        "ProbeBudgetSeconds": probe.probe_budget_seconds,
+        "Prefetch": prefetch,
+    })))
+}
+
 #[get("/remux/streams/{id}")]
 pub async fn remux_streams(
     State(state): State<AppState>,

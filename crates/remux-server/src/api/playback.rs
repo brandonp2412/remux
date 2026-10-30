@@ -537,8 +537,15 @@ async fn items_playbackinfo_inner(
                     [(http::header::RETRY_AFTER, "10")],
                     Json(json!({
                         "ErrorCode": "P2P_SOURCE_BUFFERING",
-                        "Message": "Source is downloading slowly. Wait, then retry playback.",
-                        "RetryAfterSeconds": 10
+                        "Message": "Source is downloading slowly; the player can wait and retry automatically.",
+                        "RetryAfterSeconds": 10,
+                        "SourceId": pending.source_id,
+                        "CurrentCachedBytes": pending.cached_bytes,
+                        "CurrentTotalBytes": pending.total_bytes,
+                        "DownloadMiBps": pending.download_mibps,
+                        "LivePeers": pending.live_peers,
+                        "StartupRequiredBytes": pending.startup_required_bytes,
+                        "StartupReadableBytes": pending.startup_readable_bytes
                     })),
                 ).into_response());
             }

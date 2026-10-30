@@ -357,13 +357,10 @@ fn query_bool_kind(ty: &Type) -> Option<QueryBoolKind> {
     let Type::Path(type_path) = ty else {
         return None;
     };
-    let Some(segment) = type_path
+    let segment = type_path
         .path
         .segments
-        .last()
-    else {
-        return None;
-    };
+        .last()?;
 
     if segment.ident == "bool" {
         return Some(QueryBoolKind::Required);

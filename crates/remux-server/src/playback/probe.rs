@@ -1513,12 +1513,17 @@ pub(crate) async fn probe_stream(
             debug!(id = %stream.id, "probe cache stale, filename-guess only or of another file, re-probing");
         }
     }
+    let p2p_max_retries = if is_p2p {
+        max_retries.min(2)
+    } else {
+        max_retries
+    };
     let result = probe_with_fallback(
         stream.clone(),
         url_opt,
         timeout_secs,
         auto_next_stream,
-        max_retries,
+        p2p_max_retries,
         probe_pool,
         restrict_resolution,
         start_time_ticks,
@@ -1963,6 +1968,60 @@ fn select_candidates(
             Some((candidate.clone(), url))
         })
         .collect()
+}
+
+fn probe_attempt_timeout(
+    stream: &db::Media,
+    configured_secs: u64,
+    diversified_recovery: bool,
+    primary_attempt: bool,
+) -> u64 {
+    if stream
+        .stream_info
+        .as_ref()
+        .is_some_and(|info| info.is_p2p())
+    {
+        let sparse_mp4 = stream
+            .stream_info
+            .as_ref()
+            .and_then(|info| {
+                info.filename
+                    .as_deref()
+            })
+            .and_then(|name| std::path::Path::new(name).extension())
+            .is_some_and(|ext| {
+                ext.eq_ignore_ascii_case("mp4")
+                    || ext.eq_ignore_ascii_case("m4v")
+                    || ext.eq_ignore_ascii_case("mov")
+            });
+        // PlaybackInfo clients currently allow about 90 seconds for the entire
+        // request. Keep the primary and same-tier retries tightly bounded so
+        // dead swarms cannot consume that budget. If those attempts already
+        // failed and the final reserved candidate deliberately diversifies to a
+        // lower (still >=720p) resolution, allow a little longer for the actual
+        // container probe: real-device E2E showed a healthy 720p fallback
+        // completing ffprobe at ~20s after a cold sparse-piece start.
+        if diversified_recovery {
+            // This is a bounded recovery allowance, not the generic P2P
+            // timeout. The normal configured value is 15s on the deployed
+            // server; E2E showed the viable diversified source completing at
+            // ~20s, so it must be allowed to outlive that normal cap. Two
+            // P2P fallback slots keep the total request budget bounded.
+            35
+        } else if configured_secs >= 15 {
+            if sparse_mp4 {
+                if primary_attempt { 30 } else { 20 }
+            } else if primary_attempt {
+                22
+            } else {
+                18
+            }
+        } else {
+            configured_secs
+        }
+    } else {
+        configured_secs
+    }
 }
 
 // A source with no filename (common in Torrentio) may still be Matroska.
@@ -2555,7 +2614,8 @@ where
     let hedge_started = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     let (mut hedged_fallback_result, mut hedged_fallback_guard) =
         if let Some((stream, url)) = first_fallback {
-            let effective_timeout = timeout_secs;
+            let effective_timeout =
+                probe_attempt_timeout(&stream, timeout_secs, false, false);
             let (bounded_header_probe, sequential_matroska) =
                 torrent_matroska_probe_mode(&stream);
             let probe = probe_fn.clone();
@@ -2597,7 +2657,10 @@ where
     // Only report retryable buffering when *every* attempted source is P2P and
     // none produced a definitive invalid-media or transport failure.
     let mut pending_p2p_only = true;
-    // Use the operator-configured timeout for each P2P attempt.
+    // Torrent startup depends on piece availability and can otherwise hold
+    // PlaybackInfo for the full configured 60s per candidate. Keep real P2P
+    // probing tightly bounded, with a slightly larger budget only for the final
+    // deliberately diversified lower-resolution recovery candidate.
     for (attempt_index, (stream, url_opt)) in all_to_try
         .into_iter()
         .enumerate()
@@ -2610,9 +2673,12 @@ where
                 }
                 _ => false,
             };
-        // The operator's probe timeout applies to every source, including P2P
-        // retries and lower-resolution recovery.
-        let effective_timeout = timeout_secs;
+        let effective_timeout = probe_attempt_timeout(
+            &stream,
+            timeout_secs,
+            diversified_recovery,
+            attempt_index == 0,
+        );
         // A cold torrent keeps downloading while alternate candidates are checked.
         // Before spending the final fallback slot, cheaply revisit the preferred
         // source: real-device Project Hail Mary playback had a healthy 4K swarm
@@ -4316,6 +4382,38 @@ mod probe_tests {
         .await
         .unwrap_err();
         assert_eq!(error.status(), http::StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn p2p_probe_timeout_is_capped_without_changing_http_timeout() {
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 60, false, true), 22);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 10, false, true), 10);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 15, false, true), 22);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 15, false, false), 18);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 15, true, false), 35);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 60, true, false), 35);
+        assert_eq!(
+            probe_attempt_timeout(
+                &p2p_media_with_filename("Movie.1080p.mp4", 100),
+                60,
+                false,
+                true
+            ),
+            30
+        );
+        assert_eq!(
+            probe_attempt_timeout(
+                &p2p_media_with_filename("Movie.1080p.mp4", 100),
+                60,
+                false,
+                false
+            ),
+            20
+        );
+        assert_eq!(
+            probe_attempt_timeout(&http_media("http://example.com"), 60, false, true),
+            60
+        );
     }
 
     async fn startup_range_test_server(

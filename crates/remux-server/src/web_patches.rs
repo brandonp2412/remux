@@ -2,6 +2,17 @@
 /// Targets stable `data-*` attributes and semantic class names rather than
 /// minified JS internals, so it survives jellyfin-web bundle updates.
 pub static CSS: &str = r##"
+  /* Synopsis HTML from providers can contain nested <p> elements inside <bdi>.
+     ElegantFin's dimmed paragraph rule overrides the overview's text color;
+     target the content itself as well as the wrapper for readable details. */
+  .detailPagePrimaryContent .overview.detail-clamp-text,
+  .detailPagePrimaryContent .overview.detail-clamp-text p,
+  .detailPagePrimaryContent .overview.detail-clamp-text bdi {
+    color: #f5f5f7 !important;
+    opacity: 1 !important;
+    text-shadow: 0 1px 2px rgba(0, 0, 0, 0.65);
+  }
+
   /* ── Sidebar: whole sections ─────────────────────────────── */
   [aria-labelledby="plugins-subheader"]   { display: none !important; }
 
