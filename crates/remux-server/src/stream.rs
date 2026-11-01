@@ -971,11 +971,10 @@ impl TorrentSource {
         selected_file_idx: usize,
         require_playback_readiness: bool,
     ) -> anyhow::Result<()> {
-        // The final diversified PlaybackInfo recovery probe is allowed 35s.
-        // Keep this inner readiness window long enough for a healthy cold swarm
-        // to make a requested sparse range readable; earlier attempts remain
-        // bounded by their 18-22s outer probe timeouts.
-        const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+        // An explicitly prolonged server probe can give a cold swarm several
+        // minutes to acquire sparse startup pieces. Normal interactive probes
+        // still retain their shorter outer deadline.
+        const READY_WAIT: std::time::Duration = std::time::Duration::from_secs(180);
         const POLL: std::time::Duration = std::time::Duration::from_millis(250);
         // The actual requested range must be readable at a sustainable rate
         // before serving the client.
@@ -2131,7 +2130,7 @@ impl StreamSource for TorrentSource {
             .ok_or_else(|| anyhow::anyhow!("P2P is disabled"))
             .context_bad_request("P2P is disabled")?;
         const TORRENT_RESOLVE_WAIT: std::time::Duration =
-            std::time::Duration::from_secs(20);
+            std::time::Duration::from_secs(120);
 
         let lease = torrent
             .acquire(&self.info_hash)

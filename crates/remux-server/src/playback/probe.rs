@@ -1981,6 +1981,12 @@ fn probe_attempt_timeout(
         .as_ref()
         .is_some_and(|info| info.is_p2p())
     {
+        // An explicitly configured long P2P timeout is intentional: some
+        // swarms become playable only after several minutes of piece warmup.
+        // Keep the short interactive defaults for ordinary configurations.
+        if configured_secs >= 180 {
+            return configured_secs;
+        }
         let sparse_mp4 = stream
             .stream_info
             .as_ref()
@@ -4385,13 +4391,17 @@ mod probe_tests {
     }
 
     #[test]
-    fn p2p_probe_timeout_is_capped_without_changing_http_timeout() {
+    fn p2p_probe_timeout_respects_explicit_long_warmup_without_changing_http() {
         assert_eq!(probe_attempt_timeout(&p2p_media(), 60, false, true), 22);
         assert_eq!(probe_attempt_timeout(&p2p_media(), 10, false, true), 10);
         assert_eq!(probe_attempt_timeout(&p2p_media(), 15, false, true), 22);
         assert_eq!(probe_attempt_timeout(&p2p_media(), 15, false, false), 18);
         assert_eq!(probe_attempt_timeout(&p2p_media(), 15, true, false), 35);
         assert_eq!(probe_attempt_timeout(&p2p_media(), 60, true, false), 35);
+        // A five-minute server setting must not be silently reduced to 22/35s.
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 300, false, true), 300);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 300, false, false), 300);
+        assert_eq!(probe_attempt_timeout(&p2p_media(), 300, true, false), 300);
         assert_eq!(
             probe_attempt_timeout(
                 &p2p_media_with_filename("Movie.1080p.mp4", 100),
