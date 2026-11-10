@@ -285,6 +285,95 @@ fn prefer_available_torrents(sources: &mut [db::Media]) {
     });
 }
 
+/// Only real probe data, never filename guesses, can prove the video has subtitles.
+fn has_probed_embedded_english_subtitles(source: &db::Media) -> bool {
+    source
+        .probe_data
+        .as_ref()
+        .is_some_and(|probe| {
+            !probe.is_filename_guess()
+                && probe
+                    .media_streams
+                    .iter()
+                    .any(|stream| {
+                        stream.type_ == Some(MediaStreamType::Subtitle)
+                            && !stream.is_external
+                            && !stream.is_forced
+                            && stream.is_text_subtitle_stream()
+                            && stream
+                                .language
+                                .as_deref()
+                                .is_some_and(|language| {
+                                    matches!(
+                                        language
+                                            .trim()
+                                            .to_ascii_lowercase()
+                                            .split(['-', '_'])
+                                            .next(),
+                                        Some("en" | "eng")
+                                    )
+                                })
+                    })
+        })
+}
+
+/// Prefer verified embedded English subtitles only among comparably healthy
+/// torrents of the same resolution and at least the same release quality.
+fn prefer_embedded_english_torrent(sources: &mut [db::Media]) {
+    if sources.len() < 2
+        || !sources
+            .iter()
+            .all(|source| {
+                source
+                    .stream_info
+                    .as_ref()
+                    .is_some_and(|info| info.is_p2p())
+            })
+        || has_probed_embedded_english_subtitles(&sources[0])
+    {
+        return;
+    }
+    let primary = &sources[0];
+    let Some(height) = p2p_resolution_height(primary) else {
+        return;
+    };
+    let health = torrent_availability_tier(primary);
+    let playability = torrent_playability_tier(primary);
+    let quality = primary.quality_weight();
+    let seeders = primary
+        .stream_info
+        .as_ref()
+        .and_then(|info| info.seeders)
+        .unwrap_or(0);
+    if seeders < 5 {
+        return;
+    }
+
+    let preferred = sources
+        .iter()
+        .enumerate()
+        .skip(1)
+        .find_map(|(index, source)| {
+            let candidate_seeders = source
+                .stream_info
+                .as_ref()
+                .and_then(|info| info.seeders)
+                .unwrap_or(0);
+            (p2p_resolution_height(source) == Some(height)
+                && torrent_availability_tier(source) == health
+                && torrent_playability_tier(source) == playability
+                && source.quality_weight() >= quality
+                && candidate_seeders >= seeders / 2
+                && has_probed_embedded_english_subtitles(source))
+            .then_some(index)
+        });
+    if let Some(index) = preferred {
+        let preferred_id = sources[index].id;
+        sources[..=index].rotate_right(1);
+        tracing::info!(stream_id = %preferred_id, "preferring comparably playable torrent with verified embedded English subtitles");
+    }
+}
+
 fn p2p_resolution_height(source: &db::Media) -> Option<u32> {
     source
         .stream_info
@@ -431,6 +520,7 @@ impl StreamService {
             (info, allow_subtitle_extraction)
         });
         prefer_available_torrents(sources);
+        prefer_embedded_english_torrent(sources);
         extraction
     }
 
@@ -1776,6 +1866,61 @@ fn media_info_from_probe(
 mod tests {
     use super::*;
     use crate::stream::{StreamDescriptor, StreamInfo};
+
+    fn test_subtitle_torrent(
+        filename: &str,
+        seeders: i64,
+        subtitle_language: Option<&str>,
+    ) -> db::Media {
+        db::Media {
+            id: Uuid::new_v4(),
+            stream_info: Some(StreamInfo {
+                descriptor: StreamDescriptor::Torrent {
+                    info_hash: "0000000000000000000000000000000000000000".to_string(),
+                    file_hint: Some(filename.to_string()),
+                    file_idx: Some(0),
+                    trackers: vec![],
+                },
+                filename: Some(filename.to_string()),
+                seeders: Some(seeders),
+                ..Default::default()
+            }),
+            probe_data: subtitle_language.map(|language| api::MediaSourceInfo {
+                media_streams: vec![api::MediaStream {
+                    type_: Some(MediaStreamType::Subtitle),
+                    codec: Some("subrip".to_string()),
+                    language: Some(language.to_string()),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn embedded_english_preferred_when_quality_and_swarm_are_comparable() {
+        let external = test_subtitle_torrent("Show.S07E11.1080p.WEBRip.mkv", 100, None);
+        let embedded =
+            test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 75, Some("eng"));
+        let mut sources = vec![external, embedded.clone()];
+        prefer_embedded_english_torrent(&mut sources);
+        assert_eq!(sources[0].id, embedded.id);
+    }
+
+    #[test]
+    fn embedded_subtitles_never_override_resolution_or_swarm_health() {
+        let primary = test_subtitle_torrent("Show.S07E11.1080p.WEBRip.mkv", 100, None);
+        for alternative in [
+            test_subtitle_torrent("Show.S07E11.720p.WEB-DL.mkv", 90, Some("eng")),
+            test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 8, Some("eng")),
+            test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 75, Some("fra")),
+        ] {
+            let mut sources = vec![primary.clone(), alternative];
+            prefer_embedded_english_torrent(&mut sources);
+            assert_eq!(sources[0].id, primary.id);
+        }
+    }
 
     #[test]
     fn episode_source_air_date_guard_rejects_raw_episode_from_2025() {
