@@ -1496,6 +1496,13 @@ fn has_supported_embedded_subtitle(
     external: &crate::addons::SubtitleInfo,
     device_profile: Option<&api::DeviceProfile>,
 ) -> bool {
+    // A matching embedded track is not a usable substitute when the selected
+    // source requires DirectStream/transcoding: the remux can omit that track,
+    // and on-demand extraction from an incomplete torrent may time out.
+    // Preserve a bounded external fallback for these sources.
+    if !source.supports_direct_play {
+        return false;
+    }
     let Some(profile) = device_profile else {
         return false;
     };
@@ -1935,6 +1942,7 @@ mod tests {
         let item_id = Uuid::new_v4();
         let source = api::MediaSourceInfo {
             id: Uuid::new_v4(),
+            supports_direct_play: true,
             media_streams: vec![api::MediaStream {
                 index: 2,
                 type_: Some(api::MediaStreamType::Subtitle),
@@ -1989,6 +1997,23 @@ mod tests {
                 .len(),
             1
         );
+
+        // Friends S4E15: a DirectStream source advertised English SRT, but
+        // extracting it from the torrent timed out. Keep the addon fallback.
+        let mut direct_stream = source.clone();
+        direct_stream.supports_direct_play = false;
+        let mut sources = vec![direct_stream];
+        append_external_subtitles(
+            &mut sources,
+            &[external.clone()],
+            &[],
+            Some(&embed_profile),
+            item_id,
+            "test-key",
+            DEDUP_ON,
+        );
+        assert_eq!(sources[0].media_streams.len(), 2);
+        assert!(sources[0].media_streams[1].is_external);
 
         for profile in [None, Some(&external_profile)] {
             let mut sources = vec![source.clone()];
@@ -2106,6 +2131,7 @@ mod tests {
     fn dedup_disabled_keeps_multiple_external_candidates_up_to_the_cap() {
         let source = api::MediaSourceInfo {
             id: Uuid::new_v4(),
+            supports_direct_play: true,
             media_streams: vec![api::MediaStream {
                 index: 2,
                 type_: Some(api::MediaStreamType::Subtitle),
