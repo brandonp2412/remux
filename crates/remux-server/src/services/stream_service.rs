@@ -414,10 +414,12 @@ fn comparable_subtitle_torrent(primary: &db::Media, alternate: &db::Media) -> bo
     primary_seeders >= 5
         && p2p_resolution_height(primary).is_some()
         && p2p_resolution_height(primary) == p2p_resolution_height(alternate)
-        && torrent_availability_tier(primary) == torrent_availability_tier(alternate)
+        // Even a 17-seed WEB-DL can be healthy enough to beat a 57-seed
+        // WEBRip without subtitles. Do not require identical seeder tiers.
+        && torrent_availability_tier(alternate) >= 3
         && torrent_playability_tier(primary) == torrent_playability_tier(alternate)
         && alternate.quality_weight() >= primary.quality_weight()
-        && alternate_seeders >= primary_seeders / 2
+        && alternate_seeders >= (primary_seeders / 5).max(5)
         && primary
             .probe_data
             .as_ref()
@@ -2299,6 +2301,25 @@ mod tests {
         let embedded =
             test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 75, Some("eng"));
         let mut sources = vec![external, embedded.clone()];
+        prefer_embedded_subtitle_torrent(&mut sources, "en", None);
+        assert_eq!(sources[0].id, embedded.id);
+    }
+
+    #[test]
+    fn criminal_minds_s07e11_prefers_verified_playweb_with_17_seeders() {
+        // Production candidate counts: KONTRAST WEBRip had 57 seeders and no
+        // embedded tracks; playWEB WEB-DL had 17 and verified English tracks.
+        let primary = test_subtitle_torrent(
+            "Criminal.Minds.S07E11.1080p.WEBRip.x265-KONTRAST.mp4",
+            57,
+            None,
+        );
+        let embedded = test_subtitle_torrent(
+            "Criminal Minds S07E11 True Genius 1080p DSNP WEB-DL DDP5 1 H 264-playWEB.mkv",
+            17,
+            Some("eng"),
+        );
+        let mut sources = vec![primary, embedded.clone()];
         prefer_embedded_subtitle_torrent(&mut sources, "en", None);
         assert_eq!(sources[0].id, embedded.id);
     }
