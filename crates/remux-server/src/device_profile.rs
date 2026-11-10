@@ -1027,6 +1027,12 @@ impl SourceAssessment {
     pub fn playback_label(&self) -> &'static str {
         playback_decision_label(&self.reasons)
     }
+
+    /// Used to keep subtitle preferences from increasing transcode cost.
+    pub fn transcode_cost_tier(&self) -> u8 {
+        self.rank
+            .transcode_cost_tier
+    }
 }
 
 impl SourceRankingContext<'_> {

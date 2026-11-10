@@ -180,6 +180,32 @@ pub(crate) struct DefaultStreamPrefs<'a> {
     pub requested_subtitle: Option<i64>,
     pub remembered_audio: Option<i64>,
     pub remembered_subtitle: Option<i64>,
+    pub prefer_embedded_subtitle_sources: bool,
+}
+
+impl DefaultStreamPrefs<'_> {
+    fn preferred_subtitle_language(&self) -> Option<String> {
+        if !self.prefer_embedded_subtitle_sources
+            || matches!(
+                self.user_cfg
+                    .subtitle_mode,
+                remux_sdks::remux::SubtitleMode::None
+                    | remux_sdks::remux::SubtitleMode::OnlyForced
+            )
+        {
+            return None;
+        }
+        self.user_cfg
+            .subtitle_language_preference
+            .as_deref()
+            .filter(|language| {
+                !language
+                    .trim()
+                    .is_empty()
+            })
+            .or(self.server_metadata_language)
+            .and_then(remux_sdks::remux::lang_to_two_letter)
+    }
 }
 
 pub(crate) struct StreamServiceConfig {
@@ -285,93 +311,191 @@ fn prefer_available_torrents(sources: &mut [db::Media]) {
     });
 }
 
-/// Only real probe data, never filename guesses, can prove the video has subtitles.
-fn has_probed_embedded_english_subtitles(source: &db::Media) -> bool {
+/// Only real probe data, never filename guesses, can establish embedded tracks.
+fn has_embedded_language_tracks(info: &api::MediaSourceInfo, language: &str) -> bool {
+    info.media_streams
+        .iter()
+        .any(|stream| {
+            stream.type_ == Some(MediaStreamType::Subtitle)
+                && !stream.is_external
+                && !stream.is_forced
+                && stream.is_text_subtitle_stream()
+                && stream
+                    .language
+                    .as_deref()
+                    .and_then(remux_sdks::remux::lang_to_two_letter)
+                    .as_deref()
+                    == Some(language)
+        })
+}
+
+fn has_probed_embedded_subtitles(source: &db::Media, language: &str) -> bool {
     source
         .probe_data
         .as_ref()
         .is_some_and(|probe| {
             !probe.is_filename_guess()
                 && probe
-                    .media_streams
-                    .iter()
-                    .any(|stream| {
-                        stream.type_ == Some(MediaStreamType::Subtitle)
-                            && !stream.is_external
-                            && !stream.is_forced
-                            && stream.is_text_subtitle_stream()
-                            && stream
-                                .language
-                                .as_deref()
-                                .is_some_and(|language| {
-                                    matches!(
-                                        language
-                                            .trim()
-                                            .to_ascii_lowercase()
-                                            .split(['-', '_'])
-                                            .next(),
-                                        Some("en" | "eng")
-                                    )
-                                })
-                    })
+                    .video_stream()
+                    .is_some()
+                && has_embedded_language_tracks(probe, language)
         })
 }
 
-/// Prefer verified embedded English subtitles only among comparably healthy
-/// torrents of the same resolution and at least the same release quality.
-fn prefer_embedded_english_torrent(sources: &mut [db::Media]) {
-    if sources.len() < 2
-        || !sources
-            .iter()
-            .all(|source| {
-                source
-                    .stream_info
-                    .as_ref()
-                    .is_some_and(|info| info.is_p2p())
-            })
-        || has_probed_embedded_english_subtitles(&sources[0])
-    {
-        return;
-    }
-    let primary = &sources[0];
-    let Some(height) = p2p_resolution_height(primary) else {
-        return;
+/// Never trade known higher-resolution or HDR video for subtitles.
+fn preserves_probed_video_quality(
+    primary: &api::MediaSourceInfo,
+    alternate: &api::MediaSourceInfo,
+) -> bool {
+    let (Some(primary_video), Some(alternate_video)) =
+        (primary.video_stream(), alternate.video_stream())
+    else {
+        return true;
     };
-    let health = torrent_availability_tier(primary);
-    let playability = torrent_playability_tier(primary);
-    let quality = primary.quality_weight();
-    let seeders = primary
-        .stream_info
-        .as_ref()
-        .and_then(|info| info.seeders)
+    if let (Some(primary_height), Some(alternate_height)) =
+        (primary_video.height, alternate_video.height)
+    {
+        if alternate_height < primary_height {
+            return false;
+        }
+    }
+    let hdr = |video: &api::MediaStream| {
+        video
+            .video_range_type
+            .as_ref()
+            .is_some_and(|range| {
+                !matches!(range, VideoRangeType::Sdr | VideoRangeType::Other)
+            })
+    };
+    !hdr(primary_video) || hdr(alternate_video)
+}
+
+/// Treat Direct Play and Direct Stream as equivalently cheap, but never
+/// favour subtitles by introducing a new audio/video transcode.
+fn preserves_playback_cost(
+    ranking: Option<SourceRankingContext<'_>>,
+    primary: &api::MediaSourceInfo,
+    alternate: &api::MediaSourceInfo,
+) -> bool {
+    ranking.is_none_or(|ranking| {
+        let first = ranking
+            .assess(primary, false)
+            .transcode_cost_tier();
+        let second = ranking
+            .assess(alternate, false)
+            .transcode_cost_tier();
+        second >= first || (first >= 3 && second >= 3)
+    })
+}
+
+/// Only promote similarly healthy torrents of the same resolution and at
+/// least equivalent filename-estimated release quality. Never trade a cached,
+/// readily playable release for a substantially weaker swarm.
+fn comparable_subtitle_torrent(primary: &db::Media, alternate: &db::Media) -> bool {
+    let (Some(primary_info), Some(alternate_info)) = (
+        primary
+            .stream_info
+            .as_ref(),
+        alternate
+            .stream_info
+            .as_ref(),
+    ) else {
+        return false;
+    };
+    if !primary_info.is_p2p() || !alternate_info.is_p2p() {
+        return false;
+    }
+    let primary_seeders = primary_info
+        .seeders
         .unwrap_or(0);
-    if seeders < 5 {
+    let alternate_seeders = alternate_info
+        .seeders
+        .unwrap_or(0);
+    primary_seeders >= 5
+        && p2p_resolution_height(primary).is_some()
+        && p2p_resolution_height(primary) == p2p_resolution_height(alternate)
+        && torrent_availability_tier(primary) == torrent_availability_tier(alternate)
+        && torrent_playability_tier(primary) == torrent_playability_tier(alternate)
+        && alternate.quality_weight() >= primary.quality_weight()
+        && alternate_seeders >= primary_seeders / 2
+        && primary
+            .probe_data
+            .as_ref()
+            .zip(
+                alternate
+                    .probe_data
+                    .as_ref(),
+            )
+            .is_none_or(|(first, second)| preserves_probed_video_quality(first, second))
+}
+
+fn prefer_embedded_subtitle_torrent(
+    sources: &mut [db::Media],
+    language: &str,
+    ranking: Option<SourceRankingContext<'_>>,
+) {
+    if sources.len() < 2 || has_probed_embedded_subtitles(&sources[0], language) {
         return;
     }
-
     let preferred = sources
         .iter()
         .enumerate()
         .skip(1)
         .find_map(|(index, source)| {
-            let candidate_seeders = source
-                .stream_info
-                .as_ref()
-                .and_then(|info| info.seeders)
-                .unwrap_or(0);
-            (p2p_resolution_height(source) == Some(height)
-                && torrent_availability_tier(source) == health
-                && torrent_playability_tier(source) == playability
-                && source.quality_weight() >= quality
-                && candidate_seeders >= seeders / 2
-                && has_probed_embedded_english_subtitles(source))
+            (comparable_subtitle_torrent(&sources[0], source)
+                && preserves_playback_cost(
+                    ranking,
+                    &api::MediaSourceInfo::from(sources[0].clone()),
+                    &api::MediaSourceInfo::from(source.clone()),
+                )
+                && has_probed_embedded_subtitles(source, language))
             .then_some(index)
         });
     if let Some(index) = preferred {
         let preferred_id = sources[index].id;
         sources[..=index].rotate_right(1);
-        tracing::info!(stream_id = %preferred_id, "preferring comparably playable torrent with verified embedded English subtitles");
+        tracing::info!(stream_id = %preferred_id, language, "preferring comparable torrent with verified embedded subtitles");
     }
+}
+
+fn should_bounded_probe_subtitles(
+    primary: &ProbeResult,
+    alternate: &db::Media,
+    language: &str,
+) -> bool {
+    !has_embedded_language_tracks(&primary.source, language)
+        && comparable_subtitle_torrent(&primary.effective_stream, alternate)
+}
+
+fn promote_verified_subtitle_source(
+    results: &mut [ProbeResult],
+    verified: Option<Uuid>,
+    language: Option<&str>,
+) -> bool {
+    let (Some(verified), Some(language)) = (verified, language) else {
+        return false;
+    };
+    if results
+        .first()
+        .is_none_or(|first| has_embedded_language_tracks(&first.source, language))
+    {
+        return false;
+    }
+    let Some(index) = results
+        .iter()
+        .position(|result| {
+            result
+                .stream
+                .id
+                == verified
+                && has_embedded_language_tracks(&result.source, language)
+        })
+    else {
+        return false;
+    };
+    results[..=index].rotate_right(1);
+    tracing::info!(stream_id = %verified, language, "selected bounded-probed release with embedded subtitles");
+    true
 }
 
 fn p2p_resolution_height(source: &db::Media) -> Option<u32> {
@@ -520,7 +644,9 @@ impl StreamService {
             (info, allow_subtitle_extraction)
         });
         prefer_available_torrents(sources);
-        prefer_embedded_english_torrent(sources);
+        if let Some(language) = prefs.preferred_subtitle_language() {
+            prefer_embedded_subtitle_torrent(sources, &language, Some(ranking));
+        }
         extraction
     }
 
@@ -1106,6 +1232,20 @@ impl StreamService {
         let max_retries = probe_cfg
             .max_probe_fallback_streams
             .unwrap_or(3) as usize;
+        // Opt-in, capped: at most one extra torrent probe, never an unbounded
+        // search through every alternative. With 0 the original fast path is unchanged.
+        let subtitle_probe_budget =
+            if !sel.specific_requested && prefs.prefer_embedded_subtitle_sources {
+                probe_cfg
+                    .embedded_subtitle_probe_budget_secs
+                    .unwrap_or(0)
+                    .clamp(0, 5) as u64
+            } else {
+                0
+            };
+        let preferred_subtitle_language = prefs.preferred_subtitle_language();
+        let mut extra_subtitle_probe_attempted = false;
+        let mut extra_subtitle_probe_verified = None;
         let port = self
             .ctx
             .config
@@ -1194,6 +1334,24 @@ impl StreamService {
             // gets its refresh when a client requests that stream directly.
             let skip_probe =
                 preferred_probe_id.is_some_and(|preferred| stream.id != preferred);
+            let extra_subtitle_probe = skip_probe
+                && !extra_subtitle_probe_attempted
+                && candidate_index < 5
+                && subtitle_probe_budget > 0
+                && preferred_subtitle_language
+                    .as_deref()
+                    .is_some_and(|language| {
+                        results
+                            .first()
+                            .is_some_and(|primary| {
+                                should_bounded_probe_subtitles(
+                                    primary, &stream, language,
+                                )
+                            })
+                    });
+            if extra_subtitle_probe {
+                extra_subtitle_probe_attempted = true;
+            }
             let timeout_secs = if stream
                 .stream_info
                 .as_ref()
@@ -1213,25 +1371,104 @@ impl StreamService {
                     );
                 }
             }
-            let probed = probe_stream(
-                &stream,
-                url_opt,
-                skip_probe,
-                timeout_secs,
-                auto_next,
-                max_retries,
-                &sel.probe_pool,
-                sel.restrict_resolution,
-                start_time_ticks,
-                port,
-                &self
-                    .ctx
-                    .db,
-                &self
-                    .ctx
-                    .store,
-            )
-            .await;
+            let probed = if extra_subtitle_probe {
+                // Probe the alternative's actual bytes, including playback readiness;
+                // a filename guess can never justify switching the selected source.
+                let bounded = tokio::time::timeout(
+                    std::time::Duration::from_secs(subtitle_probe_budget),
+                    probe_stream(
+                        &stream,
+                        url_opt.clone(),
+                        false,
+                        subtitle_probe_budget,
+                        false,
+                        0,
+                        &[],
+                        false,
+                        start_time_ticks,
+                        port,
+                        &self
+                            .ctx
+                            .db,
+                        &self
+                            .ctx
+                            .store,
+                    ),
+                )
+                .await;
+                match bounded {
+                    Ok(Ok((source, effective, outcome))) => {
+                        if preferred_subtitle_language
+                            .as_deref()
+                            .is_some_and(|language| {
+                                !source.is_filename_guess()
+                                    && source
+                                        .video_stream()
+                                        .is_some()
+                                    && effective.id == stream.id
+                                    && results
+                                        .first()
+                                        .is_some_and(|first| {
+                                            preserves_probed_video_quality(
+                                                &first.source,
+                                                &source,
+                                            ) && preserves_playback_cost(
+                                                ranking,
+                                                &first.source,
+                                                &source,
+                                            )
+                                        })
+                                    && has_embedded_language_tracks(&source, language)
+                            })
+                        {
+                            extra_subtitle_probe_verified = Some(stream.id);
+                        }
+                        Ok((source, effective, outcome))
+                    }
+                    _ => {
+                        debug!(stream_id = %stream.id, "bounded subtitle probe unavailable; retaining original source order");
+                        probe_stream(
+                            &stream,
+                            url_opt,
+                            true,
+                            timeout_secs,
+                            false,
+                            0,
+                            &sel.probe_pool,
+                            sel.restrict_resolution,
+                            start_time_ticks,
+                            port,
+                            &self
+                                .ctx
+                                .db,
+                            &self
+                                .ctx
+                                .store,
+                        )
+                        .await
+                    }
+                }
+            } else {
+                probe_stream(
+                    &stream,
+                    url_opt,
+                    skip_probe,
+                    timeout_secs,
+                    auto_next,
+                    max_retries,
+                    &sel.probe_pool,
+                    sel.restrict_resolution,
+                    start_time_ticks,
+                    port,
+                    &self
+                        .ctx
+                        .db,
+                    &self
+                        .ctx
+                        .store,
+                )
+                .await
+            };
             let mut external_subtitles = match subtitle_fetches.remove(&stream.id) {
                 Some(fetch) => fetch
                     .await
@@ -1322,6 +1559,21 @@ impl StreamService {
                     )
                     .await;
                 }
+            }
+            if extra_subtitle_probe_verified == Some(stream.id)
+                && external_subtitles.is_empty()
+                && let Some(mut media) = item
+                    .clone()
+                    .filter(|it| !it.is_live())
+            {
+                external_subtitles = Self::subtitles_for_stream(
+                    &self.ctx,
+                    &mut media,
+                    &effective_stream,
+                    false,
+                    self.user_id,
+                )
+                .await;
             }
 
             // Use the StreamGroup UUID when this candidate is a group representative
@@ -1453,6 +1705,11 @@ impl StreamService {
             });
         }
 
+        promote_verified_subtitle_source(
+            &mut results,
+            extra_subtitle_probe_verified,
+            preferred_subtitle_language.as_deref(),
+        );
         Ok(ProbedStreams {
             results,
             specific_requested: sel.specific_requested,
@@ -1886,16 +2143,154 @@ mod tests {
                 ..Default::default()
             }),
             probe_data: subtitle_language.map(|language| api::MediaSourceInfo {
-                media_streams: vec![api::MediaStream {
-                    type_: Some(MediaStreamType::Subtitle),
-                    codec: Some("subrip".to_string()),
-                    language: Some(language.to_string()),
-                    ..Default::default()
-                }],
+                media_streams: vec![
+                    api::MediaStream {
+                        type_: Some(MediaStreamType::Video),
+                        codec: Some("h264".to_string()),
+                        ..Default::default()
+                    },
+                    api::MediaStream {
+                        type_: Some(MediaStreamType::Subtitle),
+                        codec: Some("subrip".to_string()),
+                        language: Some(language.to_string()),
+                        ..Default::default()
+                    },
+                ],
                 ..Default::default()
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn embedded_subtitles_cannot_downgrade_known_video_resolution_or_hdr() {
+        let source = |height, range| api::MediaSourceInfo {
+            media_streams: vec![api::MediaStream {
+                type_: Some(MediaStreamType::Video),
+                height: Some(height),
+                video_range_type: Some(range),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let hdr = source(1080, VideoRangeType::Hdr10);
+        assert!(!preserves_probed_video_quality(
+            &hdr,
+            &source(720, VideoRangeType::Hdr10)
+        ));
+        assert!(!preserves_probed_video_quality(
+            &hdr,
+            &source(1080, VideoRangeType::Sdr)
+        ));
+        assert!(preserves_probed_video_quality(
+            &hdr,
+            &source(1080, VideoRangeType::Hdr10)
+        ));
+    }
+
+    #[test]
+    fn bounded_probe_only_promotes_a_verified_comparable_result_with_its_metadata() {
+        let primary = test_subtitle_torrent("Show.S07E11.1080p.WEBRip.mkv", 100, None);
+        let alternate =
+            test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 75, Some("eng"));
+        let primary_result = ProbeResult {
+            source: api::MediaSourceInfo::default(),
+            stream: primary.clone(),
+            effective_stream: primary.clone(),
+            allow_subtitle_extraction: false,
+            external_subtitles: vec![],
+        };
+        assert!(should_bounded_probe_subtitles(
+            &primary_result,
+            &alternate,
+            "en"
+        ));
+        let alternate_result = ProbeResult {
+            source: alternate
+                .probe_data
+                .clone()
+                .unwrap(),
+            stream: alternate.clone(),
+            effective_stream: alternate.clone(),
+            allow_subtitle_extraction: true,
+            external_subtitles: vec![],
+        };
+        let mut results = vec![primary_result, alternate_result];
+        assert!(!promote_verified_subtitle_source(
+            &mut results,
+            None,
+            Some("en")
+        ));
+        assert!(promote_verified_subtitle_source(
+            &mut results,
+            Some(alternate.id),
+            Some("en")
+        ));
+        assert_eq!(
+            results[0]
+                .stream
+                .id,
+            alternate.id
+        );
+        assert!(results[0].allow_subtitle_extraction);
+        assert!(!should_bounded_probe_subtitles(&results[0], &primary, "en"));
+    }
+
+    #[test]
+    fn subtitle_source_preference_uses_user_language_and_respects_disabled_modes() {
+        let cfg = api::UserConfiguration {
+            subtitle_language_preference: Some("French".to_string()),
+            subtitle_mode: remux_sdks::remux::SubtitleMode::Always,
+            ..Default::default()
+        };
+        let prefs = DefaultStreamPrefs {
+            user_cfg: &cfg,
+            server_metadata_language: Some("en"),
+            original_language: None,
+            requested_audio: None,
+            requested_subtitle: None,
+            remembered_audio: None,
+            remembered_subtitle: None,
+            prefer_embedded_subtitle_sources: true,
+        };
+        assert_eq!(
+            prefs
+                .preferred_subtitle_language()
+                .as_deref(),
+            Some("fr")
+        );
+        assert_eq!(
+            DefaultStreamPrefs {
+                prefer_embedded_subtitle_sources: false,
+                ..prefs
+            }
+            .preferred_subtitle_language(),
+            None
+        );
+        let disabled = api::UserConfiguration {
+            subtitle_language_preference: Some("French".to_string()),
+            subtitle_mode: remux_sdks::remux::SubtitleMode::None,
+            ..Default::default()
+        };
+        assert_eq!(
+            DefaultStreamPrefs {
+                user_cfg: &disabled,
+                ..prefs
+            }
+            .preferred_subtitle_language(),
+            None
+        );
+    }
+
+    #[test]
+    fn subtitle_source_preference_matches_language_not_just_english() {
+        let english =
+            test_subtitle_torrent("Show.S07E11.1080p.WEBRip.mkv", 100, Some("eng"));
+        let french =
+            test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 75, Some("fra"));
+        let mut sources = vec![english, french.clone()];
+        prefer_embedded_subtitle_torrent(&mut sources, "fr", None);
+        assert_eq!(sources[0].id, french.id);
     }
 
     #[test]
@@ -1904,8 +2299,27 @@ mod tests {
         let embedded =
             test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 75, Some("eng"));
         let mut sources = vec![external, embedded.clone()];
-        prefer_embedded_english_torrent(&mut sources);
+        prefer_embedded_subtitle_torrent(&mut sources, "en", None);
         assert_eq!(sources[0].id, embedded.id);
+    }
+
+    #[test]
+    fn subtitle_source_preference_never_trusts_filename_guesses() {
+        let mut guessed =
+            test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 80, Some("eng"));
+        guessed
+            .probe_data
+            .as_mut()
+            .unwrap()
+            .remux = Some(api::MediaSourceRemuxInfo {
+            source: Some(remux_sdks::remux::ProbeOrigin::FilenameGuess),
+            ..Default::default()
+        });
+        assert!(!has_probed_embedded_subtitles(&guessed, "en"));
+        let primary = test_subtitle_torrent("Show.S07E11.1080p.WEBRip.mkv", 100, None);
+        let mut sources = vec![primary.clone(), guessed];
+        prefer_embedded_subtitle_torrent(&mut sources, "en", None);
+        assert_eq!(sources[0].id, primary.id);
     }
 
     #[test]
@@ -1917,7 +2331,7 @@ mod tests {
             test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 75, Some("fra")),
         ] {
             let mut sources = vec![primary.clone(), alternative];
-            prefer_embedded_english_torrent(&mut sources);
+            prefer_embedded_subtitle_torrent(&mut sources, "en", None);
             assert_eq!(sources[0].id, primary.id);
         }
     }
@@ -2023,6 +2437,7 @@ mod tests {
             requested_subtitle: None,
             remembered_audio: None,
             remembered_subtitle: None,
+            prefer_embedded_subtitle_sources: false,
         };
         let ranking = SourceRankingContext {
             mode: remux_sdks::remux::SortMediaSourcesMode::Compatibility,
@@ -2154,6 +2569,7 @@ mod tests {
             requested_subtitle: None,
             remembered_audio: None,
             remembered_subtitle: None,
+            prefer_embedded_subtitle_sources: false,
         };
         let candidates = vec![low.clone(), high.clone()];
         let order = async |candidates: Vec<db::Media>, ranking| {

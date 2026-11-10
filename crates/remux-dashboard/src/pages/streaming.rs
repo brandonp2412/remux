@@ -14,6 +14,8 @@ struct StreamingSettingsState {
     config: Signal<Option<ServerConfiguration>>,
     sort_mode: Signal<SortMediaSourcesMode>,
     show_decision: Signal<bool>,
+    prefer_embedded_subtitles: Signal<bool>,
+    subtitle_probe_budget: Signal<i64>,
     probe_timeout: Signal<i64>,
     probe_timeout_p2p: Signal<i64>,
     auto_next_stream: Signal<bool>,
@@ -33,6 +35,8 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
         config: use_signal(|| None),
         sort_mode: use_signal(|| SortMediaSourcesMode::Best),
         show_decision: use_signal(|| true),
+        prefer_embedded_subtitles: use_signal(|| false),
+        subtitle_probe_budget: use_signal(|| 0),
         probe_timeout: use_signal(|| 20),
         probe_timeout_p2p: use_signal(|| 60),
         auto_next_stream: use_signal(|| true),
@@ -68,6 +72,18 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
                         .set(
                             cfg.show_playback_decision_in_title
                                 .unwrap_or(true),
+                        );
+                    load_state
+                        .prefer_embedded_subtitles
+                        .set(
+                            cfg.prefer_embedded_subtitle_sources
+                                .unwrap_or(false),
+                        );
+                    load_state
+                        .subtitle_probe_budget
+                        .set(
+                            cfg.embedded_subtitle_probe_budget_secs
+                                .unwrap_or(0),
                         );
                     load_state
                         .probe_timeout
@@ -144,6 +160,17 @@ pub fn StreamingGeneralSettingsPage(app_state: AppState) -> Element {
                 *state
                     .show_decision
                     .peek(),
+            ),
+            prefer_embedded_subtitle_sources: Some(
+                *state
+                    .prefer_embedded_subtitles
+                    .peek(),
+            ),
+            embedded_subtitle_probe_budget_secs: Some(
+                (*state
+                    .subtitle_probe_budget
+                    .peek())
+                .clamp(0, 5),
             ),
             probe_timeout_secs: Some(
                 *state
@@ -283,6 +310,16 @@ fn StreamingSortPanel() -> Element {
                     }
                 }
                 ToggleRow {
+                    label: "Prefer releases with embedded subtitles",
+                    description: "Prefer verified, playable embedded text subtitles in your chosen language when video quality and torrent health are comparable.",
+                    checked: *state.prefer_embedded_subtitles.read(),
+                    disabled: *state.saving.read(),
+                    on_change: move |value| {
+                        state.prefer_embedded_subtitles.set(value);
+                        state.saved.set(false);
+                    }
+                }
+                ToggleRow {
                     label: "Show playback decision in title",
                     description: "Append the playback decision to each stream title.",
                     checked: *state.show_decision.read(),
@@ -303,6 +340,27 @@ fn StreamingProbePanel() -> Element {
     rsx! {
         Card { title: "Stream probing",
             div { style: "display:flex;flex-direction:column;gap:14px",
+                if *state.prefer_embedded_subtitles.read() {
+                    div { class: "field",
+                        label { class: "field-label", r#for: "subtitle-probe-budget", "Extra subtitle probe budget (seconds)" }
+                        div { class: "field-hint", "0 = no extra probe. Up to 5 seconds to check one comparable release for embedded subtitles on first playback." }
+                        input {
+                            id: "subtitle-probe-budget",
+                            r#type: "number",
+                            class: "text-input",
+                            min: "0",
+                            max: "5",
+                            value: "{state.subtitle_probe_budget}",
+                            disabled: *state.saving.read(),
+                            oninput: move |event| {
+                                if let Ok(value) = event.value().parse::<i64>() {
+                                    state.subtitle_probe_budget.set(value.clamp(0, 5));
+                                    state.saved.set(false);
+                                }
+                            },
+                        }
+                    }
+                }
                 div { class: "field",
                     label { class: "field-label", r#for: "probe-timeout", "Probe timeout (seconds)" }
                     div { class: "field-hint", "Seconds to wait for HTTP/local stream probes." }

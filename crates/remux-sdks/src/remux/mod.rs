@@ -779,6 +779,15 @@ pub struct ServerConfiguration {
     /// quality always wins, regardless of transcode cost).
     #[default(Some(SortMediaSourcesMode::Best))]
     pub sort_media_sources: Option<SortMediaSourcesMode>,
+    /// Prefer a comparable, playable release with embedded text subtitles in the
+    /// requesting user's preferred language. Never infer subtitle tracks from filenames.
+    #[default(Some(false))]
+    pub prefer_embedded_subtitle_sources: Option<bool>,
+    /// Maximum additional seconds to inspect one comparable torrent release
+    /// when embedded tracks are not yet known. 0 disables extra probing.
+    /// Capped at 5 seconds at runtime. Default: 0 (no added startup latency).
+    #[default(Some(0_i64))]
+    pub embedded_subtitle_probe_budget_secs: Option<i64>,
     /// Append the playback decision ("Direct Play" / "Direct Stream" /
     /// "Transcode") to each MediaSource's display title, when a DeviceProfile
     /// is available to judge it against. Default: true.
@@ -7477,6 +7486,18 @@ mod tests {
         );
         let policy: UserPolicy = serde_json::from_str("{}").unwrap();
         assert_eq!(policy.sync_play_access, SyncPlayUserAccessType::None);
+    }
+
+    #[test]
+    fn embedded_subtitle_source_preference_defaults_to_no_extra_work() {
+        let cfg: ServerConfiguration = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.prefer_embedded_subtitle_sources, Some(false));
+        assert_eq!(cfg.embedded_subtitle_probe_budget_secs, Some(0));
+        let configured: ServerConfiguration = serde_json::from_str(
+            r#"{"PreferEmbeddedSubtitleSources":true,"EmbeddedSubtitleProbeBudgetSecs":3}"#,
+        ).unwrap();
+        assert_eq!(configured.prefer_embedded_subtitle_sources, Some(true));
+        assert_eq!(configured.embedded_subtitle_probe_budget_secs, Some(3));
     }
 
     #[test]

@@ -33,6 +33,8 @@ Remux is a Jellyfin-compatible media server that brings Stremio add-ons, local f
 - **Probe data for streams**  
   Audio and subtitle track selection works out of the box for streamed content. Track metadata is sourced from [RemuxDB](https://remuxdb.1632022.xyz) so clients see the same experience as local files.
 
+- **Optional embedded subtitle source preference:** In **Streaming settings**, favour a comparable torrent release with verified embedded text subtitles in the viewer's preferred language. Resolution, HDR and swarm health are protected. The optional **extra probe budget** (0–5 seconds; default 0) can inspect one alternative on first playback. No extra probing occurs unless explicitly enabled; metadata guesses never count as verified subtitles.
+
 - **Powerful library filtering**  
   Build libraries dynamically: filter by tags, catalogs, popularity, release year, and more. Exclude content per-user or scope libraries to specific audiences without duplicating sources.
 
