@@ -919,9 +919,9 @@ async fn items_playbackinfo_inner(
         .unwrap_or_default();
     for (source, extras) in media_sources
         .iter_mut()
-        .zip(&source_extras)
+        .zip(&mut source_extras)
     {
-        append_external_subtitles(
+        let addon_routes = append_external_subtitles(
             std::slice::from_mut(source),
             &extras.external_subtitles,
             &subtitle_languages,
@@ -933,6 +933,14 @@ async fn items_playbackinfo_inner(
                 .expose(),
             subtitle_dedup,
         );
+        extras
+            .subtitle_routes
+            .1
+            .extend(
+                addon_routes
+                    .into_iter()
+                    .flatten(),
+            );
     }
 
     // Re-resolve defaults after external subtitles were injected so language

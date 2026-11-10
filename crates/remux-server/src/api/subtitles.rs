@@ -1433,9 +1433,12 @@ pub(crate) fn append_external_subtitles(
     item_id: Uuid,
     api_key: &str,
     dedup: SubtitleDedupSettings,
-) {
+) -> Vec<Vec<SidecarSubtitleRoute>> {
+    let mut routes_by_source = Vec::with_capacity(media_sources.len());
     for source in media_sources.iter_mut() {
+        let mut routes = Vec::new();
         if !has_real_probe_data(source) {
+            routes_by_source.push(routes);
             continue;
         }
         let next_idx = source
@@ -1475,8 +1478,17 @@ pub(crate) fn append_external_subtitles(
             source
                 .media_streams
                 .push(stream);
+            // Use the exact advertised index and descriptor for delivery.
+            // Rebuilding the addon list at download time can make dedup produce
+            // a different set from the DirectStream PlaybackInfo response.
+            routes.push(SidecarSubtitleRoute {
+                index: idx,
+                subtitle: (*sub).clone(),
+            });
         }
+        routes_by_source.push(routes);
     }
+    routes_by_source
 }
 
 fn has_real_probe_data(source: &api::MediaSourceInfo) -> bool {
@@ -2003,7 +2015,7 @@ mod tests {
         let mut direct_stream = source.clone();
         direct_stream.supports_direct_play = false;
         let mut sources = vec![direct_stream];
-        append_external_subtitles(
+        let routes = append_external_subtitles(
             &mut sources,
             &[external.clone()],
             &[],
@@ -2012,8 +2024,22 @@ mod tests {
             "test-key",
             DEDUP_ON,
         );
-        assert_eq!(sources[0].media_streams.len(), 2);
+        assert_eq!(
+            sources[0]
+                .media_streams
+                .len(),
+            2
+        );
         assert!(sources[0].media_streams[1].is_external);
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].len(), 1);
+        assert_eq!(routes[0][0].index, sources[0].media_streams[1].index);
+        assert_eq!(
+            routes[0][0]
+                .subtitle
+                .id,
+            external.id
+        );
 
         for profile in [None, Some(&external_profile)] {
             let mut sources = vec![source.clone()];
