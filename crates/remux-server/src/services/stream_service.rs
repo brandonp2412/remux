@@ -433,33 +433,24 @@ fn comparable_subtitle_torrent(primary: &db::Media, alternate: &db::Media) -> bo
             .is_none_or(|(first, second)| preserves_probed_video_quality(first, second))
 }
 
-fn prefer_embedded_subtitle_torrent(
-    sources: &mut [db::Media],
+/// A subtitle-bearing torrent is only a probe candidate. Its persisted ffprobe
+/// metadata does not prove that its swarm can deliver bytes *now*.
+fn embedded_subtitle_probe_target(
+    sources: &[db::Media],
     language: &str,
-    ranking: Option<SourceRankingContext<'_>>,
-) {
-    if sources.len() < 2 || has_probed_embedded_subtitles(&sources[0], language) {
-        return;
+) -> Option<Uuid> {
+    let primary = sources.first()?;
+    if has_probed_embedded_subtitles(primary, language) {
+        return None;
     }
-    let preferred = sources
+    sources
         .iter()
-        .enumerate()
         .skip(1)
-        .find_map(|(index, source)| {
-            (comparable_subtitle_torrent(&sources[0], source)
-                && preserves_playback_cost(
-                    ranking,
-                    &api::MediaSourceInfo::from(sources[0].clone()),
-                    &api::MediaSourceInfo::from(source.clone()),
-                )
-                && has_probed_embedded_subtitles(source, language))
-            .then_some(index)
-        });
-    if let Some(index) = preferred {
-        let preferred_id = sources[index].id;
-        sources[..=index].rotate_right(1);
-        tracing::info!(stream_id = %preferred_id, language, "preferring comparable torrent with verified embedded subtitles");
-    }
+        .find(|candidate| {
+            comparable_subtitle_torrent(primary, candidate)
+                && has_probed_embedded_subtitles(candidate, language)
+        })
+        .map(|candidate| candidate.id)
 }
 
 fn should_bounded_probe_subtitles(
@@ -648,9 +639,10 @@ impl StreamService {
             (info, allow_subtitle_extraction)
         });
         prefer_available_torrents(sources);
-        if let Some(language) = prefs.preferred_subtitle_language() {
-            prefer_embedded_subtitle_torrent(sources, &language, Some(ranking));
-        }
+        // Do not reorder P2P sources merely because an old ffprobe found text
+        // subtitles. Metadata says nothing about *current* torrent readiness;
+        // the bounded alternate probe in probe_candidates decides whether a
+        // subtitle-bearing release is genuinely playable now.
         extraction
     }
 
@@ -1248,6 +1240,18 @@ impl StreamService {
                 0
             };
         let preferred_subtitle_language = prefs.preferred_subtitle_language();
+        // Prefer a known text-subtitle candidate over filename guesses, even if
+        // it is outside the first five torrent releases. Only one candidate
+        // gets a readiness probe, bounded by the configured extra budget.
+        let preferred_subtitle_probe_target = if subtitle_probe_budget > 0 {
+            preferred_subtitle_language
+                .as_deref()
+                .and_then(|language| {
+                    embedded_subtitle_probe_target(&sel.candidates, language)
+                })
+        } else {
+            None
+        };
         let mut extra_subtitle_probe_attempted = false;
         let mut extra_subtitle_probe_verified = None;
         let port = self
@@ -1340,7 +1344,7 @@ impl StreamService {
                 preferred_probe_id.is_some_and(|preferred| stream.id != preferred);
             let extra_subtitle_probe = skip_probe
                 && !extra_subtitle_probe_attempted
-                && candidate_index < 5
+                && preferred_subtitle_probe_target == Some(stream.id)
                 && subtitle_probe_budget > 0
                 && preferred_subtitle_language
                     .as_deref()
@@ -2292,9 +2296,11 @@ mod tests {
             test_subtitle_torrent("Show.S07E11.1080p.WEBRip.mkv", 100, Some("eng"));
         let french =
             test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 75, Some("fra"));
-        let mut sources = vec![english, french.clone()];
-        prefer_embedded_subtitle_torrent(&mut sources, "fr", None);
-        assert_eq!(sources[0].id, french.id);
+        let sources = vec![english, french.clone()];
+        assert_eq!(
+            embedded_subtitle_probe_target(&sources, "fr"),
+            Some(french.id)
+        );
     }
 
     #[test]
@@ -2302,9 +2308,11 @@ mod tests {
         let external = test_subtitle_torrent("Show.S07E11.1080p.WEBRip.mkv", 100, None);
         let embedded =
             test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 75, Some("eng"));
-        let mut sources = vec![external, embedded.clone()];
-        prefer_embedded_subtitle_torrent(&mut sources, "en", None);
-        assert_eq!(sources[0].id, embedded.id);
+        let sources = vec![external, embedded.clone()];
+        assert_eq!(
+            embedded_subtitle_probe_target(&sources, "en"),
+            Some(embedded.id)
+        );
     }
 
     #[test]
@@ -2321,9 +2329,11 @@ mod tests {
             17,
             Some("eng"),
         );
-        let mut sources = vec![primary, embedded.clone()];
-        prefer_embedded_subtitle_torrent(&mut sources, "en", None);
-        assert_eq!(sources[0].id, embedded.id);
+        let sources = vec![primary, embedded.clone()];
+        assert_eq!(
+            embedded_subtitle_probe_target(&sources, "en"),
+            Some(embedded.id)
+        );
     }
 
     #[test]
@@ -2341,9 +2351,11 @@ mod tests {
             5,
             Some("eng"),
         );
-        let mut sources = vec![no_subs, embedded.clone()];
-        prefer_embedded_subtitle_torrent(&mut sources, "en", None);
-        assert_eq!(sources[0].id, embedded.id);
+        let sources = vec![no_subs, embedded.clone()];
+        assert_eq!(
+            embedded_subtitle_probe_target(&sources, "en"),
+            Some(embedded.id)
+        );
     }
 
     #[test]
@@ -2360,9 +2372,8 @@ mod tests {
         });
         assert!(!has_probed_embedded_subtitles(&guessed, "en"));
         let primary = test_subtitle_torrent("Show.S07E11.1080p.WEBRip.mkv", 100, None);
-        let mut sources = vec![primary.clone(), guessed];
-        prefer_embedded_subtitle_torrent(&mut sources, "en", None);
-        assert_eq!(sources[0].id, primary.id);
+        let sources = vec![primary.clone(), guessed];
+        assert_eq!(embedded_subtitle_probe_target(&sources, "en"), None);
     }
 
     #[test]
@@ -2373,9 +2384,8 @@ mod tests {
             test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 4, Some("eng")),
             test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 75, Some("fra")),
         ] {
-            let mut sources = vec![primary.clone(), alternative];
-            prefer_embedded_subtitle_torrent(&mut sources, "en", None);
-            assert_eq!(sources[0].id, primary.id);
+            let sources = vec![primary.clone(), alternative];
+            assert_eq!(embedded_subtitle_probe_target(&sources, "en"), None);
         }
     }
 
