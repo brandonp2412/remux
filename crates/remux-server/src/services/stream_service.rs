@@ -419,7 +419,9 @@ fn comparable_subtitle_torrent(primary: &db::Media, alternate: &db::Media) -> bo
         && torrent_availability_tier(alternate) >= 3
         && torrent_playability_tier(primary) == torrent_playability_tier(alternate)
         && alternate.quality_weight() >= primary.quality_weight()
-        && alternate_seeders >= (primary_seeders / 5).max(5)
+        // The preference is opt-in: five reported seeders is a viable swarm,
+        // even when a subtitle-free alternative has far more peers.
+        && alternate_seeders >= 5
         && primary
             .probe_data
             .as_ref()
@@ -2325,6 +2327,26 @@ mod tests {
     }
 
     #[test]
+    fn criminal_minds_s02e01_prefers_healthy_embedded_freethefish() {
+        // In production KONTRAST has 86 seeders but no subtitles; FreetheFish
+        // has five seeders, two probed English SubRip tracks, matching 1080p,
+        // and a matching runtime. The explicit subtitle preference should win.
+        let no_subs = test_subtitle_torrent(
+            "Criminal.Minds.S02E01.1080p.WEBRip.x265-KONTRAST.mp4",
+            86,
+            None,
+        );
+        let embedded = test_subtitle_torrent(
+            "Criminal Minds (2005) - S02E01 - The Fisher King (2) (1080p WEB x265 FreetheFish).mkv",
+            5,
+            Some("eng"),
+        );
+        let mut sources = vec![no_subs, embedded.clone()];
+        prefer_embedded_subtitle_torrent(&mut sources, "en", None);
+        assert_eq!(sources[0].id, embedded.id);
+    }
+
+    #[test]
     fn subtitle_source_preference_never_trusts_filename_guesses() {
         let mut guessed =
             test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 80, Some("eng"));
@@ -2348,7 +2370,7 @@ mod tests {
         let primary = test_subtitle_torrent("Show.S07E11.1080p.WEBRip.mkv", 100, None);
         for alternative in [
             test_subtitle_torrent("Show.S07E11.720p.WEB-DL.mkv", 90, Some("eng")),
-            test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 8, Some("eng")),
+            test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 4, Some("eng")),
             test_subtitle_torrent("Show.S07E11.1080p.WEB-DL.mkv", 75, Some("fra")),
         ] {
             let mut sources = vec![primary.clone(), alternative];
