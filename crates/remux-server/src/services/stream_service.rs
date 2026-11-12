@@ -34,6 +34,48 @@ impl std::fmt::Display for P2pReadinessPending {
 }
 impl std::error::Error for P2pReadinessPending {}
 
+// Preserve quality-first ordering unless a lower-resolution candidate is
+// demonstrably usable while the primary has very little verified data.
+fn cached_lower_resolution_fallback(
+    primary_height: u32,
+    candidate_height: u32,
+    primary: Option<&crate::torrent::TorrentPrefetchStatus>,
+    candidate: &crate::torrent::TorrentPrefetchStatus,
+) -> bool {
+    if primary_height <= candidate_height {
+        return true;
+    }
+    if primary_height > 1080
+        || candidate_height < 720
+        || candidate_height >= primary_height
+    {
+        return false;
+    }
+    // A completely verified copy is unconditionally usable. A partial copy
+    // requires enough checked bytes and an active, measured stream; don't
+    // promote a stalled file merely because it occupies disk space.
+    let ready = candidate.current_total_bytes > 0
+        && (candidate.current_cached_bytes >= candidate.current_total_bytes
+            || (candidate.current_cached_bytes >= 40 * 1024 * 1024
+                && candidate.live_peers > 0
+                && candidate.download_mibps >= 1.0));
+    if !ready {
+        return false;
+    }
+    // With no primary session, a fully verified alternate still deserves
+    // priority, but partial alternates must not displace unknown primaries.
+    if primary.is_none() {
+        return candidate.current_cached_bytes >= candidate.current_total_bytes;
+    }
+    primary.is_some_and(|status| {
+        status.current_total_bytes > 0
+            && status
+                .current_cached_bytes
+                .saturating_mul(4)
+                < status.current_total_bytes
+    })
+}
+
 fn progressing_source(status: &crate::torrent::TorrentPrefetchStatus) -> bool {
     // A ready header is not proof that the requested resume range is readable.
     // We only reach this check after every real playback probe failed.
@@ -511,6 +553,15 @@ fn meets_minimum_p2p_resolution(source: &db::Media) -> bool {
         .as_ref()
         .is_some_and(|info| info.is_p2p());
     !is_p2p || p2p_resolution_height(source).is_some_and(|height| height >= 720)
+}
+
+// Once a primary stream has failed, prefer fallback releases whose real
+// ffprobe data confirms readable text subtitles in the requested language.
+// This only orders fallback probes; playback still validates torrent readiness.
+fn prefer_probed_text_subtitle_fallbacks(sources: &mut [db::Media], language: &str) {
+    sources.sort_by_cached_key(|source| {
+        std::cmp::Reverse(has_probed_embedded_subtitles(source, language))
+    });
 }
 
 fn quality_ordered_probe_pool(streams: &[db::Media]) -> Vec<db::Media> {
@@ -1105,13 +1156,8 @@ impl StreamService {
             }
             None => Default::default(),
         };
-        // A completed torrent is strong readiness evidence, but cache state must
-        // never silently downgrade a healthy quality-first primary. Only promote
-        // cached P2P sources that are at least the ranked primary's resolution;
-        // lower-resolution cached sources remain available for the bounded
-        // diversified fallback path after the higher-quality source proves bad.
-        // This preserves the fast path for cached same/higher-quality releases
-        // without imposing a universal cached-720p-first policy.
+        // Prefer a playable cached 720p fallback over a nearly empty 1080p
+        // torrent, but preserve healthy primaries and avoid 4K downgrades.
         let primary_p2p_height = candidates
             .first()
             .filter(|source| {
@@ -1129,12 +1175,29 @@ impl StreamService {
                 .await
                 .clone()
         {
+            let primary_status = candidates
+                .first()
+                .and_then(|source| {
+                    let info = source
+                        .stream_info
+                        .as_ref()?;
+                    let crate::stream::StreamDescriptor::Torrent {
+                        info_hash,
+                        file_hint,
+                        file_idx,
+                        ..
+                    } = &info.descriptor
+                    else {
+                        return None;
+                    };
+                    torrent.prefetch_status(info_hash, *file_idx, file_hint.as_deref())
+                });
             let cached_choice = candidates
                 .iter()
                 .enumerate()
                 .filter_map(|(index, source)| {
                     let height = p2p_resolution_height(source)?;
-                    if height < 720 || height < primary_height {
+                    if height < 720 {
                         return None;
                     }
                     let info = source
@@ -1154,9 +1217,13 @@ impl StreamService {
                         *file_idx,
                         file_hint.as_deref(),
                     )?;
-                    (status.current_total_bytes > 0
-                        && status.current_cached_bytes >= status.current_total_bytes)
-                        .then_some((index, height))
+                    cached_lower_resolution_fallback(
+                        primary_height,
+                        height,
+                        primary_status.as_ref(),
+                        &status,
+                    )
+                    .then_some((index, height))
                 })
                 .max_by_key(|(index, height)| (*height, std::cmp::Reverse(*index)));
             if let Some((index, height)) = cached_choice.filter(|(index, _)| *index > 0)
@@ -1166,7 +1233,7 @@ impl StreamService {
                     stream_id = %cached.id,
                     resolution_height = height,
                     primary_resolution_height = primary_height,
-                    "prioritizing same-or-higher-resolution fully cached torrent"
+                    "prioritizing verified playable torrent over incomplete primary"
                 );
                 candidates.insert(0, cached);
             }
@@ -1203,6 +1270,25 @@ impl StreamService {
             .rank_candidates(std::mem::take(&mut sel.candidates), ranking, prefs)
             .await;
         sel.candidates = candidates;
+        let preferred_subtitle_language = prefs.preferred_subtitle_language();
+        if !sel.specific_requested
+            && let Some(language) = preferred_subtitle_language.as_deref()
+        {
+            prefer_probed_text_subtitle_fallbacks(&mut sel.probe_pool, language);
+            // Clients use MediaSources[1] as their first fallback when [0]
+            // stalls. Keep the primary unchanged, but prefer already-probed
+            // text subtitle releases among subsequent candidates.
+            if sel
+                .candidates
+                .len()
+                > 1
+            {
+                prefer_probed_text_subtitle_fallbacks(
+                    &mut sel.candidates[1..],
+                    language,
+                );
+            }
+        }
         let preferred_probe_id = if sel.specific_requested {
             None
         } else {
@@ -1239,7 +1325,6 @@ impl StreamService {
             } else {
                 0
             };
-        let preferred_subtitle_language = prefs.preferred_subtitle_language();
         // Prefer a known text-subtitle candidate over filename guesses, even if
         // it is outside the first five torrent releases. Only one candidate
         // gets a readiness probe, bounded by the configured extra budget.
@@ -2168,6 +2253,33 @@ mod tests {
             }),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn fallback_pool_prefers_probed_english_text_over_high_seed_bitmap_release() {
+        let bitmap = test_subtitle_torrent("Friends.S04E15.1080p.Bitmap.mkv", 70, None);
+        let text = test_subtitle_torrent(
+            "Friends.S04E15.720p.English.SRT.mkv",
+            3,
+            Some("eng"),
+        );
+        let mut pool = quality_ordered_probe_pool(&[bitmap.clone(), text.clone()]);
+        assert_eq!(pool[0].id, bitmap.id);
+        prefer_probed_text_subtitle_fallbacks(&mut pool, "en");
+        assert_eq!(pool[0].id, text.id);
+        let primary = test_subtitle_torrent(
+            "Friends.S04E15.2160p.English.SRT.mkv",
+            80,
+            Some("eng"),
+        );
+        let mut advertised = vec![primary.clone(), bitmap.clone(), text.clone()];
+        prefer_probed_text_subtitle_fallbacks(&mut advertised[1..], "en");
+        assert_eq!(advertised[0].id, primary.id);
+        assert_eq!(advertised[1].id, text.id);
+        assert_eq!(advertised[2].id, bitmap.id);
+        let mut no_preferred_language = quality_ordered_probe_pool(&[bitmap, text]);
+        prefer_probed_text_subtitle_fallbacks(&mut no_preferred_language, "fr");
+        assert_eq!(no_preferred_language[0].id, pool[1].id);
     }
 
     #[test]
@@ -3257,6 +3369,87 @@ mod readiness_tests {
             startup_readable_bytes: Some(4 * 1024 * 1024),
             startup_ready: false,
         }
+    }
+
+    #[test]
+    fn ready_720p_beats_a_stalled_1080p_but_not_a_healthy_primary() {
+        let mut primary = status();
+        let mut candidate = status();
+        candidate.current_cached_bytes = candidate.current_total_bytes;
+        assert!(cached_lower_resolution_fallback(
+            1080,
+            720,
+            Some(&primary),
+            &candidate
+        ));
+        assert!(cached_lower_resolution_fallback(
+            1080, 720, None, &candidate
+        ));
+        assert!(!cached_lower_resolution_fallback(
+            2160,
+            720,
+            Some(&primary),
+            &candidate
+        ));
+        assert!(!cached_lower_resolution_fallback(
+            1080,
+            480,
+            Some(&primary),
+            &candidate
+        ));
+        primary.current_cached_bytes = primary.current_total_bytes / 2;
+        assert!(!cached_lower_resolution_fallback(
+            1080,
+            720,
+            Some(&primary),
+            &candidate
+        ));
+        assert!(cached_lower_resolution_fallback(
+            1080,
+            1080,
+            Some(&primary),
+            &candidate
+        ));
+
+        // A partially verified lower-resolution torrent can be viable while
+        // the higher-resolution one has stalled at an empty startup buffer.
+        primary.current_cached_bytes = 0;
+        candidate.current_total_bytes = 1482 * 1024 * 1024;
+        candidate.current_cached_bytes = 80 * 1024 * 1024;
+        candidate.live_peers = 3;
+        candidate.download_mibps = 3.8;
+        assert!(cached_lower_resolution_fallback(
+            1080,
+            720,
+            Some(&primary),
+            &candidate
+        ));
+        assert!(!cached_lower_resolution_fallback(
+            1080, 720, None, &candidate
+        ));
+        candidate.download_mibps = 0.0;
+        assert!(!cached_lower_resolution_fallback(
+            1080,
+            720,
+            Some(&primary),
+            &candidate
+        ));
+        candidate.download_mibps = 3.8;
+        candidate.live_peers = 0;
+        assert!(!cached_lower_resolution_fallback(
+            1080,
+            720,
+            Some(&primary),
+            &candidate
+        ));
+        candidate.live_peers = 3;
+        candidate.current_cached_bytes = 2 * 1024 * 1024;
+        assert!(!cached_lower_resolution_fallback(
+            1080,
+            720,
+            Some(&primary),
+            &candidate
+        ));
     }
 
     #[test]

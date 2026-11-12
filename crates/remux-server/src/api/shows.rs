@@ -249,33 +249,34 @@ pub async fn shows_nextup(
     let state_for =
         |e: &db::Media| -> Option<&db::UserMediaState> { states.get(&e.id) };
 
-    // 1. Resumable: partially-watched episode
-    let mut next_ep: Option<&db::Media> = None;
-    if enable_resumable {
-        next_ep = episodes
+    // Never resurrect an old unfinished episode after the user has watched a
+    // later one. Stale partials from previous sessions must not roll Next Up
+    // backwards (for example, Friends S4E1 when S4E18 was already watched).
+    let last_played_pos = episodes
+        .iter()
+        .rposition(|e| state_for(e).is_some_and(|s| s.play_count > 0));
+    let first_after_played = last_played_pos.map_or(0, |pos| pos + 1);
+    let mut next_ep = if enable_resumable {
+        episodes
             .iter()
+            .skip(first_after_played)
             .find(|e| {
                 state_for(e)
-                    .map_or(false, |s| s.play_count == 0 && s.playback_position > 0)
-            });
-    }
+                    .is_some_and(|s| s.play_count == 0 && s.playback_position > 0)
+            })
+    } else {
+        None
+    };
 
-    // 2. First unplayed episode after the last fully-played episode
     if next_ep.is_none() {
-        let last_played_pos = episodes
-            .iter()
-            .rposition(|e| state_for(e).map_or(false, |s| s.play_count > 0));
-
         next_ep = if let Some(pos) = last_played_pos {
             episodes.get(pos + 1)
         } else if !disable_first {
-            // Nothing watched yet — show first regular (Season 1+) episode,
-            // skipping Season 0 specials just like Jellyfin server does.
             episodes
                 .iter()
                 .find(|e| {
                     e.parent_idx
-                        .map_or(true, |s| s > 0)
+                        .is_none_or(|s| s > 0)
                 })
                 .or_else(|| episodes.first())
         } else {
@@ -461,26 +462,30 @@ pub(crate) async fn next_up_candidates(
 
         let state_for = |e: &db::Media| states_map.get(&e.id);
 
-        let mut next_ep: Option<&db::Media> = None;
-        if enable_resumable {
-            next_ep = episodes
+        // Start searching for resumable episodes after the furthest *watched*
+        // episode. A stale older partial must not win just because it occurs
+        // first in season order.
+        let last_played_pos = episodes
+            .iter()
+            .rposition(|e| state_for(e).is_some_and(|s| s.play_count > 0));
+        let first_after_played = last_played_pos.map_or(0, |pos| pos + 1);
+        let mut next_ep = if enable_resumable {
+            episodes
                 .iter()
+                .skip(first_after_played)
                 .find(|e| {
                     state_for(e)
-                        .map_or(false, |s| s.play_count == 0 && s.playback_position > 0)
-                });
-        }
+                        .is_some_and(|s| s.play_count == 0 && s.playback_position > 0)
+                })
+        } else {
+            None
+        };
         if next_ep.is_none() {
-            let last_played_pos = episodes
-                .iter()
-                .rposition(|e| state_for(e).map_or(false, |s| s.play_count > 0));
             if let Some(pos) = last_played_pos {
                 let candidate = episodes.get(pos + 1);
-                // Mirror Jellyfin: when EnableResumable=false, skip a candidate that
-                // is already in-progress — the user should resume or mark it watched.
                 next_ep = if !enable_resumable {
                     candidate.filter(|e| {
-                        !state_for(e).map_or(false, |s| s.playback_position > 0)
+                        !state_for(e).is_some_and(|s| s.playback_position > 0)
                     })
                 } else {
                     candidate
@@ -1394,6 +1399,83 @@ pub(crate) mod test {
                 .simple()
                 .to_string(),
         );
+    }
+
+    #[tokio::test]
+    async fn nextup_skips_stale_partials_before_furthest_watched_episode() {
+        use crate::integration_test::{auth_header_with_token, authenticated_server};
+        use chrono::{Duration, Utc};
+        use http::header::HeaderValue;
+
+        let (server, guard, token) = authenticated_server().await;
+        let auth = auth_header_with_token(&token);
+        let db = &guard
+            .0
+            .db;
+        let user: db::User = sqlx::query_as("SELECT * FROM users LIMIT 1")
+            .fetch_one(db)
+            .await
+            .unwrap();
+        let (series, episodes) = insert_series_with_episodes(
+            db,
+            "FriendsContinueWatchingRegression",
+            &["S4E1", "S4E9", "S4E14", "S4E16", "S4E18", "S4E19"],
+        )
+        .await;
+        let old = Utc::now().naive_utc() - Duration::days(11);
+        let recent = Utc::now().naive_utc();
+        insert_state(db, user.id, episodes[0].id, 0, 201, None, Some(old)).await;
+        insert_state(db, user.id, episodes[1].id, 0, 800, None, Some(old)).await;
+        insert_state(
+            db,
+            user.id,
+            episodes[3].id,
+            1,
+            0,
+            Some(recent),
+            Some(recent),
+        )
+        .await;
+        insert_state(
+            db,
+            user.id,
+            episodes[4].id,
+            1,
+            0,
+            Some(recent),
+            Some(recent),
+        )
+        .await;
+
+        for path in [
+            "/shows/nextup".to_string(),
+            "/shows/nextup?EnableResumable=false".to_string(),
+            format!("/shows/nextup?SeriesId={}", series.id),
+            format!("/shows/nextup?SeriesId={}&EnableResumable=false", series.id),
+        ] {
+            let resp = server
+                .get(&path)
+                .add_header(
+                    http::header::AUTHORIZATION,
+                    HeaderValue::from_str(&auth).unwrap(),
+                )
+                .await;
+            let body: serde_json::Value = resp.json();
+            let items = body["Items"]
+                .as_array()
+                .unwrap();
+            assert_eq!(items.len(), 1, "{path}: expected one Next Up episode");
+            assert_eq!(
+                items[0]["Id"]
+                    .as_str()
+                    .unwrap(),
+                episodes[5]
+                    .id
+                    .simple()
+                    .to_string(),
+                "{path}: stale S4E1/S4E9 must not beat S4E19"
+            );
+        }
     }
 
     #[tokio::test]
