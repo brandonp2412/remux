@@ -1644,7 +1644,6 @@ async fn rank_item_sources(
     original_language: Option<&str>,
     remembered_audio: Option<i64>,
     remembered_subtitle: Option<i64>,
-    prefer_embedded_subtitle_sources: bool,
 ) {
     crate::services::StreamService::rank_media_sources(
         db,
@@ -1658,7 +1657,6 @@ async fn rank_item_sources(
             requested_subtitle: None,
             remembered_audio,
             remembered_subtitle,
-            prefer_embedded_subtitle_sources,
         },
     )
     .await;
@@ -1940,9 +1938,6 @@ async fn item_for_user(
                     original_language.as_deref(),
                     remembered_audio,
                     remembered_subtitle,
-                    server_config
-                        .prefer_embedded_subtitle_sources
-                        .unwrap_or(false),
                 )
                 .await;
             }
@@ -2025,9 +2020,6 @@ async fn item_for_user(
                     original_language.as_deref(),
                     remembered_audio,
                     remembered_subtitle,
-                    server_config
-                        .prefer_embedded_subtitle_sources
-                        .unwrap_or(false),
                 )
                 .await;
             }

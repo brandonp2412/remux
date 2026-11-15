@@ -479,9 +479,6 @@ async fn items_playbackinfo_inner(
         requested_subtitle: q.subtitle_stream_index,
         remembered_audio: saved_audio,
         remembered_subtitle: saved_subtitle,
-        prefer_embedded_subtitle_sources: probe_cfg
-            .prefer_embedded_subtitle_sources
-            .unwrap_or(false),
     };
 
     let port = state
