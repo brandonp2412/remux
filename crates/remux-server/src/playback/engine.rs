@@ -2906,6 +2906,7 @@ mod tests {
             wait_done: Arc::new(tokio::sync::Notify::new()),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
+            requested_start_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
             runtime_ticks: 120i64
                 .to_ticks(TickUnit::Seconds)
@@ -3112,6 +3113,7 @@ mod tests {
             wait_done: Arc::new(tokio::sync::Notify::new()),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 30,
+            requested_start_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
             runtime_ticks: 120i64
                 .to_ticks(TickUnit::Seconds)

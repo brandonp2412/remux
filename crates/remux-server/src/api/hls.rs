@@ -34,6 +34,20 @@ use crate::{
 static TRANSCODE_CREATE_LOCKS: crate::keyed_lock::KeyedLock<String> =
     crate::keyed_lock::KeyedLock::new();
 
+// A manifest may be requested repeatedly after a seek (including retries and
+// variant discovery). Only a *different* offset needs a new ffmpeg process.
+// Matching the session's second-resolution offset also avoids restarting a
+// transcode for a sub-second difference the HLS engine cannot represent.
+fn hls_seek_requires_restart(
+    current_start_secs: u32,
+    requested_ticks: Option<i64>,
+) -> bool {
+    requested_ticks.is_some_and(|ticks| {
+        let requested_secs = (ticks.max(0) / 10_000_000).min(u32::MAX as i64) as u32;
+        requested_secs != current_start_secs
+    })
+}
+
 enum HlsSessionResult {
     Transcode(Arc<tokio::sync::RwLock<TranscodeSession>>, String),
     /// The request needs processing the server or user policy disallows.
@@ -121,20 +135,21 @@ async fn create_hls_session(
     let _create_guard = TRANSCODE_CREATE_LOCKS
         .lock(play_session_id.clone())
         .await;
-    let is_seeking = q
-        .start_time_ticks
-        .is_some_and(|t| t > 0);
-    if is_seeking {
-        if state
-            .ctx
-            .sessions
-            .get_transcode(&play_session_id)
-            .is_some()
-        {
+    if let Some(existing) = state
+        .ctx
+        .sessions
+        .get_transcode(&play_session_id)
+    {
+        let original_start_secs = existing
+            .read()
+            .await
+            .requested_start_secs;
+        if hls_seek_requires_restart(original_start_secs, q.start_time_ticks) {
             debug!(
                 play_session_id = %play_session_id,
                 start_time_ticks = ?q.start_time_ticks,
-                "seek detected — stopping old transcode session and restarting"
+                original_start_secs,
+                "new HLS seek position — restarting transcode session"
             );
             state
                 .ctx
@@ -547,6 +562,15 @@ async fn create_hls_session(
             session_hw_accel,
         );
 
+        // Record the requested offset before publishing the session. Another
+        // master-playlist request can arrive before the ffmpeg task initializes.
+        session
+            .write()
+            .await
+            .requested_start_secs = q
+            .start_time_ticks
+            .map(|ticks| (ticks.max(0) / 10_000_000).min(u32::MAX as i64) as u32)
+            .unwrap_or(0);
         state
             .ctx
             .sessions
@@ -1492,6 +1516,22 @@ async fn hls_segment_inner(
 mod tests {
     use super::SegmentContainer::{Fmp4, Ts};
     use remux_sdks::remux::VideoContainer;
+
+    #[test]
+    fn repeated_hls_seek_manifest_reuses_existing_transcode() {
+        assert!(!super::hls_seek_requires_restart(60, Some(600_000_000)));
+        assert!(!super::hls_seek_requires_restart(60, Some(609_000_000)));
+        assert!(!super::hls_seek_requires_restart(60, None));
+        assert!(!super::hls_seek_requires_restart(0, Some(0)));
+    }
+
+    #[test]
+    fn changed_hls_seek_position_restarts_transcode() {
+        assert!(super::hls_seek_requires_restart(0, Some(600_000_000)));
+        assert!(super::hls_seek_requires_restart(60, Some(1_200_000_000)));
+        assert!(super::hls_seek_requires_restart(60, Some(0)));
+        assert!(super::hls_seek_requires_restart(60, Some(-1)));
+    }
 
     #[test]
     fn vod_hls_source_reencodes_copied_audio_to_aac() {

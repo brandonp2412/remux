@@ -75,8 +75,12 @@ pub struct TranscodeSession {
     pub wait_done: Arc<Notify>,
     /// Index of the last segment the client has requested (0-based).
     pub last_segment_index: Arc<AtomicU32>,
-    /// Start offset of this transcode in seconds (from start_time_ticks).
+    /// Start offset of the currently running ffmpeg job. This can move when a
+    /// distant HLS segment causes an internal transcode restart.
     pub start_time_secs: u32,
+    /// Original playlist StartTimeTicks, stable across internal segment restarts.
+    /// Repeated master requests with this offset must reuse the same session.
+    pub requested_start_secs: u32,
     /// Playback offset in seconds relative to start_time_secs, updated from progress reports.
     pub playback_offset_secs: Arc<AtomicU32>,
     /// Total runtime of the media in Jellyfin ticks (100-ns units).
@@ -160,6 +164,7 @@ impl TranscodeSession {
             wait_done: Arc::new(Notify::new()),
             last_segment_index: Arc::new(AtomicU32::new(0)),
             start_time_secs: 0,
+            requested_start_secs: 0,
             playback_offset_secs: Arc::new(AtomicU32::new(0)),
             runtime_ticks,
             is_live,
