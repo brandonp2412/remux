@@ -8977,6 +8977,10 @@ fn filter_rule_to_sql(
     }
 
     match rule {
+        R::YearBeforeCurrent => Some((
+            "released_at < date('now', 'localtime', 'start of year')".to_owned(),
+            false,
+        )),
         R::Year { op, value } => {
             let negated = *op == NumericOp::NotEq;
             let sql = match op {
@@ -9395,6 +9399,56 @@ pub(crate) fn build_genre_relations_from_names(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn year_before_current_filter_follows_calendar_year() {
+        use remux_sdks::remux::FilterRule;
+
+        let rule: FilterRule =
+            serde_json::from_str(r#"{"field":"year_before_current"}"#).unwrap();
+        let (sql, negated) = filter_rule_to_sql(&rule, None, false).unwrap();
+        assert_eq!(
+            sql,
+            "released_at < date('now', 'localtime', 'start of year')"
+        );
+        assert!(!negated);
+        assert_eq!(
+            serde_json::to_value(rule).unwrap(),
+            serde_json::json!({"field":"year_before_current"})
+        );
+    }
+
+    #[tokio::test]
+    async fn year_before_current_excludes_current_and_future_releases() {
+        let pool = sqlx::SqlitePool::connect("sqlite::memory:")
+            .await
+            .unwrap();
+        let year: i32 = chrono::Local::now()
+            .format("%Y")
+            .to_string()
+            .parse()
+            .unwrap();
+        let sql = filter_rule_to_sql(
+            &remux_sdks::remux::FilterRule::YearBeforeCurrent,
+            None,
+            false,
+        )
+        .unwrap()
+        .0;
+        let query = format!("SELECT {sql} FROM (SELECT ? AS released_at)");
+        for (date, expected) in [
+            (format!("{}-12-31", year - 1), 1_i64),
+            (format!("{year}-01-01"), 0_i64),
+            (format!("{}-01-01", year + 1), 0_i64),
+        ] {
+            let actual: i64 = sqlx::query_scalar(&query)
+                .bind(date)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            assert_eq!(actual, expected);
+        }
+    }
 
     fn tmdb_ratings(score: f64, vote_count: Option<u32>) -> ExternalRatings {
         ExternalRatings {

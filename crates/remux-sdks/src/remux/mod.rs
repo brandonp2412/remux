@@ -3894,6 +3894,8 @@ pub enum FilterRule {
         op: NumericOp,
         value: i64,
     },
+    /// Excludes titles released in the server-local current calendar year or later.
+    YearBeforeCurrent,
     RatingAudience {
         op: NumericOp,
         value: f64,
